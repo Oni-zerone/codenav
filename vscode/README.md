@@ -1,7 +1,13 @@
 # CodeNav Graph (VS Code)
 
 Visualizza dentro VS Code il grafo della codebase generato da [codenav](../README.md)
-(`.codenav/graph.json`): lo stesso grafo che gli LLM navigano via MCP.
+(`.codenav/graph.cnav`): lo stesso grafo che gli LLM navigano via MCP.
+
+Per vederlo basta **aprire un file `.cnav`** (dall'Explorer, da Quick Open o con
+`code .codenav/graph.cnav`): l'estensione lo apre come grafo invece che come testo. Il file è
+JSON; per leggerlo come testo usa *Reopen Editor With… → Text Editor*. Un `.cnav` copiato fuori
+da `.codenav/` funziona lo stesso: i sorgenti vengono cercati nella root registrata al momento
+dell'indicizzazione.
 
 ## Viste
 
@@ -32,7 +38,7 @@ cresce con il numero di occorrenze.
 | `CodeNav: Reveal in Code Graph` | Focus sul simbolo sotto il cursore (menu contestuale dell'editor) o sul file (menu dell'Explorer). |
 | `CodeNav: Re-index Repository` | Esegue `codenav index` sulla cartella. |
 
-Il pannello si aggiorna da solo quando `graph.json` cambia (ad esempio quando `codenav serve`
+Il grafo si aggiorna da solo quando il file `.cnav` cambia (ad esempio quando `codenav serve`
 re-indicizza in background).
 
 ## Impostazioni
@@ -57,8 +63,8 @@ poi apri una repo indicizzata con `codenav index`. Per creare il pacchetto: `npx
 
 Struttura:
 
-- `src/graphModel.ts`: parsing di `graph.json` e costruzione delle viste (puro, testato);
-- `src/graphStore.ts`: caricamento per workspace folder e file watcher;
-- `src/graphPanel.ts`: webview e protocollo dei messaggi;
+- `src/graphModel.ts`: parsing del grafo e costruzione delle viste (puro, testato);
+- `src/graphStore.ts`: caricamento dei file `.cnav` (cache per file) e file watcher;
+- `src/graphPanel.ts`: webview e protocollo dei messaggi, pannello dei comandi e custom editor per `*.cnav`;
 - `src/extension.ts`: comandi;
 - `media/main.js`, `media/main.css`: UI della webview (Cytoscape.js + layout fcose).

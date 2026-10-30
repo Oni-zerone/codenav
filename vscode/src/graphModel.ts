@@ -1,4 +1,4 @@
-// Pure model of `.codenav/graph.json` and the views drawn by the webview.
+// Pure model of `.codenav/graph.cnav` (JSON) and the views drawn by the webview.
 // No `vscode` import here, so it can be unit-tested with plain Node.
 
 export const SUPPORTED_VERSION = 1;
@@ -152,15 +152,15 @@ export class CodeGraph {
     try {
       raw = JSON.parse(text);
     } catch (err) {
-      throw new GraphError(`graph.json is not valid JSON: ${(err as Error).message}`);
+      throw new GraphError(`The code graph is not valid JSON: ${(err as Error).message}`);
     }
     const g = raw as Partial<RawGraph>;
     if (!g || typeof g !== 'object' || !Array.isArray(g.nodes) || !Array.isArray(g.edges)) {
-      throw new GraphError('graph.json has no nodes/edges arrays');
+      throw new GraphError('The code graph has no nodes/edges arrays');
     }
     if (g.version !== SUPPORTED_VERSION) {
       throw new GraphError(
-        `graph.json format version ${g.version} is not supported (expected ${SUPPORTED_VERSION}). ` +
+        `Code graph format version ${g.version} is not supported (expected ${SUPPORTED_VERSION}). ` +
           'Re-index with a matching codenav version.',
       );
     }
