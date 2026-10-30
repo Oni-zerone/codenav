@@ -156,8 +156,21 @@ const JS_COMMON_QUERY: &str = r#"
 (new_expression constructor: (identifier) @name) @call
 (new_expression constructor: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call
 
+; Top-level `const` (functions are matched above and win over constants).
+(program (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant))
+(program (export_statement declaration: (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant)))
+
+; Exports: any export statement makes the file an ES module; named/default exports.
+(export_statement) @export
+(export_statement (export_clause (export_specifier name: (identifier) @export.name)))
+(export_statement value: (identifier) @export.name)
+
+; Values that may name a top-level constant.
+(identifier) @valueref
+(shorthand_property_identifier) @valueref
+
 (import_statement source: (string (string_fragment) @path)) @import
-(export_statement source: (string (string_fragment) @path)) @import
+(export_statement source: (string (string_fragment) @path)) @import.reexport
 ((call_expression function: (identifier) @_req arguments: (arguments (string (string_fragment) @path)))
   (#eq? @_req "require")) @import
 ((call_expression function: (import) arguments: (arguments (string (string_fragment) @path)))) @import
@@ -188,9 +201,12 @@ const TS_QUERY: &str = r#"
 (type_identifier) @typeref
 "#;
 
+/// Components only: lowercase tags (`<p>`, `<summary>`) are HTML elements, not calls.
 const JSX_QUERY: &str = r#"
-(jsx_opening_element name: (identifier) @name) @call
-(jsx_self_closing_element name: (identifier) @name) @call
+((jsx_opening_element name: (identifier) @name) @call (#match? @name "^[A-Z]"))
+((jsx_self_closing_element name: (identifier) @name) @call (#match? @name "^[A-Z]"))
+(jsx_opening_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call
+(jsx_self_closing_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call
 "#;
 
 const GO_QUERY: &str = r#"

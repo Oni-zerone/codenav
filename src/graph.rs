@@ -72,11 +72,14 @@ impl SymKind {
     }
 
     /// Used to pick a winner when one syntax node matches several patterns.
+    /// Which kind wins when one node matches several patterns: a JS `const f = () => {}`
+    /// is a function, not a constant.
     pub fn specificity(self) -> u8 {
         match self {
             SymKind::Type => 0,
-            SymKind::Function => 1,
-            _ => 2,
+            SymKind::Constant => 1,
+            SymKind::Function => 2,
+            _ => 3,
         }
     }
 

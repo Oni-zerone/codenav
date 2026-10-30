@@ -31,7 +31,18 @@ globali (al massimo 3). Alcune euristiche riducono i falsi positivi:
 - `x.foo()`: può puntare solo a metodi; nomi molto comuni (`get`, `len`, `push`…) non vengono
   risolti globalmente;
 - `self.foo()` / `this.foo()`: preferisce i membri del tipo corrente;
-- `store.New()` (Go), `utils.helper()` (Python): il qualificatore può essere package/modulo.
+- `store.New()` (Go), `utils.helper()` (Python): il qualificatore può essere package/modulo;
+- JS/TS rispettano lo scope dei moduli: un simbolo di un altro file è un candidato solo se è di
+  primo livello ed esportato (`export`, `export { … }`, `export default`) e, per un nome usato da
+  solo (`f()`, `new C()`, `x: T`), se il suo file è importato, anche attraverso un file barile
+  (`export … from`). I membri di una classe esportata restano raggiungibili da un'istanza. Una
+  funzione annidata è visibile solo dentro la funzione che la contiene. I file senza import né
+  export sono script: le loro definizioni di primo livello sono globali, e un file con `require`
+  ma senza `export` (CommonJS) espone tutto;
+- JSX: solo i tag con iniziale maiuscola (`<Card>`, `<ui.Card>`) sono componenti; `<p>`,
+  `<summary>` sono elementi HTML e non diventano chiamate;
+- JS/TS: le `const` di primo livello che non sono funzioni (oggetti, `Set`, schemi Zod…) sono nodi
+  `constant`, e gli identificatori che le usano diventano archi `references`.
 
 Ogni arco dice quanto è sicuro il collegamento (`confidence`):
 

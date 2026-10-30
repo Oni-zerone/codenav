@@ -23,6 +23,8 @@ pub struct Def {
     pub doc: Option<String>,
     /// Explicit owner type (Go receivers).
     pub owner: Option<String>,
+    /// JS/TS: declared with `export`, or named in an `export { … }` / `export default`.
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,8 @@ pub enum RefKind {
     Call,
     Base,
     TypeRef,
+    /// JS/TS identifier used as a value (may name a top-level constant).
+    Value,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,8 @@ pub struct Import {
     pub names: Vec<String>,
     /// Rust `mod foo;`
     pub is_mod: bool,
+    /// JS/TS `export … from '…'`: the file passes the target's exports on.
+    pub reexport: bool,
     pub line: u32,
 }
 
@@ -70,6 +76,8 @@ pub struct FileFacts {
     pub impls: Vec<ImplBlock>,
     pub refs: Vec<Ref>,
     pub imports: Vec<Import>,
+    /// JS/TS: the file has an `export` statement (an ES module).
+    pub has_exports: bool,
 }
 
 fn query_for(lang: Lang) -> Result<&'static Query> {
@@ -116,7 +124,9 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
         impls: Vec::new(),
         refs: Vec::new(),
         imports: Vec::new(),
+        has_exports: false,
     };
+    let mut export_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let text = |n: Node| n.utf8_text(source).unwrap_or("").to_string();
 
@@ -154,6 +164,7 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 signature: signature_of(node, source),
                 doc: doc_of(node, source),
                 owner: caps.get("owner").map(|n| simple_type_name(&text(*n))),
+                exported: lang.family() == Lang::JavaScript.family() && has_export_ancestor(node),
             });
         } else if let Some(node) = caps.get("impl") {
             let Some(ty) = caps.get("impl.type") else {
@@ -166,7 +177,11 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 end_byte: node.end_byte(),
                 line: node.start_position().row as u32 + 1,
             });
-        } else if let Some(node) = caps.get("import").or(caps.get("import.mod")) {
+        } else if let Some(node) = caps
+            .get("import")
+            .or(caps.get("import.mod"))
+            .or(caps.get("import.reexport"))
+        {
             let Some(path_node) = caps.get("path") else {
                 continue;
             };
@@ -176,6 +191,20 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                     .to_string(),
                 names: import_names,
                 is_mod: caps.contains_key("import.mod"),
+                reexport: caps.contains_key("import.reexport"),
+                line: node.start_position().row as u32 + 1,
+            });
+        } else if caps.contains_key("export") {
+            facts.has_exports = true;
+        } else if let Some(n) = caps.get("export.name") {
+            export_names.insert(text(*n));
+        } else if let Some(node) = caps.get("valueref") {
+            facts.refs.push(Ref {
+                kind: RefKind::Value,
+                name: text(*node),
+                qualifier: None,
+                is_static: false,
+                byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
             });
         } else if let Some(node) = caps.get("call") {
@@ -210,6 +239,9 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
     }
 
     dedupe_defs(&mut facts.defs);
+    for d in &mut facts.defs {
+        d.exported |= export_names.contains(&d.name);
+    }
     // A supertype is also matched as a plain type reference: keep only the inheritance.
     let bases: std::collections::HashSet<usize> = facts
         .refs
@@ -221,6 +253,20 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
         .refs
         .retain(|r| r.kind != RefKind::TypeRef || !bases.contains(&r.byte));
     Ok(facts)
+}
+
+/// `export function f`, `export class C`, `export const x = …`, `export default …`.
+fn has_export_ancestor(node: Node) -> bool {
+    let mut cur = node.parent();
+    // A declarator sits in a declaration statement, which sits in the export.
+    for _ in 0..2 {
+        match cur {
+            Some(p) if p.kind() == "export_statement" => return true,
+            Some(p) if p.kind().ends_with("declaration") => cur = p.parent(),
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The same node can match several definition patterns (e.g. a Go `type_spec`

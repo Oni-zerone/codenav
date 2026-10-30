@@ -321,6 +321,13 @@ struct Builder<'a> {
     externals: HashMap<String, usize>,
     edge_index: HashMap<(usize, usize, EdgeKind), usize>,
     lang_of_node: Vec<Lang>,
+    /// JS/TS top-level definitions not exported from their module.
+    hidden: HashSet<usize>,
+    /// JS files with neither imports nor exports: plain scripts, whose top-level
+    /// definitions are globals.
+    script_files: HashSet<usize>,
+    /// JS/TS file -> files it re-exports (`export … from`).
+    reexports: HashMap<usize, HashSet<usize>>,
 }
 
 impl<'a> Builder<'a> {
@@ -342,6 +349,9 @@ impl<'a> Builder<'a> {
             externals: HashMap::new(),
             edge_index: HashMap::new(),
             lang_of_node: Vec::new(),
+            hidden: HashSet::new(),
+            script_files: HashSet::new(),
+            reexports: HashMap::new(),
         }
     }
 
@@ -384,6 +394,10 @@ impl<'a> Builder<'a> {
             );
             self.file_nodes.push(file_node);
             self.file_by_path.insert(f.path.clone(), file_node);
+            let is_js = f.lang.family() == Lang::JavaScript.family();
+            if is_js && f.imports.is_empty() && !f.has_exports {
+                self.script_files.insert(file_node);
+            }
             self.index_file_path(&f.path, file_node);
 
             // Defs are sorted by (start, -end): a stack yields the innermost container.
@@ -417,6 +431,10 @@ impl<'a> Builder<'a> {
                     f.lang,
                 );
                 self.names.entry(d.name.clone()).or_default().push(node);
+                // Without any `export`, a JS file is CommonJS or a script: nothing is hidden.
+                if is_js && f.has_exports && !d.exported {
+                    self.hidden.insert(node);
+                }
                 stack.push((d.end_byte, node));
                 nodes.push(node);
             }
@@ -655,6 +673,8 @@ impl<'a> Builder<'a> {
     }
 
     /// Fills `imported` (file -> repo files it imports) without adding edges or nodes.
+    /// Importing a JS/TS barrel (`export … from`) also counts as importing what it
+    /// re-exports, transitively.
     fn collect_imported_files(&mut self) {
         for (fi, f) in self.facts.iter().enumerate() {
             let from = self.file_nodes[fi];
@@ -664,6 +684,22 @@ impl<'a> Builder<'a> {
                         && n != from
                     {
                         self.imported.entry(from).or_default().insert(n);
+                        if imp.reexport {
+                            self.reexports.entry(from).or_default().insert(n);
+                        }
+                    }
+                }
+            }
+        }
+        if self.reexports.is_empty() {
+            return;
+        }
+        for set in self.imported.values_mut() {
+            let mut queue: Vec<usize> = set.iter().copied().collect();
+            while let Some(f) = queue.pop() {
+                for &n in self.reexports.get(&f).into_iter().flatten() {
+                    if set.insert(n) {
+                        queue.push(n);
                     }
                 }
             }
@@ -876,6 +912,7 @@ impl<'a> Builder<'a> {
                     RefKind::Call => (EdgeKind::Calls, SymKind::is_callable),
                     RefKind::Base => (EdgeKind::Inherits, SymKind::is_type),
                     RefKind::TypeRef => (EdgeKind::References, SymKind::is_type),
+                    RefKind::Value => (EdgeKind::References, |k| k == SymKind::Constant),
                 };
                 let (targets, conf) = self.pick_targets(fi, scope, r, accept);
                 for t in targets {
@@ -942,6 +979,10 @@ impl<'a> Builder<'a> {
             .filter(|&n| accept(self.graph.nodes[n].kind))
             .filter(|&n| self.lang_of_node[n].family() == family)
             .collect();
+        if family == Lang::JavaScript.family() {
+            let bare = r.qualifier.is_none();
+            cands.retain(|&n| self.js_visible(fi, scope, n, bare));
+        }
 
         // Receiver/path qualifiers narrow the candidates down. `risky` marks method calls
         // on values whose type we cannot know; `qualified` a match on the qualifier's name.
@@ -1051,6 +1092,56 @@ impl<'a> Builder<'a> {
             1 => (cands, unique(false, false)),
             k if k <= MAX_AMBIGUOUS => (cands, Confidence::Ambiguous),
             _ => none,
+        }
+    }
+
+    /// JS/TS module scoping: can code in file `fi`, inside `scope`, see definition `n`?
+    /// In its own file a definition nested in a function is visible only inside that
+    /// function. From another file a top-level definition must be exported, and for a
+    /// bare name (`f()`, `new C()`, `x: T`) also imported, unless it is a global of a
+    /// plain script; a member is reachable (through an instance) when its type is.
+    fn js_visible(&self, fi: usize, scope: usize, n: usize, bare: bool) -> bool {
+        let nodes = &self.graph.nodes;
+        let Some(parent) = nodes[n].parent else {
+            return true;
+        };
+        let parent_kind = nodes[parent].kind;
+        if nodes[n].file == self.facts[fi].path {
+            return parent_kind == SymKind::File
+                || parent_kind.is_type()
+                || self.is_within(scope, parent);
+        }
+        let Some(&file) = self.file_by_path.get(&nodes[n].file) else {
+            return false;
+        };
+        let script = self.script_files.contains(&file);
+        match parent_kind {
+            SymKind::File => {
+                let imported = || {
+                    self.imported
+                        .get(&self.file_nodes[fi])
+                        .is_some_and(|set| set.contains(&file))
+                };
+                script || (!self.hidden.contains(&n) && (!bare || imported()))
+            }
+            k if k.is_type() => {
+                let top_level = nodes[parent].parent == Some(file);
+                top_level && (script || !self.hidden.contains(&parent))
+            }
+            _ => false,
+        }
+    }
+
+    /// `node` is `ancestor` or nested in it.
+    fn is_within(&self, mut node: usize, ancestor: usize) -> bool {
+        loop {
+            if node == ancestor {
+                return true;
+            }
+            match self.graph.nodes[node].parent {
+                Some(p) => node = p,
+                None => return false,
+            }
         }
     }
 

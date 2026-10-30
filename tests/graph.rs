@@ -704,6 +704,169 @@ fn owner_and_overload_confidence() {
     );
 }
 
+/// get_symbol (JSON) of `id` in a temporary repository.
+fn symbol_in(repo: &TempRepo, id: &str) -> Value {
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_symbol",
+        json!({ "id": id, "include_code": false, "format": "json" }),
+    );
+    assert!(ok, "{id}: {text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn jsx_lowercase_tags_are_not_calls() {
+    let repo = TempRepo::new(
+        "jsx",
+        &[
+            (
+                "a.ts",
+                "export function render() {\n  const p = (t: string) => `<p>${t}</p>`;\n  return [\"x\"].map(p).join(\"\");\n}\n\
+                 function summary() { return 1; }\n"
+                    .into(),
+            ),
+            (
+                "ui.tsx",
+                "export function Card() { return null; }\n".into(),
+            ),
+            (
+                "b.tsx",
+                "import * as ui from './ui';\nimport { Card } from './ui';\n\
+                 export function Page() {\n  return <details><summary>s</summary><p>ciao</p><Card /><ui.Card></ui.Card></details>;\n}\n"
+                    .into(),
+            ),
+        ],
+    );
+    let page = symbol_in(&repo, "b.tsx::Page");
+    let calls = page["outgoing"]["calls"].to_string();
+    assert!(calls.contains("ui.tsx::Card"), "{page:#}");
+    assert!(
+        !calls.contains("render") && !calls.contains("summary"),
+        "{page:#}"
+    );
+    // Both the plain and the qualified tag count as calls to the component.
+    assert!(
+        page["outgoing"]["calls"]
+            .to_string()
+            .contains("\"count\":2"),
+        "{page:#}"
+    );
+    let p = symbol_in(&repo, "a.ts::render::p");
+    assert!(p["incoming"].get("called_by").is_none(), "{p:#}");
+}
+
+#[test]
+fn js_resolution_respects_module_scope() {
+    let repo = TempRepo::new(
+        "jsscope",
+        &[
+            // Same-named private helpers in two files that don't import each other.
+            ("lib/a.ts", "function helper() {}\nexport function a() { helper(); }\n".into()),
+            ("lib/b.ts", "function helper() {}\nexport function shared() {}\nexport class Repo { load() {} }\n".into()),
+            ("app/c.ts", "export function c() { helper(); }\n".into()),
+            // Barrel re-export, explicit import, nested function, instance method.
+            ("lib/index.ts", "export * from './b';\n".into()),
+            (
+                "app/d.ts",
+                "import { shared } from '../lib/index';\n\
+                 export function d(r: any) {\n  shared();\n  r.load();\n  function inner() {}\n  inner();\n}\n\
+                 export function e() { inner(); }\n"
+                    .into(),
+            ),
+            // A plain script: its top-level functions are globals.
+            ("web/globals.js", "function legacyGlobal() {}\n".into()),
+            ("web/page.js", "legacyGlobal();\n".into()),
+        ],
+    );
+    let a = symbol_in(&repo, "lib/a.ts::a");
+    assert_eq!(a["outgoing"]["calls"], json!(["lib/a.ts::helper"]), "{a:#}");
+    let c = symbol_in(&repo, "app/c.ts::c");
+    assert!(
+        c["outgoing"].get("calls").is_none(),
+        "no import, no edge: {c:#}"
+    );
+
+    let d = symbol_in(&repo, "app/d.ts::d");
+    let calls = d["outgoing"]["calls"].to_string();
+    assert!(
+        calls.contains("\"lib/b.ts::shared\""),
+        "barrel import is exact: {d:#}"
+    );
+    assert!(calls.contains("lib/b.ts::Repo::load"), "{d:#}");
+    assert!(calls.contains("app/d.ts::d::inner"), "{d:#}");
+    let e = symbol_in(&repo, "app/d.ts::e");
+    assert!(
+        e["outgoing"].get("calls").is_none(),
+        "nested functions are local: {e:#}"
+    );
+
+    let page = symbol_in(&repo, "web/page.js");
+    assert!(
+        page["outgoing"]["calls"]
+            .to_string()
+            .contains("web/globals.js::legacyGlobal"),
+        "{page:#}"
+    );
+}
+
+#[test]
+fn js_top_level_constants_are_indexed_and_referenced() {
+    let repo = TempRepo::new(
+        "jsconst",
+        &[
+            (
+                "schema.ts",
+                "import { z } from 'zod';\nexport const planSchema = z.object({});\nconst LIMITS = new Set([1]);\n\
+                 export const build = () => 1;\nexport function check(x: unknown) {\n  const local = 1;\n  return LIMITS.has(local) && planSchema.parse(x);\n}\n"
+                    .into(),
+            ),
+            (
+                "use.ts",
+                "import { planSchema } from './schema';\nexport function save(x: unknown) { return planSchema.parse(x); }\n\
+                 export const cfg = { planSchema };\n"
+                    .into(),
+            ),
+        ],
+    );
+    let schema = symbol_in(&repo, "schema.ts::planSchema");
+    assert_eq!(schema["kind"], "constant", "{schema:#}");
+    assert_eq!(symbol_in(&repo, "schema.ts::LIMITS")["kind"], "constant");
+    assert_eq!(
+        symbol_in(&repo, "schema.ts::build")["kind"],
+        "function",
+        "functions win"
+    );
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "search_symbols",
+        json!({ "query": "local", "kinds": ["constant"] }),
+    );
+    assert!(
+        ok && !text.contains("schema.ts::check::local"),
+        "local consts are not indexed: {text}"
+    );
+
+    let check = symbol_in(&repo, "schema.ts::check");
+    let refs = check["outgoing"]["references"].to_string();
+    assert!(
+        refs.contains("schema.ts::planSchema") && refs.contains("schema.ts::LIMITS"),
+        "{check:#}"
+    );
+    let save = symbol_in(&repo, "use.ts::save");
+    assert_eq!(
+        save["outgoing"]["references"],
+        json!(["schema.ts::planSchema"]),
+        "imported: exact {save:#}"
+    );
+    let cfg = symbol_in(&repo, "use.ts::cfg");
+    assert_eq!(
+        cfg["outgoing"]["references"],
+        json!(["schema.ts::planSchema"]),
+        "shorthand {cfg:#}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
