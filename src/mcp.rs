@@ -490,7 +490,7 @@ fn base_tool_definitions() -> Value {
         },
         {
             "name": "impact_analysis",
-            "description": "Everything that transitively depends on a symbol or file (and its members): what may break if it changes. Grouped by file.",
+            "description": "Everything that transitively depends on a symbol or file (and its members): what may break if it changes. Grouped by file. Methods also count callers of the interface/base-class methods they override (listed in overridden_members).",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string" },
                 "depth": { "type": "integer", "description": "1-8, default 3." },
