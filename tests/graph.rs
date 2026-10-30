@@ -1771,6 +1771,140 @@ fn diff_impact_maps_changes_to_symbols() {
     }
 }
 
+#[test]
+fn explore_seeds_use_docs_and_word_variants() {
+    // English code, Italian comments.
+    let repo = TempRepo::new(
+        "exploreseeds",
+        &[
+            (
+                "src/cycles.ts",
+                "/** Propaga il risultato di un test ai cicli collegati. */\n\
+                 export function recordInLinkedCycles(result: string) { return computeCycleStats(); }\n\
+                 export function computeCycleStats() { return 0; }\n"
+                    .into(),
+            ),
+            (
+                "src/athlete.ts",
+                "/** Carica l'atleta corrente con le sue schede visibili. */\n\
+                 export function loadAthlete(id: string) { return visiblePlans(id); }\n\
+                 export function visiblePlans(athleteId: string) {\n  // Filtra le schede (plans) visibili all'atleta.\n  return [];\n}\n"
+                    .into(),
+            ),
+            (
+                "src/oauth.ts",
+                "/** PKCE: verifica il code_verifier della richiesta OAuth. */\n\
+                 export function validatePkce(v: string) { return v; }\n\
+                 /** Scope OAuth del coach sui propri atleti. */\n\
+                 export function coachScopes() { return []; }\n"
+                    .into(),
+            ),
+        ],
+    );
+    // Seeds as listed in explore's header, and the header itself.
+    let seeds = |question: &str| -> (Vec<String>, String) {
+        let (ok, text) = tool_text_in(
+            &repo.0,
+            "explore",
+            json!({ "question": question, "depth": 1 }),
+        );
+        assert!(ok, "{question}: {text}");
+        let line = text.lines().find(|l| l.starts_with("Traversal:")).unwrap();
+        let list = line
+            .split("seeds: ")
+            .nth(1)
+            .unwrap()
+            .split(" | ")
+            .next()
+            .unwrap();
+        (list.split(", ").map(str::to_string).collect(), text)
+    };
+    let position = |list: &[String], id: &str| list.iter().position(|s| s == id);
+
+    // (question, expected seed, best position allowed)
+    let cases = [
+        (
+            "how is a test result propagated to linked cycles",
+            "src/cycles.ts::recordInLinkedCycles",
+            0,
+        ),
+        (
+            "come accede l'atleta alle proprie schede",
+            "src/athlete.ts::loadAthlete",
+            1,
+        ),
+        (
+            "come accede l'atleta alle proprie schede",
+            "src/athlete.ts::visiblePlans",
+            1,
+        ),
+        (
+            "which plans can an athlete see",
+            "src/athlete.ts::visiblePlans",
+            1,
+        ),
+    ];
+    for (question, expected, max_pos) in cases {
+        let (list, text) = seeds(question);
+        let pos = position(&list, expected);
+        assert!(
+            pos.is_some_and(|p| p <= max_pos),
+            "{question}: {expected} at {pos:?}\n{text}"
+        );
+        assert!(!text.contains("low_confidence"), "{question}\n{text}");
+    }
+    let (list, _) = seeds("come accede l'atleta alle proprie schede");
+    assert!(
+        position(&list, "src/oauth.ts::validatePkce").is_none(),
+        "{list:?}"
+    );
+
+    // Mostly unknown words: the answer says it is unsure instead of pretending.
+    let (_, text) = seeds("athlete quantum flux capacitor warp");
+    assert!(
+        text.contains("low_confidence: true") && text.contains("unmatched: quantum"),
+        "{text}"
+    );
+}
+
+#[test]
+fn explore_seed_review_cases() {
+    let repo = TempRepo::new(
+        "exploreseeds2",
+        &[(
+            "src/a.ts",
+            "export function parseConfig(text: string) { return text; }\n\
+             export function load() { return parseConfig(''); }\n\
+             export class Store {\n  /** Deletes a user. */\n  remove() {}\n}\n\
+             export function audit() {\n  // TODO: remove legacy auth hack\n  return 1;\n}\n\
+             /** Max retries */\nexport const MAX = 3, handler = () => 0;\n"
+                .into(),
+        )],
+    );
+    // A relation word does not count as an unmatched term.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "what uses parseConfig" }),
+    );
+    assert!(ok && !text.contains("low_confidence"), "{text}");
+
+    let doc = |id: &str| symbol_in(&repo, id)["doc"].clone();
+    assert_eq!(doc("src/a.ts::Store::remove"), "Deletes a user.");
+    assert!(
+        doc("src/a.ts::Store").is_null(),
+        "a class does not take its member's doc"
+    );
+    assert!(
+        doc("src/a.ts::audit").is_null(),
+        "a TODO is not a description"
+    );
+    assert!(
+        doc("src/a.ts::handler").is_null(),
+        "the comment belongs to the whole statement"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {

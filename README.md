@@ -126,7 +126,7 @@ aggiornamento automatico quando l'indice cambia.
 
 | Tool | A cosa serve |
 |---|---|
-| `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`) |
+| `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`). I nodi di partenza si scelgono da nomi e doc comment (anche varianti delle parole); se la domanda trova poco riscontro nel codice la risposta lo dice (`low_confidence: true`) |
 | `graph_overview` | Stato dell'indice (commit e branch Git da cui è stato costruito, modifiche non committate, avvisi se HEAD è cambiato o i sorgenti sono stati modificati), linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali, community più grandi |
 | `module_graph` | Architettura: dipendenze aggregate tra directory/componenti |
 | `insights` | Cosa merita un'occhiata: connessioni inattese tra file (confidenza bassa, poche connessioni tra community, codice periferico che raggiunge un hub), nodi ponte tra community (betweenness approssimata) e domande suggerite |

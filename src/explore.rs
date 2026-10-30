@@ -6,7 +6,7 @@
 //! 3. Nodes are rendered seeds first, then by distance and relevance, each with its
 //!    edges to other rendered nodes, and the text is cut to a token budget.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 
@@ -29,6 +29,12 @@ const STOP_WORDS: &[&str] = &[
     "that", "there", "between", "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "da",
     "del", "della", "dei", "delle", "e", "ed", "o", "che", "chi", "come", "cosa", "dove", "perche",
     "perché", "quale", "quali", "con", "per", "su", "tra", "fra", "nel", "nella",
+    // Articulated prepositions, possessives and modal verbs: never a symbol's subject.
+    "al", "allo", "alla", "alle", "ai", "agli", "dal", "dallo", "dalla", "dalle", "dai", "dagli",
+    "sul", "sullo", "sulla", "sulle", "sui", "sugli", "nello", "nelle", "nei", "negli", "col",
+    "coi", "mio", "mia", "miei", "mie", "suo", "sua", "suoi", "sue", "loro", "proprio", "propria",
+    "propri", "proprie", "può", "possono", "own", "can", "could", "should", "would", "my", "his",
+    "her", "its", "their", "our", "your",
 ];
 
 /// Words describing the relation being asked about rather than a symbol to start from.
@@ -175,16 +181,48 @@ fn name_tokens(name: &str) -> Vec<String> {
 /// Weight from which a match is on the symbol name itself.
 const NAME_MATCH: f64 = 2.0;
 
-/// How strongly a term matches a node: exact name, name token, name substring,
-/// id/path or doc.
-fn term_weight(term: &str, name: &str, tokens: &[String], id: &str, doc: &str) -> f64 {
+/// A term matching a whole word of the doc comment.
+const DOC_WORD: f64 = 1.5;
+
+/// Two forms of one word: equal, or at least 5 letters long and alike up to the last
+/// letter of the shorter (`propagate` / `propagated`, `schede` / `scheda`), but not words
+/// that merely start alike (`context` / `content`, `interval` / `internal`).
+fn same_word(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    let shorter = la.min(lb);
+    if shorter < 5 {
+        return false;
+    }
+    let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    common >= shorter - 1
+}
+
+/// How strongly a term matches a node, best first: exact name (4), name token (3), part of
+/// the name or another form of a name token (2), a whole word of the doc (1.5), the
+/// id/path or another form of a doc word (1), a substring of the doc (0.5).
+fn term_weight(
+    term: &str,
+    name: &str,
+    tokens: &[String],
+    id: &str,
+    doc_words: &[&str],
+    doc: &str,
+) -> f64 {
     if name == term {
         4.0
     } else if tokens.iter().any(|t| t == term) {
         3.0
-    } else if term.chars().count() >= MIN_SUBSTRING_TERM && name.contains(term) {
+    } else if (term.chars().count() >= MIN_SUBSTRING_TERM && name.contains(term))
+        || tokens.iter().any(|t| same_word(t, term))
+    {
         NAME_MATCH
-    } else if id.contains(term) {
+    } else if doc_words.contains(&term) {
+        DOC_WORD
+    } else if id.contains(term) || doc_words.iter().any(|w| same_word(w, term)) {
+        // A path, or another form of the word in the doc: weaker hints.
         1.0
     } else if doc.contains(term) {
         0.5
@@ -200,6 +238,8 @@ struct Scores {
     name_match: Vec<bool>,
     /// Best name match for each term, if any.
     best_by_term: Vec<Option<usize>>,
+    /// Terms each node matches by name or by a word of its doc.
+    strong_terms: Vec<Vec<usize>>,
 }
 
 fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
@@ -207,6 +247,8 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
     let mut total = vec![0.0; n];
     let mut name_match = vec![false; n];
     let mut per_term: Vec<Vec<f64>> = vec![vec![0.0; n]; terms.len()];
+    // Terms (indices into `terms`) each node matches by name or by a word of its doc.
+    let mut strong_terms: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, node) in g.nodes.iter().enumerate() {
         // A file is named by its stem: `api.ts` must not match the term `ts`.
         let display = if node.kind == SymKind::File {
@@ -220,8 +262,17 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
         let tokens = name_tokens(display);
         let id = node.id.to_lowercase();
         let doc = node.doc.as_deref().unwrap_or("").to_lowercase();
+        // Words of at least two characters, as for the question's terms.
+        let doc_words: Vec<&str> = doc
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 2)
+            .collect();
         for (t, term) in terms.iter().enumerate() {
-            per_term[t][i] = term_weight(term, &name, &tokens, &id, &doc);
+            let w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            per_term[t][i] = w;
+            if w >= DOC_WORD {
+                strong_terms[i].push(t);
+            }
         }
     }
     let mut best_by_term = Vec::new();
@@ -257,6 +308,7 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
         total,
         name_match,
         best_by_term,
+        strong_terms,
     }
 }
 
@@ -319,12 +371,25 @@ fn pick_seeds(
             .then(a.cmp(&b))
     });
 
-    // Seeds must match on their name; path or doc text alone is only a fallback.
+    // Seeds must match on their name, or on words of their doc for at least two terms (or
+    // the only one); a path or a doc substring alone is only a fallback.
     let mut notes = Vec::new();
+    // Scores (and `strong_terms`) index the symbol terms, not the raw ones.
+    let symbol_terms = symbol_terms(terms);
+    // Doc words anchor a node when they match two terms; for a one-term question, only if
+    // no name matches at all.
+    let any_name = ranked.iter().any(|&i| scores.name_match[i]);
+    let doc_quorum = if symbol_terms.len() >= 2 {
+        2
+    } else if any_name {
+        usize::MAX
+    } else {
+        1
+    };
     let anchored: Vec<usize> = ranked
         .iter()
         .copied()
-        .filter(|&i| scores.name_match[i])
+        .filter(|&i| scores.name_match[i] || scores.strong_terms[i].len() >= doc_quorum)
         .collect();
     let pool = if anchored.is_empty() {
         notes.push("no symbol name matches the question; seeds come from paths/docs".to_string());
@@ -344,6 +409,30 @@ fn pick_seeds(
         if !seeds.contains(&best) && seeds.len() < MAX_SEEDS {
             seeds.push(best);
         }
+    }
+    // Say so when the starting points cover few of the question's terms.
+    let covered: BTreeSet<usize> = seeds
+        .iter()
+        .flat_map(|&s| scores.strong_terms[s].iter().copied())
+        .collect();
+    let covered_terms = (0..symbol_terms.len())
+        .filter(|t| covered.contains(t))
+        .count();
+    if anchored.is_empty() || covered_terms * 2 < symbol_terms.len() {
+        let missing: Vec<&str> = (0..symbol_terms.len())
+            .filter(|t| !covered.contains(t))
+            .map(|t| symbol_terms[t].as_str())
+            .collect();
+        notes.insert(
+            0,
+            format!(
+                "low_confidence: true: only {covered_terms} of {} terms match code names or docs \
+                 (unmatched: {}); the starting points may be unrelated. Try search_symbols, \
+                 other words, or explicit seeds",
+                symbol_terms.len(),
+                missing.join(", ")
+            ),
+        );
     }
     Ok((seeds, notes))
 }
@@ -591,6 +680,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn word_forms() {
+        for (a, b) in [
+            ("propagate", "propagated"),
+            ("propaga", "propagated"),
+            ("schede", "scheda"),
+            ("atleti", "atleta"),
+            ("plans", "plans"),
+        ] {
+            assert!(same_word(a, b), "{a} ~ {b}");
+        }
+        for (a, b) in [
+            ("context", "content"),
+            ("interval", "internal"),
+            ("construct", "constant"),
+            ("plan", "plans"),
+        ] {
+            assert!(!same_word(a, b), "{a} !~ {b}");
+        }
+    }
+
+    #[test]
     fn tokenizes_names() {
         assert_eq!(name_tokens("UserService"), vec!["user", "service"]);
         assert_eq!(name_tokens("HTTPClient"), vec!["http", "client"]);
@@ -609,11 +719,11 @@ mod tests {
     fn exact_name_beats_token_and_short_substrings_do_not_match() {
         let toks = name_tokens("resolve_imports");
         assert!(
-            term_weight("resolve", "resolve", &["resolve".into()], "", "")
-                > term_weight("resolve", "resolve_imports", &toks, "", "")
+            term_weight("resolve", "resolve", &["resolve".into()], "", &[], "")
+                > term_weight("resolve", "resolve_imports", &toks, "", &[], "")
         );
         assert_eq!(
-            term_weight("get", "budget", &["budget".into()], "", ""),
+            term_weight("get", "budget", &["budget".into()], "", &[], ""),
             0.0
         );
     }
