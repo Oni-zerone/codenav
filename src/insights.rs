@@ -1,0 +1,359 @@
+//! Things worth a closer look: surprising cross-file connections, bridge nodes between
+//! communities (approximate betweenness), and questions an LLM could ask about them.
+//! Deterministic: every ranking breaks ties by node index, sampling is fixed.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+use serde_json::{Value, json};
+
+use crate::communities;
+use crate::graph::{Confidence, Edge, EdgeKind, Graph, SymKind};
+
+/// Betweenness is computed from at most this many source nodes (evenly spaced).
+const MAX_SOURCES: usize = 256;
+
+fn is_dependency(e: &Edge) -> bool {
+    e.kind != EdgeKind::Contains
+}
+
+fn active(g: &Graph, i: usize) -> bool {
+    g.nodes[i].kind != SymKind::External
+}
+
+fn dir(file: &str) -> &str {
+    file.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
+fn label(g: &Graph, c: Option<u32>) -> String {
+    c.and_then(|c| g.communities.get(c as usize))
+        .map_or_else(|| "?".into(), |info| info.label.clone())
+}
+
+struct Surprise {
+    score: u32,
+    edge: usize,
+    reasons: Vec<String>,
+}
+
+/// Cross-file dependency edges ranked by how unexpected they are; the best per file pair.
+fn surprising_connections(g: &Graph, degree: &[usize], hub: usize) -> Vec<Surprise> {
+    // Edges between each pair of communities: a lone link is more surprising.
+    let mut between: HashMap<(u32, u32), usize> = HashMap::new();
+    for e in g.edges.iter().filter(|e| is_dependency(e)) {
+        if let (Some(a), Some(b)) = (g.nodes[e.from].community, g.nodes[e.to].community)
+            && a != b
+        {
+            *between.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut best: BTreeMap<(&str, &str), Surprise> = BTreeMap::new();
+    for (i, e) in g.edges.iter().enumerate() {
+        if !is_dependency(e) || !active(g, e.from) || !active(g, e.to) {
+            continue;
+        }
+        let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
+        if a.file == b.file {
+            continue;
+        }
+        // A guess across languages is noise, not a finding.
+        let languages_differ = match (a.lang, b.lang) {
+            (Some(x), Some(y)) => x.family() != y.family(),
+            _ => false,
+        };
+        if languages_differ && !e.confidence.is_exact() {
+            continue;
+        }
+        let mut score = 0;
+        let mut reasons = Vec::new();
+        match e.confidence {
+            Confidence::Ambiguous => {
+                score += 2;
+                reasons.push("guessed among same-named candidates".to_string());
+            }
+            Confidence::Inferred => {
+                score += 1;
+                reasons.push("inferred, not certain".to_string());
+            }
+            Confidence::Exact => {}
+        }
+        if let (Some(ca), Some(cb)) = (a.community, b.community)
+            && ca != cb
+        {
+            score += 2;
+            let links = between[&(ca.min(cb), ca.max(cb))];
+            let rare = match links {
+                1 => {
+                    score += 2;
+                    ", the only link between them"
+                }
+                2..=3 => {
+                    score += 1;
+                    ", one of few links between them"
+                }
+                _ => "",
+            };
+            reasons.push(format!(
+                "crosses communities {} → {}{rare}",
+                label(g, Some(ca)),
+                label(g, Some(cb))
+            ));
+        } else if dir(&a.file) != dir(&b.file) {
+            score += 1;
+            reasons.push(format!(
+                "crosses directories {} → {}",
+                dir(&a.file),
+                dir(&b.file)
+            ));
+        }
+        if degree[e.from] <= 2 && degree[e.to] >= hub {
+            score += 1;
+            reasons.push("from a peripheral node to a hub".to_string());
+        }
+        if score < 2 {
+            continue;
+        }
+        let key = (a.file.as_str(), b.file.as_str());
+        let candidate = Surprise {
+            score,
+            edge: i,
+            reasons,
+        };
+        match best.get(&key) {
+            Some(old) if old.score >= candidate.score => {}
+            _ => {
+                best.insert(key, candidate);
+            }
+        }
+    }
+    let mut out: Vec<Surprise> = best.into_values().collect();
+    out.sort_by(|x, y| y.score.cmp(&x.score).then(x.edge.cmp(&y.edge)));
+    out
+}
+
+/// A dependency edge sure enough to shape the structure (guesses would invent bridges).
+fn is_structural(e: &Edge) -> bool {
+    is_dependency(e) && !e.is_ambiguous()
+}
+
+/// Approximate betweenness (Brandes) on the undirected graph of structural dependencies
+/// between non-external nodes, from evenly spaced sources, scaled to the full graph.
+fn betweenness(g: &Graph) -> Vec<f64> {
+    let n = g.nodes.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for e in g.edges.iter().filter(|e| is_structural(e)) {
+        if e.from != e.to && active(g, e.from) && active(g, e.to) {
+            adj[e.from].push(e.to);
+            adj[e.to].push(e.from);
+        }
+    }
+    for list in &mut adj {
+        list.sort_unstable();
+        list.dedup();
+    }
+    let nodes: Vec<usize> = (0..n).filter(|&i| !adj[i].is_empty()).collect();
+    let mut bc = vec![0.0; n];
+    if nodes.is_empty() {
+        return bc;
+    }
+    let k = nodes.len().min(MAX_SOURCES);
+    let sources: Vec<usize> = (0..k).map(|j| nodes[j * nodes.len() / k]).collect();
+    let mut sigma = vec![0.0f64; n];
+    let mut dist = vec![-1i64; n];
+    let mut delta = vec![0.0f64; n];
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &s in &sources {
+        let mut order = Vec::new();
+        for &v in &nodes {
+            sigma[v] = 0.0;
+            dist[v] = -1;
+            delta[v] = 0.0;
+            preds[v].clear();
+        }
+        sigma[s] = 1.0;
+        dist[s] = 0;
+        let mut queue = VecDeque::from([s]);
+        while let Some(v) = queue.pop_front() {
+            order.push(v);
+            for &w in &adj[v] {
+                if dist[w] < 0 {
+                    dist[w] = dist[v] + 1;
+                    queue.push_back(w);
+                }
+                if dist[w] == dist[v] + 1 {
+                    sigma[w] += sigma[v];
+                    preds[w].push(v);
+                }
+            }
+        }
+        for &w in order.iter().rev() {
+            for &v in &preds[w] {
+                delta[v] += sigma[v] / sigma[w] * (1.0 + delta[w]);
+            }
+            if w != s {
+                bc[w] += delta[w];
+            }
+        }
+    }
+    let scale = nodes.len() as f64 / k as f64 / 2.0; // undirected: each pair counted twice
+    for v in &mut bc {
+        *v *= scale;
+    }
+    bc
+}
+
+pub fn insights(g: &Graph, top: usize) -> Value {
+    let degree: Vec<usize> = (0..g.nodes.len())
+        .map(|i| {
+            if active(g, i) {
+                communities::dependency_degree(g, i)
+            } else {
+                0
+            }
+        })
+        .collect();
+    // A hub: in the top 5% by degree, and at least 5 neighbours.
+    let hub = {
+        let mut d: Vec<usize> = degree.iter().copied().filter(|&d| d > 0).collect();
+        d.sort_unstable();
+        d.get(d.len() * 95 / 100)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .max(5)
+    };
+
+    let surprises = surprising_connections(g, &degree, hub);
+    let surprising: Vec<Value> = surprises
+        .iter()
+        .take(top)
+        .map(|s| {
+            let e = &g.edges[s.edge];
+            let kind = match e.confidence.label() {
+                Some(l) => format!("{} ({l})", e.kind.as_str()),
+                None => e.kind.as_str().to_string(),
+            };
+            json!({
+                "edge": format!("{} --{kind}--> {}", g.nodes[e.from].id, g.nodes[e.to].id),
+                "line": format!("{}:{}", g.nodes[e.from].file, e.line),
+                "score": s.score,
+                "why": s.reasons.join("; "),
+            })
+        })
+        .collect();
+
+    // Bridges: highest betweenness among nodes whose neighbours span several communities.
+    let bc = betweenness(g);
+    let mut bridges: Vec<(usize, BTreeSet<u32>)> = (0..g.nodes.len())
+        .filter(|&i| bc[i] > 0.0)
+        .filter_map(|i| {
+            let comms: BTreeSet<u32> = g.out_edges[i]
+                .iter()
+                .chain(&g.in_edges[i])
+                .map(|&e| &g.edges[e])
+                .filter(|e| is_structural(e))
+                .flat_map(|e| [g.nodes[e.from].community, g.nodes[e.to].community])
+                .flatten()
+                .collect();
+            (comms.len() >= 2).then_some((i, comms))
+        })
+        .collect();
+    bridges.sort_by(|a, b| bc[b.0].total_cmp(&bc[a.0]).then(a.0.cmp(&b.0)));
+    bridges.truncate(top);
+    let bridge_values: Vec<Value> = bridges
+        .iter()
+        .map(|(i, comms)| {
+            json!({
+                "id": g.nodes[*i].id,
+                "kind": g.nodes[*i].kind.as_str(),
+                "betweenness": (bc[*i] * 10.0).round() / 10.0,
+                "connects": comms.iter().map(|&c| label(g, Some(c))).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    // Questions: guesses to verify first, then why bridges join communities.
+    let mut questions: Vec<String> = Vec::new();
+    for s in surprises
+        .iter()
+        .filter(|s| g.edges[s.edge].is_ambiguous())
+        .take(top.div_ceil(2))
+    {
+        let e = &g.edges[s.edge];
+        questions.push(format!(
+            "What exactly is the relation between {} and {}? (`{}` was resolved by name; check {}:{})",
+            g.nodes[e.from].id,
+            g.nodes[e.to].id,
+            e.kind.as_str(),
+            g.nodes[e.from].file,
+            e.line
+        ));
+    }
+    for (i, comms) in bridges.iter().take(top.div_ceil(2)) {
+        let names: Vec<String> = comms.iter().take(3).map(|&c| label(g, Some(c))).collect();
+        questions.push(format!(
+            "Why does {} connect the communities {}?",
+            g.nodes[*i].id,
+            names.join(" and ")
+        ));
+    }
+    questions.truncate(top);
+
+    json!({
+        "surprising_connections": surprising,
+        "bridges": bridge_values,
+        "suggested_questions": questions,
+        "hint": "Verify guessed edges with read_code; get_community and find_paths explain how communities connect.",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Node;
+    use std::path::Path;
+
+    #[test]
+    fn betweenness_peaks_at_the_bridge() {
+        // Two triangles joined through node 3: 0-1-2-0, 2-3, 3-4, 4-5-6-4.
+        let mut g = Graph::new(Path::new("/r"));
+        for i in 0..7 {
+            g.nodes.push(Node {
+                id: format!("n{i}"),
+                kind: SymKind::Function,
+                name: format!("n{i}"),
+                file: "m.rs".into(),
+                lang: None,
+                line: 1,
+                end_line: 1,
+                signature: String::new(),
+                doc: None,
+                parent: None,
+                community: None,
+            });
+        }
+        for (a, b) in [
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (5, 6),
+            (6, 4),
+        ] {
+            g.edges.push(Edge {
+                from: a,
+                to: b,
+                kind: EdgeKind::Calls,
+                count: 1,
+                confidence: Confidence::Exact,
+                line: 1,
+            });
+        }
+        g.build_indexes();
+        let bc = betweenness(&g);
+        let max = (0..7).max_by(|&a, &b| bc[a].total_cmp(&bc[b])).unwrap();
+        assert_eq!(max, 3, "{bc:?}");
+        // Exact on a small graph: node 3 lies on all 3×3 paths between the triangles.
+        assert!((bc[3] - 9.0).abs() < 1e-9, "{bc:?}");
+    }
+}

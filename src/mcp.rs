@@ -12,6 +12,7 @@ use crate::cycles;
 use crate::explore;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
+use crate::insights;
 use crate::output;
 use crate::query::{self, Direction, EdgeFilter};
 use crate::tests_for;
@@ -330,6 +331,7 @@ impl Server {
                     min_confidence(a)?,
                 ))
             }
+            "insights" => Ok(insights::insights(g, uint(a, "top", 10)?.clamp(1, 50))),
             "tests_for" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 // Guesses among same-named candidates would list unrelated tests.
@@ -435,6 +437,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "audit_edges" => "narrow with path or edge_kinds, or lower limit",
         "find_cycles" => "lower limit or max_length",
         "tests_for" => "lower depth or limit, or raise min_confidence",
+        "insights" => "lower top",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -654,6 +657,13 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "insights",
+            "description": "What deserves a closer look: surprising cross-file connections (low confidence, crossing communities with few links, peripheral code reaching a hub), bridge nodes joining communities (approximate betweenness), and suggested questions to investigate. Deterministic.",
+            "inputSchema": { "type": "object", "properties": {
+                "top": { "type": "integer", "description": "Entries per section (1-50, default 10)." }
+            } }
         },
         {
             "name": "tests_for",
