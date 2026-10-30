@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 
-use crate::graph::{EdgeKind, Graph, SymKind};
+use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::output;
 use crate::query::{self, Direction};
 
@@ -83,7 +83,18 @@ pub struct Options<'a> {
     pub depth: u32,
     pub direction: Direction,
     pub kinds: &'a [EdgeKind],
+    /// Only edges at least this sure are followed and drawn.
+    pub min_confidence: Confidence,
     pub token_budget: usize,
+}
+
+impl Options<'_> {
+    fn filter(&self) -> query::EdgeFilter<'_> {
+        query::EdgeFilter {
+            kinds: self.kinds,
+            min: self.min_confidence,
+        }
+    }
 }
 
 pub fn explore(g: &Graph, question: &str, seeds: &[String], opts: &Options) -> Result<String> {
@@ -384,7 +395,7 @@ fn traverse(g: &Graph, seeds: &[usize], opts: &Options) -> Visited {
     let expandable =
         |i: usize, d: u32| d == 0 || !matches!(g.nodes[i].kind, SymKind::File | SymKind::External);
     let steps = |i: usize| -> Vec<usize> {
-        query::steps(g, i, opts.direction, opts.kinds)
+        query::steps(g, i, opts.direction, opts.filter())
             .map(|(n, _, _)| n)
             .collect()
     };
@@ -479,7 +490,7 @@ fn render(
             seed_rank.contains_key(&n),
         )];
         let mut edges: Vec<(usize, String)> = Vec::new();
-        for (other, e, forward) in query::steps(g, n, Direction::Both, opts.kinds) {
+        for (other, e, forward) in query::steps(g, n, Direction::Both, opts.filter()) {
             let Some(&r) = rank.get(&other) else { continue };
             if r < rank[&n] || (r == rank[&n] && !forward) {
                 continue;
@@ -493,8 +504,8 @@ fn render(
             if edge.count > 1 {
                 line.push_str(&format!(" (×{})", edge.count));
             }
-            if edge.ambiguous {
-                line.push_str(" (ambiguous)");
+            if !edge.confidence.is_exact() {
+                line.push_str(&format!(" ({})", edge.confidence.as_str()));
             }
             edges.push((r, line));
         }
@@ -525,6 +536,12 @@ fn render(
     if !opts.kinds.is_empty() {
         let kinds: Vec<&str> = opts.kinds.iter().map(|k| k.as_str()).collect();
         header.push_str(&format!(" | edges: {}", kinds.join(",")));
+    }
+    if opts.min_confidence != Confidence::Ambiguous {
+        header.push_str(&format!(
+            " | min confidence: {}",
+            opts.min_confidence.as_str()
+        ));
     }
     for note in notes.iter().take(5) {
         header.push_str(&format!("\nNote: {}", output::clip(note, 160)));

@@ -2,7 +2,7 @@
   "name": "codenav-graph",
   "displayName": "CodeNav Graph",
   "description": "Visualize the code graph built by codenav: open a .cnav file (e.g. .codenav/graph.cnav) to see it.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "codenav",
   "license": "MIT",
   "repository": {

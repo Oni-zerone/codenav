@@ -3,7 +3,8 @@
 //!
 //! Resolution is heuristic (no type checking): a reference is linked to definitions
 //! with the same name, preferring the same file, then imported files, then the same
-//! directory, then a small set of global candidates (marked `ambiguous`).
+//! directory, then a small set of global candidates. Each edge records how sure the
+//! match is (`Confidence`): exact, inferred by proximity, or ambiguous.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -18,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::communities;
 use crate::extract::{self, FileFacts, RefKind};
-use crate::graph::{Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
+use crate::graph::{Confidence, Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
 use crate::lang::Lang;
 
 /// Project-specific exclusions, same syntax as `.gitignore`.
@@ -453,7 +454,7 @@ impl<'a> Builder<'a> {
     fn resolve_owners(&mut self) {
         for (fi, f) in self.facts.iter().enumerate() {
             for (ii, imp) in f.impls.iter().enumerate() {
-                self.impl_owner[fi][ii] = self.find_type(&imp.type_name, fi);
+                self.impl_owner[fi][ii] = self.find_type(&imp.type_name, fi).map(|(t, _)| t);
             }
             for (di, d) in f.defs.iter().enumerate() {
                 let node = self.def_nodes[fi][di];
@@ -478,7 +479,7 @@ impl<'a> Builder<'a> {
                 if self.graph.nodes[node].kind == SymKind::Function {
                     self.graph.nodes[node].kind = SymKind::Method;
                 }
-                match self.find_type(&owner_name, fi) {
+                match self.find_type(&owner_name, fi).map(|(t, _)| t) {
                     Some(owner) if owner != node => self.graph.nodes[node].parent = Some(owner),
                     // Type not in the repo: keep the owner in the qualified name (see `qualified`).
                     _ => self.graph.nodes[node].id = format!("{owner_name}::{}", d.name),
@@ -487,7 +488,9 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn find_type(&self, name: &str, fi: usize) -> Option<usize> {
+    /// The type named `name` as seen from file `fi`: same file, else same directory, else
+    /// the only one in the repository.
+    fn find_type(&self, name: &str, fi: usize) -> Option<(usize, Confidence)> {
         let cands: Vec<usize> = self
             .names
             .get(name)?
@@ -498,16 +501,33 @@ impl<'a> Builder<'a> {
             .collect();
         let file = &self.facts[fi].path;
         let dir = parent_dir(file);
-        cands
+        let same_file: Vec<usize> = cands
             .iter()
-            .find(|&&n| &self.graph.nodes[n].file == file)
-            .or_else(|| {
-                cands
-                    .iter()
-                    .find(|&&n| parent_dir(&self.graph.nodes[n].file) == dir)
-            })
             .copied()
-            .or_else(|| (cands.len() == 1).then(|| cands[0]))
+            .filter(|&n| &self.graph.nodes[n].file == file)
+            .collect();
+        if let Some(&t) = same_file.first() {
+            let conf = if same_file.len() == 1 {
+                Confidence::Exact
+            } else {
+                Confidence::Ambiguous
+            };
+            return Some((t, conf));
+        }
+        let same_dir: Vec<usize> = cands
+            .iter()
+            .copied()
+            .filter(|&n| parent_dir(&self.graph.nodes[n].file) == dir)
+            .collect();
+        if let Some(&t) = same_dir.first() {
+            let conf = if same_dir.len() == 1 {
+                Confidence::Inferred
+            } else {
+                Confidence::Ambiguous
+            };
+            return Some((t, conf));
+        }
+        (cands.len() == 1).then(|| (cands[0], Confidence::Inferred))
     }
 
     fn assign_ids(&mut self) {
@@ -550,17 +570,18 @@ impl<'a> Builder<'a> {
         for i in 0..self.graph.nodes.len() {
             if let Some(p) = self.graph.nodes[i].parent {
                 let line = self.graph.nodes[i].line;
-                self.add_edge(p, i, EdgeKind::Contains, line, false);
+                self.add_edge(p, i, EdgeKind::Contains, line, Confidence::Exact);
             }
         }
     }
 
-    fn add_edge(&mut self, from: usize, to: usize, kind: EdgeKind, line: u32, ambiguous: bool) {
+    fn add_edge(&mut self, from: usize, to: usize, kind: EdgeKind, line: u32, conf: Confidence) {
         if let Some(&e) = self.edge_index.get(&(from, to, kind)) {
             let edge = &mut self.graph.edges[e];
             edge.count += 1;
             edge.line = edge.line.min(line);
-            edge.ambiguous &= ambiguous;
+            // One sure occurrence is enough to trust the relation.
+            edge.confidence = edge.confidence.max(conf);
             return;
         }
         self.edge_index
@@ -570,7 +591,7 @@ impl<'a> Builder<'a> {
             to,
             kind,
             count: 1,
-            ambiguous,
+            confidence: conf,
             line,
         });
     }
@@ -620,7 +641,7 @@ impl<'a> Builder<'a> {
                         }
                         Target::External(name) => self.external(&name),
                     };
-                    self.add_edge(from, to, EdgeKind::Imports, imp.line, false);
+                    self.add_edge(from, to, EdgeKind::Imports, imp.line, Confidence::Exact);
                 }
             }
         }
@@ -793,8 +814,8 @@ impl<'a> Builder<'a> {
                 else {
                     continue;
                 };
-                if let Some(t) = self.find_type(tr, fi) {
-                    self.add_edge(owner, t, EdgeKind::Inherits, imp.line, false);
+                if let Some((t, conf)) = self.find_type(tr, fi) {
+                    self.add_edge(owner, t, EdgeKind::Inherits, imp.line, conf);
                 }
             }
         }
@@ -812,7 +833,7 @@ impl<'a> Builder<'a> {
                     RefKind::Base => (EdgeKind::Inherits, SymKind::is_type),
                     RefKind::TypeRef => (EdgeKind::References, SymKind::is_type),
                 };
-                let (targets, ambiguous) = self.pick_targets(fi, scope, r, accept);
+                let (targets, conf) = self.pick_targets(fi, scope, r, accept);
                 for t in targets {
                     if t == scope && kind != EdgeKind::Calls {
                         continue;
@@ -821,7 +842,7 @@ impl<'a> Builder<'a> {
                     if kind == EdgeKind::References && self.graph.nodes[scope].parent == Some(t) {
                         continue;
                     }
-                    self.add_edge(scope, t, kind, r.line, ambiguous);
+                    self.add_edge(scope, t, kind, r.line, conf);
                 }
             }
         }
@@ -858,16 +879,18 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Definitions a reference may point to, and how sure the match is.
     fn pick_targets(
         &self,
         fi: usize,
         scope: usize,
         r: &extract::Ref,
         accept: fn(SymKind) -> bool,
-    ) -> (Vec<usize>, bool) {
+    ) -> (Vec<usize>, Confidence) {
+        let none = (vec![], Confidence::Ambiguous);
         let family = self.facts[fi].lang.family();
         let Some(all) = self.names.get(&r.name) else {
-            return (vec![], false);
+            return none;
         };
         let mut cands: Vec<usize> = all
             .iter()
@@ -876,9 +899,10 @@ impl<'a> Builder<'a> {
             .filter(|&n| self.lang_of_node[n].family() == family)
             .collect();
 
-        // Receiver/path qualifiers narrow the candidates down; `risky` marks method
-        // calls on values whose type we cannot know.
+        // Receiver/path qualifiers narrow the candidates down. `risky` marks method calls
+        // on values whose type we cannot know; `qualified` a match on the qualifier's name.
         let mut risky = false;
+        let mut qualified = false;
         if let Some(q) = r.qualifier.as_deref() {
             if matches!(q, "self" | "this" | "Self") {
                 let owner = self.enclosing_type(scope);
@@ -888,7 +912,12 @@ impl<'a> Builder<'a> {
                     .filter(|&n| owner.is_some() && self.graph.nodes[n].parent == owner)
                     .collect();
                 if !own.is_empty() {
-                    return (own, false);
+                    let conf = if own.len() == 1 {
+                        Confidence::Exact
+                    } else {
+                        Confidence::Ambiguous
+                    };
+                    return (own, conf);
                 }
                 // Inherited member: any method with that name.
                 cands.retain(|&n| self.graph.nodes[n].kind == SymKind::Method);
@@ -901,9 +930,10 @@ impl<'a> Builder<'a> {
                     .collect();
                 if !matched.is_empty() {
                     cands = matched;
+                    qualified = true;
                 } else if r.is_static || q.starts_with(char::is_uppercase) {
                     // `Vec::new()`, `Math.max()`: a type/module outside the repo.
-                    return (vec![], false);
+                    return none;
                 } else {
                     // `value.method()` can only target methods.
                     cands.retain(|&n| self.graph.nodes[n].kind == SymKind::Method);
@@ -912,8 +942,21 @@ impl<'a> Builder<'a> {
             }
         }
         if cands.is_empty() {
-            return (vec![], false);
+            return none;
         }
+        let common = COMMON_METHODS.contains(&r.name.as_str());
+        // A unique match: `sure` when found where it should be (same or imported file) or
+        // named by a qualifier; an unknown receiver lowers it, a common method name on an
+        // unknown receiver is a guess.
+        let unique = move |sure: bool| -> Confidence {
+            if risky && common {
+                Confidence::Ambiguous
+            } else if (sure || qualified) && !risky {
+                Confidence::Exact
+            } else {
+                Confidence::Inferred
+            }
+        };
 
         let file = &self.facts[fi].path;
         let file_node = self.file_nodes[fi];
@@ -921,25 +964,36 @@ impl<'a> Builder<'a> {
         let imported = self.imported.get(&file_node);
         let is_rust = self.facts[fi].lang == Lang::Rust;
         let krate = crate_root(file);
-        let tiers: [Box<dyn Fn(usize) -> bool>; 4] = [
-            Box::new(|n| &self.graph.nodes[n].file == file),
-            Box::new(|n| {
-                imported.is_some_and(|set| {
-                    self.file_by_path
-                        .get(&self.graph.nodes[n].file)
-                        .is_some_and(|f| set.contains(f))
-                })
-            }),
-            Box::new(|n| parent_dir(&self.graph.nodes[n].file) == dir),
-            Box::new(|n| is_rust && crate_root(&self.graph.nodes[n].file) == krate),
+        // (filter, a unique hit here is exact)
+        type Tier<'t> = (Box<dyn Fn(usize) -> bool + 't>, bool);
+        let tiers: [Tier; 4] = [
+            (Box::new(|n| &self.graph.nodes[n].file == file), true),
+            (
+                Box::new(|n| {
+                    imported.is_some_and(|set| {
+                        self.file_by_path
+                            .get(&self.graph.nodes[n].file)
+                            .is_some_and(|f| set.contains(f))
+                    })
+                }),
+                true,
+            ),
+            (
+                Box::new(|n| parent_dir(&self.graph.nodes[n].file) == dir),
+                false,
+            ),
+            (
+                Box::new(|n| is_rust && crate_root(&self.graph.nodes[n].file) == krate),
+                false,
+            ),
         ];
-        for tier in &tiers {
+        for (tier, sure) in &tiers {
             let hits: Vec<usize> = cands.iter().copied().filter(|&n| tier(n)).collect();
             match hits.len() {
                 0 => continue,
-                1 => return (hits, risky && COMMON_METHODS.contains(&r.name.as_str())),
-                k if k <= MAX_AMBIGUOUS => return (hits, true),
-                _ => return (vec![], false),
+                1 => return (hits, unique(*sure)),
+                k if k <= MAX_AMBIGUOUS => return (hits, Confidence::Ambiguous),
+                _ => return none,
             }
         }
 
@@ -948,13 +1002,14 @@ impl<'a> Builder<'a> {
         if is_rust {
             risky = true;
         }
-        if risky && (COMMON_METHODS.contains(&r.name.as_str()) || cands.len() > 1) {
-            return (vec![], false);
+        if risky && (common || cands.len() > 1) {
+            return none;
         }
         match cands.len() {
-            1 => (cands, risky),
-            k if k <= MAX_AMBIGUOUS => (cands, true),
-            _ => (vec![], false),
+            1 if risky => (cands, Confidence::Ambiguous),
+            1 => (cands, unique(false)),
+            k if k <= MAX_AMBIGUOUS => (cands, Confidence::Ambiguous),
+            _ => none,
         }
     }
 

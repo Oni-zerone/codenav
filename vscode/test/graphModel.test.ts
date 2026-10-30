@@ -42,7 +42,8 @@ const all = (over: Partial<ViewParams>): ViewParams => ({
 test('parse rejects bad input and unsupported versions', () => {
   assert.throws(() => CodeGraph.parse('{'), GraphError);
   assert.throws(() => CodeGraph.parse('{"version":1}'), GraphError);
-  assert.throws(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 3 })), /version 3/);
+  assert.throws(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 4 })), /version 4/);
+  assert.doesNotThrow(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 3 })));
   assert.doesNotThrow(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 2 })));
   assert.equal(CodeGraph.parse(JSON.stringify(sample())).size.files, 3);
 });
@@ -243,4 +244,17 @@ test('v1 graphs have no communities', () => {
   assert.equal(view.communities, undefined);
   assert.ok(view.nodes.every((n) => n.community === undefined));
   assert.equal(g.details('src/db/store.rs::Store')?.community, undefined);
+});
+
+test('v3 edge confidence marks guessed edges as ambiguous', () => {
+  const raw = sample();
+  raw.version = 3;
+  raw.edges[6] = { from: 1, to: 4, kind: 'references', count: 1, line: 4, confidence: 'ambiguous' };
+  raw.edges[5] = { ...raw.edges[5], confidence: 'inferred' };
+  const g = CodeGraph.parse(JSON.stringify(raw));
+  const view = g.build(all({ mode: 'focus', center: 'src/api/server.rs::Server', depth: 1 }), 100);
+  const ref = view.edges.find((e) => e.kind === 'references');
+  assert.equal(ref?.ambiguous, true);
+  const calls = g.build(all({ mode: 'focus', center: 'src/api/server.rs::Server::run', depth: 1 }), 100);
+  assert.equal(calls.edges.find((e) => e.kind === 'calls')?.ambiguous, undefined, 'inferred is not dashed');
 });

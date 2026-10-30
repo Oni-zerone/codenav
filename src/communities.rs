@@ -132,7 +132,11 @@ fn hub_threshold(deg: &[usize], active: &[bool], percentile: f64) -> usize {
 
 fn weight(e: &Edge) -> f64 {
     let w = 1.0 + f64::from(e.count.max(1)).ln();
-    if e.ambiguous { w * AMBIGUOUS_WEIGHT } else { w }
+    if e.is_ambiguous() {
+        w * AMBIGUOUS_WEIGHT
+    } else {
+        w
+    }
 }
 
 /// Undirected weighted graph; `adj[i]` holds merged (neighbour, weight) pairs and a

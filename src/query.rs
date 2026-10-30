@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::communities;
-use crate::graph::{EdgeKind, Graph, SymKind};
+use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 
 const MAX_CODE_LINES: usize = 150;
 const MAX_LINE_BYTES: usize = 300;
@@ -192,13 +192,13 @@ pub fn symbol_details(g: &Graph, root: &Path, i: usize, include_code: bool) -> V
 
 fn edge_ref(g: &Graph, other: usize, e: &crate::graph::Edge) -> Value {
     let mut v = json!(g.nodes[other].id);
-    if e.count > 1 || e.ambiguous {
+    if e.count > 1 || !e.confidence.is_exact() {
         let mut o = json!({ "id": g.nodes[other].id });
         if e.count > 1 {
             o["count"] = json!(e.count);
         }
-        if e.ambiguous {
-            o["ambiguous"] = json!(true);
+        if !e.confidence.is_exact() {
+            o["confidence"] = json!(e.confidence.as_str());
         }
         v = o;
     }
@@ -258,12 +258,28 @@ fn edge_allowed(kinds: &[EdgeKind], k: EdgeKind) -> bool {
     kinds.is_empty() || kinds.contains(&k)
 }
 
-/// Steps from `i` along allowed edges in the given direction: (neighbor, edge, outgoing?).
+/// Which edges a traversal may follow.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeFilter<'a> {
+    /// Allowed kinds (empty: all).
+    pub kinds: &'a [EdgeKind],
+    /// Least confidence followed.
+    pub min: Confidence,
+}
+
+impl EdgeFilter<'_> {
+    pub fn allows(&self, e: &crate::graph::Edge) -> bool {
+        edge_allowed(self.kinds, e.kind) && e.confidence >= self.min
+    }
+}
+
+/// Steps from `i` along edges allowed by `filter` in the given direction:
+/// (neighbor, edge, outgoing?).
 pub fn steps<'a>(
     g: &'a Graph,
     i: usize,
     dir: Direction,
-    kinds: &'a [EdgeKind],
+    filter: EdgeFilter<'a>,
 ) -> impl Iterator<Item = Step> + 'a {
     let out = matches!(dir, Direction::Out | Direction::Both)
         .then(|| {
@@ -282,14 +298,14 @@ pub fn steps<'a>(
         .into_iter()
         .flatten();
     out.chain(inc)
-        .filter(move |&(_, e, _)| edge_allowed(kinds, g.edges[e].kind))
+        .filter(move |&(_, e, _)| filter.allows(&g.edges[e]))
 }
 
 pub fn neighbors(
     g: &Graph,
     start: usize,
     dir: Direction,
-    kinds: &[EdgeKind],
+    filter: EdgeFilter,
     depth: u32,
     limit: usize,
 ) -> Value {
@@ -302,7 +318,7 @@ pub fn neighbors(
         if d >= depth {
             continue;
         }
-        for (next, e, _) in steps(g, cur, dir, kinds) {
+        for (next, e, _) in steps(g, cur, dir, filter) {
             let edge = &g.edges[e];
             if edges.len() >= limit * 2 {
                 truncated = true;
@@ -316,8 +332,8 @@ pub fn neighbors(
             if edge.count > 1 {
                 ev["count"] = json!(edge.count);
             }
-            if edge.ambiguous {
-                ev["ambiguous"] = json!(true);
+            if !edge.confidence.is_exact() {
+                ev["confidence"] = json!(edge.confidence.as_str());
             }
             edges.push(ev);
             if seen.insert(next) {
@@ -345,7 +361,7 @@ pub fn find_paths(
     g: &Graph,
     from: usize,
     to: usize,
-    kinds: &[EdgeKind],
+    filter: EdgeFilter,
     directed: bool,
     max_depth: u32,
     max_paths: usize,
@@ -363,7 +379,7 @@ pub fn find_paths(
         if cur == to || d >= max_depth {
             continue;
         }
-        for (next, e, fwd) in steps(g, cur, dir, kinds) {
+        for (next, e, fwd) in steps(g, cur, dir, filter) {
             match dist.get(&next) {
                 None => {
                     dist.insert(next, d + 1);
@@ -507,7 +523,10 @@ pub fn file_outline(g: &Graph, file: usize) -> Value {
 ///
 /// A method also stands in for the members it overrides: a call through the interface
 /// or base class (`repo.load()` resolved to `Repository::load`) reaches it at runtime.
-pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize) -> Value {
+///
+/// Only edges at least as sure as `min` are followed; each hit reports the confidence of
+/// the weakest edge on the path that reached it.
+pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
     let mut seeds = vec![start];
     let mut i = 0;
     while i < seeds.len() {
@@ -535,26 +554,32 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize) -> Value {
         EdgeKind::Imports,
     ];
     let mut seen = seed_set.clone();
-    let mut queue: VecDeque<(usize, u32)> = seeds.iter().map(|&s| (s, 0)).collect();
-    let mut hits: Vec<(usize, u32, EdgeKind, bool)> = Vec::new();
-    while let Some((cur, d)) = queue.pop_front() {
+    let mut queue: VecDeque<(usize, u32, Confidence)> =
+        seeds.iter().map(|&s| (s, 0, Confidence::Exact)).collect();
+    let mut hits: Vec<(usize, u32, EdgeKind, Confidence)> = Vec::new();
+    while let Some((cur, d, path_conf)) = queue.pop_front() {
         if d >= depth {
             continue;
         }
         for &e in &g.in_edges[cur] {
             let edge = &g.edges[e];
-            if !kinds.contains(&edge.kind) || !seen.insert(edge.from) {
+            if !kinds.contains(&edge.kind) || edge.confidence < min || !seen.insert(edge.from) {
                 continue;
             }
-            hits.push((edge.from, d + 1, edge.kind, edge.ambiguous));
-            queue.push_back((edge.from, d + 1));
+            let conf = path_conf.min(edge.confidence);
+            hits.push((edge.from, d + 1, edge.kind, conf));
+            queue.push_back((edge.from, d + 1, conf));
         }
     }
 
     let mut by_file: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for &(n, d, k, ambiguous) in hits.iter().take(limit) {
+    for &(n, d, k, conf) in hits.iter().take(limit) {
         let node = &g.nodes[n];
-        let guess = if ambiguous { ", ambiguous" } else { "" };
+        let guess = if conf.is_exact() {
+            String::new()
+        } else {
+            format!(", {}", conf.as_str())
+        };
         let label = if node.kind == SymKind::File {
             format!("(file) via {} [depth {d}{guess}]", k.inverse_str())
         } else {
@@ -769,12 +794,88 @@ pub fn overview(g: &Graph, top: usize) -> Value {
         "languages": langs,
         "node_kinds": kinds,
         "edge_kinds": edge_kinds,
+        "edge_confidence": confidence_shares(g),
         "most_depended_on_symbols": central,
         "most_imported_files": central_files,
         "top_external_dependencies": externals,
         "community_count": g.communities.len(),
         "largest_communities": communities,
         "hint": "Use module_graph for component-level dependencies, get_community for structural clusters, search_symbols to find ids, then get_symbol / get_neighbors / find_paths / impact_analysis.",
+    })
+}
+
+/// Share of each confidence level among dependency edges (`contains` is always exact).
+fn confidence_shares(g: &Graph) -> Value {
+    let mut counts = [0usize; 3];
+    for e in g.edges.iter().filter(|e| e.kind != EdgeKind::Contains) {
+        counts[e.confidence as usize] += 1;
+    }
+    let total: usize = counts.iter().sum();
+    let mut out = serde_json::Map::new();
+    for c in Confidence::ALL {
+        let n = counts[c as usize];
+        let pct = (n * 1000)
+            .checked_div(total)
+            .map_or(0.0, |x| x as f64 / 10.0);
+        out.insert(c.as_str().into(), json!({ "edges": n, "percent": pct }));
+    }
+    Value::Object(out)
+}
+
+/// Edges at one confidence level, to check what the name-based resolver guessed: totals
+/// per edge kind and level, then the matching edges grouped by source file, with lines.
+pub fn audit_edges(
+    g: &Graph,
+    level: Confidence,
+    path: Option<&str>,
+    kinds: &[EdgeKind],
+    limit: usize,
+) -> Value {
+    let in_scope = |e: &crate::graph::Edge| {
+        e.kind != EdgeKind::Contains
+            && edge_allowed(kinds, e.kind)
+            && path.is_none_or(|p| g.nodes[e.from].file.starts_with(p))
+    };
+    let mut totals: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
+    let mut matching: Vec<&crate::graph::Edge> = Vec::new();
+    for e in g.edges.iter().filter(|e| in_scope(e)) {
+        *totals
+            .entry(e.kind.as_str())
+            .or_default()
+            .entry(e.confidence.as_str())
+            .or_default() += 1;
+        if e.confidence == level {
+            matching.push(e);
+        }
+    }
+    matching.sort_by(|a, b| {
+        let (fa, fb) = (&g.nodes[a.from].file, &g.nodes[b.from].file);
+        fa.cmp(fb).then(a.line.cmp(&b.line)).then(a.to.cmp(&b.to))
+    });
+    let mut by_file: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for e in matching.iter().take(limit) {
+        let count = if e.count > 1 {
+            format!(" (×{})", e.count)
+        } else {
+            String::new()
+        };
+        by_file
+            .entry(g.nodes[e.from].file.as_str())
+            .or_default()
+            .push(json!(format!(
+                "L{} {} {} → {}{count}",
+                e.line,
+                g.qualified_name(e.from),
+                e.kind.as_str(),
+                g.nodes[e.to].id
+            )));
+    }
+    json!({
+        "confidence": level.as_str(),
+        "totals_by_kind": totals,
+        "matching_edges": matching.len(),
+        "truncated": matching.len() > limit,
+        "by_file": by_file,
     })
 }
 
@@ -834,7 +935,7 @@ pub fn community(g: &Graph, c: u32, from: Option<usize>, limit: usize) -> Value 
     }
     impl Count {
         fn add(&mut self, e: &crate::graph::Edge) {
-            if e.ambiguous {
+            if e.is_ambiguous() {
                 self.ambiguous += e.count;
             } else {
                 self.edges += e.count;
