@@ -116,8 +116,8 @@ pub fn dependency_degree(g: &Graph, i: usize) -> usize {
     others.len()
 }
 
-/// Degree above which a node is a hub.
-fn hub_threshold(deg: &[usize], active: &[bool], percentile: f64) -> usize {
+/// Degree above which a node is a hub (shared with insights).
+pub fn hub_threshold(deg: &[usize], active: &[bool], percentile: f64) -> usize {
     let mut sorted: Vec<usize> = (0..deg.len())
         .filter(|&i| active[i])
         .map(|i| deg[i])
@@ -290,9 +290,7 @@ fn label_communities(g: &Graph, groups: &[Vec<usize>], dep_degree: &[usize]) -> 
     let dirs: Vec<String> = groups
         .iter()
         .map(|m| {
-            let (dir, _) = dominant(m, |i| {
-                g.nodes[i].file.rsplit_once('/').map_or("", |(d, _)| d)
-            });
+            let (dir, _) = dominant(m, |i| crate::graph::dir_of(&g.nodes[i].file));
             if dir.is_empty() {
                 "(root)".to_string()
             } else {

@@ -4,6 +4,7 @@ mod explore;
 mod extract;
 mod graph;
 mod indexer;
+mod insights;
 mod lang;
 mod mcp;
 mod output;

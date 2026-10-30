@@ -295,6 +295,11 @@ pub struct Graph {
     pub by_file: HashMap<String, usize>,
 }
 
+/// Directory of a repo-relative path ("" for top-level files).
+pub fn dir_of(file: &str) -> &str {
+    file.rsplit_once('/').map_or("", |(d, _)| d)
+}
+
 fn default_hub_percentile() -> f64 {
     crate::communities::DEFAULT_HUB_PERCENTILE
 }

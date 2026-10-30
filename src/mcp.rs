@@ -12,6 +12,7 @@ use crate::cycles;
 use crate::explore;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
+use crate::insights;
 use crate::output;
 use crate::query::{self, Direction, EdgeFilter};
 use crate::tests_for;
@@ -38,6 +39,8 @@ pub struct Server {
     last_stale_check: Instant,
     auto_refresh: bool,
     index_options: IndexOptions,
+    /// insights for (graph build time in ms, top): costly, changes only on reindex.
+    insights_cache: Option<((u64, usize), Value)>,
 }
 
 impl Server {
@@ -53,6 +56,7 @@ impl Server {
             last_stale_check: Instant::now(),
             auto_refresh,
             index_options,
+            insights_cache: None,
         }
     }
 
@@ -184,6 +188,17 @@ impl Server {
             return self.reindex();
         }
         self.refresh_if_stale();
+        if name == "insights" {
+            let key = (self.graph.indexed_at_ms, uint(a, "top", 10)?.clamp(1, 50));
+            if let Some((k, v)) = &self.insights_cache
+                && *k == key
+            {
+                return Ok(v.clone());
+            }
+            let v = insights::insights(&self.graph, key.1);
+            self.insights_cache = Some((key, v.clone()));
+            return Ok(v);
+        }
         let g = &self.graph;
         match name {
             "graph_overview" => {
@@ -435,6 +450,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "audit_edges" => "narrow with path or edge_kinds, or lower limit",
         "find_cycles" => "lower limit or max_length",
         "tests_for" => "lower depth or limit, or raise min_confidence",
+        "insights" => "lower top",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -654,6 +670,13 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "insights",
+            "description": "What deserves a closer look: surprising cross-file connections (low confidence, crossing communities with few links, peripheral code reaching a hub), bridge nodes joining communities (approximate betweenness), and suggested questions to investigate. Deterministic.",
+            "inputSchema": { "type": "object", "properties": {
+                "top": { "type": "integer", "description": "Entries per section (1-50, default 10)." }
+            } }
         },
         {
             "name": "tests_for",

@@ -1342,6 +1342,73 @@ fn tests_for_review_cases() {
     assert_eq!(v["direct"][0]["file"], "rs/parser/tests.rs", "{v:#}");
 }
 
+#[test]
+fn insights_are_deterministic_on_the_fixture() {
+    let a = tool("insights", json!({}));
+    let b = tool("insights", json!({}));
+    assert_eq!(a, b);
+    for section in ["surprising_connections", "bridges", "suggested_questions"] {
+        assert!(a[section].is_array(), "{section}: {a:#}");
+    }
+    // The Swift call to `load` is guessed between Repository and ItemStore.
+    let questions = a["suggested_questions"].to_string();
+    assert!(questions.contains("ViewModel::refresh"), "{a:#}");
+}
+
+#[test]
+fn insights_find_lone_links_and_bridges() {
+    // Two tight clusters (a*, b*) joined only through `bridge`.
+    let mut files: Vec<(String, String)> = Vec::new();
+    for c in ["a", "b"] {
+        let mut src = String::new();
+        for i in 0..6 {
+            src.push_str(&format!("def {c}{i}():\n"));
+            for j in 0..6 {
+                if j != i {
+                    src.push_str(&format!("    {c}{j}()\n"));
+                }
+            }
+        }
+        files.push((format!("{c}/{c}.py"), src));
+    }
+    files.push((
+        "hub/bridge.py".into(),
+        "from a.a import a0\nfrom b.b import b0\n\ndef bridge():\n    a0()\n    b0()\n".into(),
+    ));
+    let files: Vec<(&str, String)> = files.iter().map(|(p, s)| (p.as_str(), s.clone())).collect();
+    let repo = TempRepo::new("insights", &files);
+    let (ok, text) = tool_text_in(&repo.0, "insights", json!({ "format": "json" }));
+    assert!(ok, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(v["bridges"][0]["id"], "hub/bridge.py::bridge", "{v:#}");
+    assert_eq!(
+        v["bridges"][0]["connects"].as_array().unwrap().len(),
+        2,
+        "{v:#}"
+    );
+    let surprises = v["surprising_connections"].as_array().unwrap();
+    assert_eq!(
+        surprises.len(),
+        2,
+        "only the two links out of the hub: {v:#}"
+    );
+    for s in surprises {
+        assert!(
+            s["why"]
+                .as_str()
+                .unwrap()
+                .contains("the only link between them"),
+            "{v:#}"
+        );
+    }
+    let questions = v["suggested_questions"].to_string();
+    assert!(
+        questions.contains("Why does hub/bridge.py::bridge connect"),
+        "{v:#}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
@@ -1610,6 +1677,7 @@ fn every_structured_tool_respects_token_budget() {
             "tests_for",
             json!({ "id": "src/graph.rs::Graph", "depth": 8 }),
         ),
+        ("insights", json!({ "top": 50 })),
         (
             "find_cycles",
             json!({ "edge_kinds": ["imports", "calls", "references"], "min_confidence": "ambiguous" }),
