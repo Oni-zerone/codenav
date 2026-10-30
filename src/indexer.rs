@@ -637,6 +637,12 @@ impl<'a> Builder<'a> {
             let edge = &mut self.graph.edges[e];
             edge.count += 1;
             edge.line = edge.line.min(line);
+            if kind != EdgeKind::Contains {
+                // Refs arrive in source order per file: keep ascending, distinct lines.
+                if let Err(at) = edge.lines.binary_search(&line) {
+                    edge.lines.insert(at, line);
+                }
+            }
             // One sure occurrence is enough to trust the relation.
             edge.confidence = edge.confidence.max(conf);
             return;
@@ -650,6 +656,11 @@ impl<'a> Builder<'a> {
             count: 1,
             confidence: conf,
             line,
+            lines: if kind == EdgeKind::Contains {
+                Vec::new()
+            } else {
+                vec![line]
+            },
         });
     }
 

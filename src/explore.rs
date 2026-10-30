@@ -507,6 +507,9 @@ fn render(
             if let Some(l) = edge.confidence.label() {
                 line.push_str(&format!(" ({l})"));
             }
+            if edge.kind != EdgeKind::Contains {
+                line.push_str(&format!(" {}", edge.sites_text()));
+            }
             edges.push((r, line));
         }
         edges.sort();

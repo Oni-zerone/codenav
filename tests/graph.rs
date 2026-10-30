@@ -780,7 +780,11 @@ fn js_resolution_respects_module_scope() {
         ],
     );
     let a = symbol_in(&repo, "lib/a.ts::a");
-    assert_eq!(a["outgoing"]["calls"], json!(["lib/a.ts::helper"]), "{a:#}");
+    assert_eq!(
+        a["outgoing"]["calls"],
+        json!([{ "id": "lib/a.ts::helper", "call_sites": [2] }]),
+        "{a:#}"
+    );
     let c = symbol_in(&repo, "app/c.ts::c");
     assert!(
         c["outgoing"].get("calls").is_none(),
@@ -1409,6 +1413,51 @@ fn insights_find_lone_links_and_bridges() {
     );
 }
 
+#[test]
+fn call_sites_record_every_line() {
+    let repo = TempRepo::new(
+        "callsites",
+        &[(
+            "m.py",
+            "def g():\n    pass\n\ndef f():\n    g()\n    x = 1\n    g()\n\ndef h():\n    g(); g()\n".into(),
+        )],
+    );
+    let f = symbol_in(&repo, "m.py::f");
+    assert_eq!(
+        f["outgoing"]["calls"],
+        json!([{ "id": "m.py::g", "count": 2, "call_sites": [5, 7] }]),
+        "{f:#}"
+    );
+    // Two calls on one line: counted twice, one site.
+    let h = symbol_in(&repo, "m.py::h");
+    assert_eq!(
+        h["outgoing"]["calls"],
+        json!([{ "id": "m.py::g", "count": 2, "call_sites": [10] }]),
+        "{h:#}"
+    );
+    // The callee sees where it is called from.
+    let g = symbol_in(&repo, "m.py::g");
+    assert!(
+        g["incoming"]["called_by"]
+            .to_string()
+            .contains("\"call_sites\":[5,7]"),
+        "{g:#}"
+    );
+
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_neighbors",
+        json!({ "id": "m.py::f", "direction": "out", "format": "json" }),
+    );
+    assert!(ok && text.contains("\"call_sites\":[5,7]"), "{text}");
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "", "seeds": ["m.py::f"] }),
+    );
+    assert!(ok && text.contains("calls → m.py::g (×2) L5,7"), "{text}");
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
@@ -1429,7 +1478,7 @@ fn merged_edges_keep_the_best_confidence() {
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         v["outgoing"]["calls"],
-        json!([{ "id": "a.py::A::helper", "count": 2 }]),
+        json!([{ "id": "a.py::A::helper", "count": 2, "call_sites": [6, 7] }]),
         "{v:#}"
     );
 }
@@ -1745,7 +1794,7 @@ fn text_and_json_formats() {
         "{text}"
     );
     assert!(
-        text.contains("  calls:\n    - py/app/models.py::User\n"),
+        text.contains("  calls:\n    - id: py/app/models.py::User\n      call_sites: [7]\n"),
         "{text}"
     );
     assert!(text.contains("code: |\n      6 |     def create"), "{text}");

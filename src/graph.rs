@@ -21,7 +21,8 @@ const FORMAT_VERSION: u32 = 3;
 /// same sources would give a different graph: older indexes are then stale and rebuilt,
 /// while readers of the format (like the VS Code extension) are unaffected.
 /// 1: JS/TS module scoping, JSX components only, top-level constants.
-pub const ANALYSIS_VERSION: u32 = 1;
+/// 2: `Edge::lines` (every line of a relation, e.g. call sites).
+pub const ANALYSIS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -244,11 +245,39 @@ pub struct Edge {
     pub confidence: Confidence,
     /// First line in the source file where the relation occurs.
     pub line: u32,
+    /// Every line where it occurs, ascending (dependency edges; empty in older indexes
+    /// and for containment).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<u32>,
 }
 
 impl Edge {
     pub fn is_ambiguous(&self) -> bool {
         self.confidence == Confidence::Ambiguous
+    }
+
+    /// Lines of the source file of `from` where the relation occurs.
+    pub fn sites(&self) -> Vec<u32> {
+        if self.lines.is_empty() {
+            vec![self.line]
+        } else {
+            self.lines.clone()
+        }
+    }
+
+    /// Name of `sites` in tool output: `call_sites` for calls, `lines` otherwise.
+    pub fn sites_key(&self) -> &'static str {
+        if self.kind == EdgeKind::Calls {
+            "call_sites"
+        } else {
+            "lines"
+        }
+    }
+
+    /// `L12,40` for the text views.
+    pub fn sites_text(&self) -> String {
+        let lines: Vec<String> = self.sites().iter().map(u32::to_string).collect();
+        format!("L{}", lines.join(","))
     }
 }
 
