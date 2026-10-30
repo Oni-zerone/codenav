@@ -18,6 +18,8 @@ use crate::extract::{self, FileFacts, RefKind};
 use crate::graph::{Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
 use crate::lang::Lang;
 
+/// Project-specific exclusions, same syntax as `.gitignore`.
+pub const IGNORE_FILE: &str = ".codenavignore";
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_AMBIGUOUS: usize = 3;
 const SKIP_DIRS: &[&str] = &[
@@ -111,6 +113,7 @@ pub struct SourceFile {
 pub fn discover(root: &Path) -> Vec<SourceFile> {
     let mut files: Vec<SourceFile> = WalkBuilder::new(root)
         .require_git(false)
+        .add_custom_ignore_filename(IGNORE_FILE)
         .filter_entry(|e| {
             !(e.file_type().is_some_and(|t| t.is_dir())
                 && e.file_name()
@@ -1020,6 +1023,77 @@ fn to_unix(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway repository with the given files, removed on drop.
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(name: &str, files: &[(&str, &str)]) -> TempRepo {
+            let dir =
+                std::env::temp_dir().join(format!("codenav-unit-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            for (path, content) in files {
+                let p = dir.join(path);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, content).unwrap();
+            }
+            TempRepo(dir)
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn codenavignore_excludes_paths_at_any_level() {
+        let repo = TempRepo::new(
+            "ignore",
+            &[
+                (".codenavignore", "gen/\n"),
+                ("a.py", "def a(): pass\n"),
+                ("gen/b.py", "def b(): pass\n"),
+                ("sub/.codenavignore", "local.py\n"),
+                ("sub/local.py", "def c(): pass\n"),
+                ("sub/kept.py", "def d(): pass\n"),
+                ("other/local.py", "def e(): pass\n"),
+            ],
+        );
+        let files: Vec<String> = discover(&repo.0).into_iter().map(|f| f.rel).collect();
+        assert_eq!(files, vec!["a.py", "other/local.py", "sub/kept.py"]);
+
+        // Indexing an excluded directory directly still works.
+        let gen_files: Vec<String> = discover(&repo.0.join("gen"))
+            .into_iter()
+            .map(|f| f.rel)
+            .collect();
+        assert_eq!(gen_files, vec!["b.py"]);
+    }
+
+    #[test]
+    fn changes_to_ignored_files_do_not_make_the_index_stale() {
+        let repo = TempRepo::new(
+            "stale",
+            &[
+                (".codenavignore", "gen/\n"),
+                ("a.py", "def a(): pass\n"),
+                ("gen/b.py", "x = 1\n"),
+            ],
+        );
+        // The index timestamp has second precision: files written in the same second
+        // as the indexing count as newer (a harmless extra re-index), so wait first.
+        std::thread::sleep(Duration::from_millis(1100));
+        let (graph, _) = index(&repo.0).unwrap();
+        assert!(!is_stale(&repo.0, &graph));
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(repo.0.join("gen/b.py"), "x = 2\n").unwrap();
+        fs::write(repo.0.join("gen/new.py"), "y = 1\n").unwrap();
+        assert!(!is_stale(&repo.0, &graph));
+        fs::write(repo.0.join("a.py"), "def a(): return 1\n").unwrap();
+        assert!(is_stale(&repo.0, &graph));
+    }
 
     #[test]
     fn rust_use_expansion() {
