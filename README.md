@@ -42,6 +42,9 @@ globali (al massimo 3). Alcune euristiche riducono i falsi positivi:
   la classe non è esportata. Una funzione annidata è visibile solo dentro la funzione che la
   contiene. I file senza `import`, `export` né `module.exports` sono script: le loro definizioni
   di primo livello sono globali; un file CommonJS senza `export` espone tutto a chi lo importa;
+- monorepo: gli import dei package locali (workspace npm con il loro `package.json`, crate Cargo
+  con il loro `Cargo.toml`) sono collegati ai file del package (punto d'ingresso, o il file di un
+  sottopercorso come `@acme/utils/strings`) invece di restare pacchetti esterni;
 - JSX: solo i tag con iniziale maiuscola (`<Card>`, `<ui.Card>`) sono componenti; `<p>`,
   `<summary>` sono elementi HTML e non diventano chiamate;
 - JS/TS: le `const` di primo livello che non sono funzioni (oggetti, `Set`, schemi Zod…) sono nodi
@@ -156,7 +159,9 @@ invece il risultato JSON completo, senza budget.
 `codenav serve repo-a repo-b …` serve più repository da un solo server: ogni tool accetta
 `project` (il nome mostrato da `list_projects`, o il path), e senza `project` risponde sul primo.
 I grafi si caricano al primo uso; al massimo `--max-loaded` (default 4) restano in memoria, i meno
-usati di recente vengono scaricati e ricaricati dal loro indice quando servono. Con
+usati di recente vengono scaricati e ricaricati dal loro indice quando servono.
+`list_projects` elenca anche i package dichiarati da ogni progetto, e `get_symbol` su un pacchetto
+esterno indica quale progetto servito lo fornisce (`provided_by_project`). Con
 `--any-project` i tool possono aprire anche altri repository indicandone il path assoluto (solo
 cartelle con `.git` o con un indice codenav). `--fresh` e `--hub-percentile` valgono per tutti i
 repository.

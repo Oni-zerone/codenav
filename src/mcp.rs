@@ -15,6 +15,7 @@ use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::insights;
 use crate::output;
+use crate::packages;
 use crate::query::{self, Direction, EdgeFilter};
 use crate::tests_for;
 use crate::vcs;
@@ -242,6 +243,17 @@ impl Server {
         Ok(())
     }
 
+    /// Packages a project declares, from its graph (loaded, or its saved index).
+    fn project_packages(&self, i: usize) -> Vec<packages::PackageRef> {
+        if i == self.active {
+            return self.cur.graph.packages.clone();
+        }
+        match &self.projects[i].parked {
+            Some(state) => state.graph.packages.clone(),
+            None => Graph::saved_packages(&self.projects[i].root),
+        }
+    }
+
     fn list_projects(&self) -> Value {
         json!(
             self.projects
@@ -253,6 +265,11 @@ impl Server {
                     "default": i == 0,
                     "active": i == self.active,
                     "loaded": i == self.active || p.parked.is_some(),
+                    "packages": self
+                        .project_packages(i)
+                        .into_iter()
+                        .map(|p| p.name)
+                        .collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>()
         )
@@ -545,7 +562,26 @@ impl Server {
             "get_symbol" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 let code = opt_bool(a, "include_code")?.unwrap_or(true);
-                Ok(query::symbol_details(g, &self.cur.root, i, code))
+                let mut v = query::symbol_details(g, &self.cur.root, i, code);
+                // An external package that another served project declares (same
+                // ecosystem as the files importing it): say which.
+                if g.nodes[i].kind == SymKind::External
+                    && let Some(kind) = external_ecosystem(g, i)
+                {
+                    let name = g.nodes[i].name.clone();
+                    let provider =
+                        (0..self.projects.len())
+                            .filter(|&k| k != self.active)
+                            .find(|&k| {
+                                self.project_packages(k)
+                                    .iter()
+                                    .any(|p| p.kind == kind && p.name == name)
+                            });
+                    if let Some(k) = provider {
+                        v["provided_by_project"] = json!(self.projects[k].name);
+                    }
+                }
+                Ok(v)
             }
             "get_neighbors" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
@@ -835,6 +871,19 @@ fn architecture_review(focus: Option<&str>) -> Value {
     json!({
         "description": description,
         "messages": [{ "role": "user", "content": { "type": "text", "text": text } }],
+    })
+}
+
+/// The ecosystem of an external package, from the files importing it.
+fn external_ecosystem(g: &Graph, ext: usize) -> Option<packages::PackageKind> {
+    g.in_edges[ext].iter().find_map(|&e| {
+        let edge = &g.edges[e];
+        let lang = g.nodes[edge.from].lang?;
+        match lang.family() {
+            "js" => Some(packages::PackageKind::Npm),
+            "rust" => Some(packages::PackageKind::Crate),
+            _ => None,
+        }
     })
 }
 

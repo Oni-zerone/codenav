@@ -9,6 +9,7 @@ mod insights;
 mod lang;
 mod mcp;
 mod output;
+mod packages;
 mod query;
 mod tests_for;
 mod vcs;

@@ -2190,6 +2190,192 @@ fn common_method_evidence_review_cases() {
     );
 }
 
+#[test]
+fn local_packages_resolve_across_a_monorepo() {
+    let repo = TempRepo::new(
+        "monorepo",
+        &[
+            ("package.json", r#"{"private":true,"workspaces":["packages/*"]}"#.into()),
+            (
+                "packages/utils/package.json",
+                r#"{"name":"@acme/utils","main":"dist/index.js"}"#.into(),
+            ),
+            ("packages/utils/src/index.ts", "export function helper() { return 1; }\n".into()),
+            ("packages/utils/src/strings.ts", "export function shout(s: string) { return s; }\n".into()),
+            ("packages/app/package.json", r#"{"name":"@acme/app"}"#.into()),
+            (
+                "packages/app/src/main.ts",
+                "import { helper } from '@acme/utils';\nimport { shout } from '@acme/utils/strings';\n\
+                 import React from 'react';\nexport function run() { helper(); shout('x'); }\n"
+                    .into(),
+            ),
+            ("crates/core/Cargo.toml", "[package]\nname = \"acme-core\"\n".into()),
+            ("crates/core/src/lib.rs", "pub fn start() {}\n".into()),
+            ("crates/cli/Cargo.toml", "[package]\nname = \"acme-cli\"\n".into()),
+            ("crates/cli/src/main.rs", "use acme_core::start;\nfn main() { start(); }\n".into()),
+        ],
+    );
+    let main = symbol_in(&repo, "packages/app/src/main.ts");
+    let imports = main["outgoing"]["imports"].to_string();
+    assert!(imports.contains("packages/utils/src/index.ts"), "{main:#}");
+    assert!(
+        imports.contains("packages/utils/src/strings.ts"),
+        "{main:#}"
+    );
+    assert!(
+        imports.contains("ext:react"),
+        "real packages stay external: {main:#}"
+    );
+    let run = symbol_in(&repo, "packages/app/src/main.ts::run");
+    assert_eq!(
+        run["outgoing"]["calls"],
+        json!([
+            { "id": "packages/utils/src/index.ts::helper", "call_sites": [4] },
+            { "id": "packages/utils/src/strings.ts::shout", "call_sites": [4] }
+        ]),
+        "exact calls: {run:#}"
+    );
+    let cli = symbol_in(&repo, "crates/cli/src/main.rs::main");
+    assert_eq!(
+        cli["outgoing"]["calls"],
+        json!([{ "id": "crates/core/src/lib.rs::start", "call_sites": [2] }]),
+        "{cli:#}"
+    );
+
+    // Served together, an external package of one project points to the project that has it.
+    let app = TempRepo::new(
+        "monorepo-app",
+        &[(
+            "src/a.ts",
+            "import { helper } from '@acme/utils';\nexport function a() { helper(); }\n".into(),
+        )],
+    );
+    let r = serve_calls(
+        &[app.0.as_os_str(), repo.0.as_os_str()],
+        &[
+            (
+                "get_symbol",
+                json!({ "id": "ext:@acme/utils", "include_code": false, "format": "json" }),
+            ),
+            ("list_projects", json!({ "format": "json" })),
+        ],
+    );
+    let ext: Value = serde_json::from_str(&r[0].1).unwrap();
+    let monorepo_name = repo.0.file_name().unwrap().to_str().unwrap();
+    assert_eq!(ext["provided_by_project"], monorepo_name, "{ext:#}");
+    let projects: Value = serde_json::from_str(&r[1].1).unwrap();
+    assert!(
+        projects["projects"][1]["packages"]
+            .to_string()
+            .contains("@acme/utils"),
+        "{projects:#}"
+    );
+}
+
+#[test]
+fn local_package_review_cases() {
+    let repo = TempRepo::new(
+        "monorepo2",
+        &[
+            // Workspaces declared: only packages/* count.
+            ("package.json", r#"{"private":true,"workspaces":["packages/*"]}"#.into()),
+            (
+                "packages/utils/package.json",
+                r#"{"name":"@acme/utils","exports":{".":"./dist/index.js","./str":"./dist/strings/index.js"}}"#.into(),
+            ),
+            ("packages/utils/src/index.ts", "export function helper() {}\n".into()),
+            ("packages/utils/src/strings/index.ts", "export function shout() {}\n".into()),
+            ("tools/gen/package.json", r#"{"name":"gen"}"#.into()),
+            ("tools/gen/index.ts", "export function gen() {}\n".into()),
+            // A test shim named like a real package, outside the workspaces.
+            ("tests/fixtures/react-shim/package.json", r#"{"name":"react"}"#.into()),
+            ("tests/fixtures/react-shim/index.ts", "export default {};\n".into()),
+            (
+                "packages/app/src/main.ts",
+                "import { shout } from '@acme/utils/str';\nimport React from 'react';\nimport { gen } from 'gen';\n\
+                 export function run() { shout(); gen(); }\n"
+                    .into(),
+            ),
+            // Two crates, one with a module named like the other's item.
+            ("crates/core/Cargo.toml", "[package]\nname = \"acme-core\" # core\n".into()),
+            ("crates/core/src/lib.rs", "pub fn start() {}\n".into()),
+            ("crates/cli/Cargo.toml", "[package]\nname = \"acme-cli\"\n".into()),
+            ("crates/cli/src/start.rs", "pub fn start() {}\n".into()),
+            ("crates/cli/src/main.rs", "mod start;\nuse acme_core::start;\nfn main() { start(); }\n".into()),
+        ],
+    );
+    let main = symbol_in(&repo, "packages/app/src/main.ts");
+    let imports = main["outgoing"]["imports"].to_string();
+    assert!(
+        imports.contains("packages/utils/src/strings/index.ts"),
+        "exports subpath: {main:#}"
+    );
+    assert!(
+        imports.contains("ext:react"),
+        "a test shim is not react: {main:#}"
+    );
+    assert!(
+        imports.contains("ext:gen"),
+        "not a declared workspace: {main:#}"
+    );
+    let cli = symbol_in(&repo, "crates/cli/src/main.rs::main");
+    assert!(
+        cli["outgoing"]["calls"]
+            .to_string()
+            .contains("crates/core/src/lib.rs::start"),
+        "{cli:#}"
+    );
+
+    // Editing a manifest makes the index stale.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::write(repo.0.join("tools/gen/package.json"), r#"{"name":"gen2"}"#).unwrap();
+    let out = codenav()
+        .args(["tool", "graph_overview"])
+        .arg(&repo.0)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stale"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Duplicate names are not resolved.
+    let dup = TempRepo::new(
+        "monorepo-dup",
+        &[
+            ("a/package.json", r#"{"name":"shared"}"#.into()),
+            ("a/index.ts", "export function x() {}\n".into()),
+            ("b/package.json", r#"{"name":"shared"}"#.into()),
+            ("b/index.ts", "export function x() {}\n".into()),
+            (
+                "c/main.ts",
+                "import { x } from 'shared';\nexport function m() { x(); }\n".into(),
+            ),
+        ],
+    );
+    let m = symbol_in(&dup, "c/main.ts");
+    assert!(
+        m["outgoing"]["imports"].to_string().contains("ext:shared"),
+        "{m:#}"
+    );
+
+    // A Python import named like a crate of another served project: not provided by it.
+    let py = TempRepo::new(
+        "monorepo-py",
+        &[("m.py", "import acme_core\n\ndef f():\n    pass\n".into())],
+    );
+    let r = serve_calls(
+        &[py.0.as_os_str(), repo.0.as_os_str()],
+        &[(
+            "get_symbol",
+            json!({ "id": "ext:acme_core", "include_code": false, "format": "json" }),
+        )],
+    );
+    let ext: Value = serde_json::from_str(&r[0].1).unwrap();
+    assert!(ext.get("provided_by_project").is_none(), "{ext:#}");
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {

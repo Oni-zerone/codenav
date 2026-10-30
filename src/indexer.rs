@@ -21,6 +21,7 @@ use crate::communities;
 use crate::extract::{self, FileFacts, RefKind};
 use crate::graph::{Confidence, Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
 use crate::lang::Lang;
+use crate::packages::{self, PackageKind};
 use crate::vcs;
 
 /// Project-specific exclusions, same syntax as `.gitignore`.
@@ -116,9 +117,11 @@ pub struct SourceFile {
     pub lang: Lang,
 }
 
-pub fn discover(root: &Path) -> Vec<SourceFile> {
+/// Files under `root` that indexing considers: .gitignore and .codenavignore rules, no
+/// dependency or build directories. Shared with package discovery.
+pub fn walk_files(root: &Path) -> impl Iterator<Item = ignore::DirEntry> {
     let excludes = CodenavIgnore::new(root);
-    let mut files: Vec<SourceFile> = WalkBuilder::new(root)
+    WalkBuilder::new(root)
         .require_git(false)
         .filter_entry(move |e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir());
@@ -131,19 +134,47 @@ pub fn discover(root: &Path) -> Vec<SourceFile> {
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
-        .filter(|e| e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES))
-        .filter_map(|e| {
-            let lang = Lang::from_path(e.path())?;
-            let rel = e.path().strip_prefix(root).ok()?;
-            Some(SourceFile {
-                rel: to_unix(rel),
-                abs: e.path().to_path_buf(),
-                lang,
-            })
-        })
-        .collect();
-    files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    files
+}
+
+/// What one walk of the repository finds: source files to index and package manifests.
+pub struct Tree {
+    pub sources: Vec<SourceFile>,
+    /// package.json, Cargo.toml, pnpm-workspace.yaml (absolute paths, sorted).
+    pub manifests: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+fn discover(root: &Path) -> Vec<SourceFile> {
+    scan(root).sources
+}
+
+pub fn scan(root: &Path) -> Tree {
+    let mut sources = Vec::new();
+    let mut manifests = Vec::new();
+    for e in walk_files(root) {
+        let name = e.file_name().to_string_lossy();
+        if packages::MANIFESTS.contains(&name.as_ref()) {
+            manifests.push(e.path().to_path_buf());
+            continue;
+        }
+        if !e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
+            continue;
+        }
+        let Some(lang) = Lang::from_path(e.path()) else {
+            continue;
+        };
+        let Ok(rel) = e.path().strip_prefix(root) else {
+            continue;
+        };
+        sources.push(SourceFile {
+            rel: to_unix(rel),
+            abs: e.path().to_path_buf(),
+            lang,
+        });
+    }
+    sources.sort_by(|a, b| a.rel.cmp(&b.rel));
+    manifests.sort();
+    Tree { sources, manifests }
 }
 
 /// `.codenavignore` rules, applied on top of the walker's own filters (`.gitignore`,
@@ -218,8 +249,9 @@ pub fn is_stale(root: &Path, graph: &Graph) -> bool {
     if graph.analysis != crate::graph::ANALYSIS_VERSION {
         return true;
     }
-    let files = discover(root);
-    if files.len() != graph.by_file.len() {
+    let tree = scan(root);
+    let files = tree.sources;
+    if files.len() != graph.by_file.len() || tree.manifests.len() != graph.manifest_files {
         return true;
     }
     // Milliseconds when known: whole seconds would flag files saved just before indexing.
@@ -228,12 +260,16 @@ pub fn is_stale(root: &Path, graph: &Graph) -> bool {
     } else {
         UNIX_EPOCH + Duration::from_secs(graph.indexed_at)
     };
-    files.iter().any(|f| {
-        !graph.by_file.contains_key(&f.rel)
-            || fs::metadata(&f.abs)
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t > since)
-    })
+    let changed = |p: &Path| {
+        fs::metadata(p)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t > since)
+    };
+    // Package manifests decide how imports resolve: their changes count too.
+    files
+        .iter()
+        .any(|f| !graph.by_file.contains_key(&f.rel) || changed(&f.abs))
+        || tree.manifests.iter().any(|m| changed(m))
 }
 
 /// Explicit settings win; otherwise keep those of the saved index, so a later
@@ -324,7 +360,8 @@ pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats
     let started = Instant::now();
     // Timestamp taken before reading, so edits made during indexing count as stale.
     let started_at = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let files = discover(root);
+    let tree = scan(root);
+    let files = tree.sources;
 
     let results: Vec<Result<FileFacts, String>> = files
         .par_iter()
@@ -343,7 +380,8 @@ pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats
         }
     }
 
-    let mut graph = Builder::new(root, &facts).build();
+    let mut graph = Builder::new(root, &facts, &tree.manifests).build();
+    graph.manifest_files = tree.manifests.len();
     graph.indexed_at = started_at.as_secs();
     graph.indexed_at_ms = started_at.as_millis() as u64;
     graph.build_indexes();
@@ -390,6 +428,11 @@ struct Builder<'a> {
     child_ranges: HashMap<usize, Vec<(usize, usize)>>,
     /// file index -> name or qualifier -> byte offsets of the refs using it
     mentions: Vec<HashMap<String, Vec<usize>>>,
+    /// local npm packages: name -> index in `packages`, entry file
+    npm_packages: HashMap<String, (usize, Option<usize>)>,
+    /// local crates: name -> (module root directory, lib file)
+    crates: HashMap<String, (String, usize)>,
+    packages: Vec<packages::Package>,
     /// path without extension -> file node (also `dir` for mod.rs / __init__.py / index.ts)
     stems: HashMap<String, usize>,
     /// every path suffix of a stem (by component) -> file nodes
@@ -416,7 +459,7 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(root: &Path, facts: &'a [FileFacts]) -> Self {
+    fn new(root: &Path, facts: &'a [FileFacts], manifests: &[PathBuf]) -> Self {
         Builder {
             facts,
             graph: Graph::new(root),
@@ -438,6 +481,9 @@ impl<'a> Builder<'a> {
             def_ranges: HashMap::new(),
             child_ranges: HashMap::new(),
             mentions: Vec::new(),
+            npm_packages: HashMap::new(),
+            crates: HashMap::new(),
+            packages: packages::from_manifests(root, manifests),
             script_files: HashSet::new(),
             reexports: HashMap::new(),
             unresolved_imports: Vec::new(),
@@ -446,6 +492,7 @@ impl<'a> Builder<'a> {
 
     fn build(mut self) -> Graph {
         self.add_files_and_defs();
+        self.map_packages();
         // Owners and base types are looked up in imported files too.
         self.collect_imported_files();
         self.resolve_owners();
@@ -454,6 +501,14 @@ impl<'a> Builder<'a> {
         self.resolve_imports();
         self.resolve_impls();
         self.resolve_refs();
+        self.graph.packages = self
+            .packages
+            .iter()
+            .map(|p| packages::PackageRef {
+                kind: p.kind,
+                name: p.name.clone(),
+            })
+            .collect();
         self.graph
     }
 
@@ -774,6 +829,41 @@ impl<'a> Builder<'a> {
         n
     }
 
+    /// Maps local package names to their indexed entry files.
+    fn map_packages(&mut self) {
+        let mut npm = HashMap::new();
+        let mut crates = HashMap::new();
+        for (k, p) in self.packages.iter().enumerate() {
+            let entry = p.entries.iter().find_map(|e| self.lookup_stem(e));
+            match p.kind {
+                PackageKind::Npm => {
+                    npm.insert(p.name.clone(), (k, entry));
+                }
+                PackageKind::Crate => {
+                    if let Some(lib) = entry {
+                        crates.insert(
+                            p.name.clone(),
+                            (parent_dir(&self.graph.nodes[lib].file), lib),
+                        );
+                    }
+                }
+            }
+        }
+        self.npm_packages = npm;
+        self.crates = crates;
+    }
+
+    /// The file node for a module path, with or without its extension (`a/b.ts`, `a/b`,
+    /// or a directory with an index file).
+    fn lookup_stem(&self, p: &str) -> Option<usize> {
+        let p = p.trim_end_matches('/');
+        let without_ext = match p.rsplit_once('.') {
+            Some((s, ext)) if !s.is_empty() && !ext.contains('/') => s,
+            _ => p,
+        };
+        self.stems.get(p).or(self.stems.get(without_ext)).copied()
+    }
+
     /// Import targets of file `fi` (repo files and external packages).
     fn import_targets(&self, fi: usize, imp: &extract::Import) -> Vec<Target> {
         let f = &self.facts[fi];
@@ -898,6 +988,15 @@ impl<'a> Builder<'a> {
                     }
                     (base, rest)
                 }
+                // Another crate of this repository: resolve inside it.
+                other if self.crates.contains_key(other) => {
+                    let (src, lib) = &self.crates[other];
+                    if segs.len() == 1 {
+                        out.push(Target::File(*lib));
+                        continue;
+                    }
+                    (src.clone(), &segs[1..])
+                }
                 _ => (module_dir.clone(), &segs[..]),
             };
             let mut found = None;
@@ -907,7 +1006,11 @@ impl<'a> Builder<'a> {
                     found = Some(n);
                     break;
                 }
-                // 2018 paths relative to the crate root (`use graph::Graph` in main.rs)
+                // 2018 paths relative to the crate root (`use graph::Graph` in main.rs);
+                // not for another local crate, resolved in its own tree only.
+                if self.crates.contains_key(first) {
+                    continue;
+                }
                 let cand = join(&crate_root, &rest[..k].join("/"));
                 if let Some(&n) = self.stems.get(&cand) {
                     found = Some(n);
@@ -916,6 +1019,10 @@ impl<'a> Builder<'a> {
             }
             match found {
                 Some(n) => out.push(Target::File(n)),
+                // An item of a local crate not found as a module: its lib re-exports it.
+                None if self.crates.contains_key(first) => {
+                    out.push(Target::File(self.crates[first].1))
+                }
                 None if !matches!(first, "crate" | "self" | "super") => {
                     out.push(Target::External(first.to_string()))
                 }
@@ -969,14 +1076,7 @@ impl<'a> Builder<'a> {
     }
 
     fn resolve_js_import(&self, file: &str, spec: &str) -> Vec<Target> {
-        let lookup = |p: &str| -> Option<usize> {
-            let p = p.trim_end_matches('/');
-            let without_ext = match p.rsplit_once('.') {
-                Some((s, ext)) if !s.is_empty() && !ext.contains('/') => s,
-                _ => p,
-            };
-            self.stems.get(p).or(self.stems.get(without_ext)).copied()
-        };
+        let lookup = |p: &str| self.lookup_stem(p);
         if spec.starts_with('.') {
             let p = normalize(&join(&parent_dir(file), spec));
             return lookup(&p).map(Target::File).into_iter().collect();
@@ -993,6 +1093,33 @@ impl<'a> Builder<'a> {
         } else {
             spec.split('/').next().unwrap_or(spec).to_string()
         };
+        // A package of this repository (a workspace): its entry file, an `exports`
+        // subpath, or a file under it (built outputs map to `src/`).
+        if let Some(&(k, entry)) = self.npm_packages.get(&pkg) {
+            let package = &self.packages[k];
+            let sub = spec[pkg.len()..].trim_start_matches('/');
+            let found = if sub.is_empty() {
+                entry
+            } else {
+                let mut cands: Vec<String> = package
+                    .subpaths
+                    .iter()
+                    .filter(|(key, _)| key == sub)
+                    .flat_map(|(_, files)| files.iter().cloned())
+                    .collect();
+                cands.push(join(&package.dir, sub));
+                cands.push(join(&package.dir, &format!("src/{sub}")));
+                for built in ["dist/", "build/", "lib/", "out/"] {
+                    if let Some(rest) = sub.strip_prefix(built) {
+                        cands.push(join(&package.dir, &format!("src/{rest}")));
+                    }
+                }
+                cands.iter().find_map(|c| self.lookup_stem(c))
+            };
+            if let Some(n) = found {
+                return vec![Target::File(n)];
+            }
+        }
         vec![Target::External(pkg)]
     }
 
