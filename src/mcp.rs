@@ -14,6 +14,7 @@ use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::output;
 use crate::query::{self, Direction, EdgeFilter};
+use crate::vcs;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(20);
@@ -134,6 +135,10 @@ impl Server {
             if let Err(e) = self.reindex() {
                 eprintln!("codenav: re-index failed: {e:#}");
             }
+        } else if vcs::refresh_state(&mut self.graph, &self.root)
+            && let Err(e) = self.graph.save(&self.root)
+        {
+            eprintln!("codenav: could not save index: {e:#}");
         }
     }
 
@@ -180,7 +185,12 @@ impl Server {
         self.refresh_if_stale();
         let g = &self.graph;
         match name {
-            "graph_overview" => Ok(query::overview(g, uint(a, "top", 15)?)),
+            "graph_overview" => {
+                let mut v = query::overview(g, uint(a, "top", 15)?);
+                // With auto-refresh, stale sources are re-indexed on their own.
+                v["index"] = vcs::index_state(g, &self.root, !self.auto_refresh);
+                Ok(v)
+            }
             "get_community" => {
                 let (c, from) = match a.get("community").filter(|v| !v.is_null()) {
                     Some(_) => (uint(a, "community", 0)?, None),

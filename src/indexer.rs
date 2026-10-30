@@ -21,6 +21,7 @@ use crate::communities;
 use crate::extract::{self, FileFacts, RefKind};
 use crate::graph::{Confidence, Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
 use crate::lang::Lang;
+use crate::vcs;
 
 /// Project-specific exclusions, same syntax as `.gitignore`.
 pub const IGNORE_FILE: &str = ".codenavignore";
@@ -221,7 +222,12 @@ pub fn is_stale(root: &Path, graph: &Graph) -> bool {
     if files.len() != graph.by_file.len() {
         return true;
     }
-    let since = UNIX_EPOCH + Duration::from_secs(graph.indexed_at);
+    // Milliseconds when known: whole seconds would flag files saved just before indexing.
+    let since = if graph.indexed_at_ms > 0 {
+        UNIX_EPOCH + Duration::from_millis(graph.indexed_at_ms)
+    } else {
+        UNIX_EPOCH + Duration::from_secs(graph.indexed_at)
+    };
     files.iter().any(|f| {
         !graph.by_file.contains_key(&f.rel)
             || fs::metadata(&f.abs)
@@ -252,8 +258,8 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
 
 pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats)> {
     let started = Instant::now();
-    // Timestamp taken before reading so edits made during indexing count as stale.
-    let indexed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    // Timestamp taken before reading, so edits made during indexing count as stale.
+    let started_at = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let files = discover(root);
 
     let results: Vec<Result<FileFacts, String>> = files
@@ -274,8 +280,10 @@ pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats
     }
 
     let mut graph = Builder::new(root, &facts).build();
-    graph.indexed_at = indexed_at;
+    graph.indexed_at = started_at.as_secs();
+    graph.indexed_at_ms = started_at.as_millis() as u64;
     graph.build_indexes();
+    vcs::record_state(&mut graph, root);
     communities::detect(&mut graph, opts.hub_percentile);
 
     let mut by_lang = HashMap::new();

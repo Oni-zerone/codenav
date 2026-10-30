@@ -817,7 +817,8 @@ pub fn overview(g: &Graph, top: usize) -> Value {
 
     json!({
         "root": g.root,
-        "indexed_at_unix": g.indexed_at,
+        // Filled by vcs::index_state (it needs the repository); keeps its place here.
+        "index": Value::Null,
         "languages": langs,
         "node_kinds": kinds,
         "edge_kinds": edge_kinds,

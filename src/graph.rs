@@ -258,11 +258,24 @@ pub struct Graph {
     pub root: String,
     /// Unix timestamp (seconds) of the indexing run.
     pub indexed_at: u64,
+    /// The same in milliseconds (0 in older indexes), for precise staleness checks.
+    #[serde(default)]
+    pub indexed_at_ms: u64,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     /// Structural communities, largest first (see `communities`).
     #[serde(default)]
     pub communities: Vec<Community>,
+    /// Git HEAD commit and branch (None: detached) when the graph was built; absent
+    /// outside a Git repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Tracked files had uncommitted changes when the graph was built (absent when
+    /// unknown: no Git repository or no `git` command).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
     /// `ANALYSIS_VERSION` of the indexer that built the graph (0: before it existed).
     #[serde(default)]
     pub analysis: u32,

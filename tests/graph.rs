@@ -1114,6 +1114,86 @@ fn fixture_has_no_cycles() {
     }
 }
 
+#[test]
+fn overview_reports_the_indexed_commit() {
+    let repo = TempRepo::new("vcs", &[("a.py", "def f():\n    pass\n".into())]);
+    let overview = |root: &Path| -> Value {
+        let (ok, text) = tool_text_in(root, "graph_overview", json!({ "format": "json" }));
+        assert!(ok, "{text}");
+        serde_json::from_str::<Value>(&text).unwrap()["index"].clone()
+    };
+    // Not a Git repository: no commit, no error.
+    let index = overview(&repo.0);
+    assert!(index["built_at_unix"].is_u64(), "{index}");
+    assert!(
+        index.get("commit").is_none() && index.get("warnings").is_none(),
+        "{index}"
+    );
+
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo.0)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.0.join(".gitignore"), ".codenav/\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "one"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    let index = overview(&repo.0);
+    assert_eq!(index["commit"], first, "{index}");
+    assert_eq!(index["branch"], "main", "{index}");
+    assert_eq!(index["uncommitted_changes"], false, "{index}");
+    assert!(index.get("warnings").is_none(), "{index}");
+
+    // A commit that changes no source: the graph is kept and its Git state updated.
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let second = git(&["rev-parse", "HEAD"]);
+    let index = overview(&repo.0);
+    assert_eq!(index["commit"], second, "{index}");
+    assert!(index.get("warnings").is_none(), "{index}");
+
+    // An untracked file that is indexed counts as an uncommitted change; others don't.
+    std::fs::write(repo.0.join("notes.txt"), "x").unwrap();
+    std::fs::write(repo.0.join("b.py"), "def g():\n    pass\n").unwrap();
+    assert_eq!(overview(&repo.0)["uncommitted_changes"], true);
+    std::fs::remove_file(repo.0.join("b.py")).unwrap();
+    assert_eq!(overview(&repo.0)["uncommitted_changes"], false);
+    // So does an edit to a tracked file.
+    std::fs::write(repo.0.join("a.py"), "def f():\n    return 1\n").unwrap();
+    assert_eq!(overview(&repo.0)["uncommitted_changes"], true);
+
+    // A tracked subfolder indexed on its own belongs to the repository...
+    std::fs::create_dir_all(repo.0.join("pkg")).unwrap();
+    std::fs::write(repo.0.join("pkg/m.py"), "def m():\n    pass\n").unwrap();
+    git(&["add", "pkg"]);
+    git(&["commit", "-q", "-m", "pkg"]);
+    let pkg = git(&["rev-parse", "HEAD"]);
+    assert_eq!(overview(&repo.0.join("pkg"))["commit"], pkg);
+    // ...an unversioned one does not inherit its HEAD.
+    std::fs::create_dir_all(repo.0.join("scratch")).unwrap();
+    std::fs::write(repo.0.join("scratch/s.py"), "def s():\n    pass\n").unwrap();
+    let index = overview(&repo.0.join("scratch"));
+    assert!(index.get("commit").is_none(), "{index}");
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
