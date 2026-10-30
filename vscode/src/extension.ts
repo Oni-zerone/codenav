@@ -1,13 +1,13 @@
 import { execFile } from 'child_process';
 import * as vscode from 'vscode';
-import { GraphPanel } from './graphPanel';
-import { GraphStore, relativePath } from './graphStore';
+import { GraphEditorProvider, GraphPanel } from './graphPanel';
+import { folderSource, GRAPH_FILE, GraphStore, relativePath } from './graphStore';
 
 let output: vscode.OutputChannel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
   const store = new GraphStore();
-  context.subscriptions.push(store);
+  context.subscriptions.push(store, GraphEditorProvider.register(context, store));
 
   context.subscriptions.push(
     vscode.commands.registerCommand('codenav.showGraph', async () => {
@@ -27,8 +27,8 @@ export function activate(context: vscode.ExtensionContext) {
       if (!folder || !(await ensureIndexed(store, folder))) {
         return;
       }
-      const graph = await store.load(folder);
-      const file = relativePath(folder, target);
+      const graph = await store.load(folderSource(folder));
+      const file = relativePath(folder.uri, target);
       // From the explorer (or another file) reveal the file; from the editor, the symbol under the cursor.
       const fromEditor = editor && editor.document.uri.toString() === target.toString();
       const node = fromEditor
@@ -44,9 +44,10 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('codenav.reindex', async (uri?: vscode.Uri) => {
-      const folder = uri ? vscode.workspace.getWorkspaceFolder(uri) : await pickFolder(store, true);
-      if (folder) {
-        await reindex(folder);
+      // `uri` is a repository root (from the graph view); it may be outside the workspace.
+      const root = uri ?? (await pickFolder(store, true))?.uri;
+      if (root) {
+        await reindex(root);
       }
     }),
   );
@@ -84,25 +85,26 @@ async function ensureIndexed(store: GraphStore, folder: vscode.WorkspaceFolder):
     return true;
   }
   const choice = await vscode.window.showInformationMessage(
-    `No code graph found in ${folder.name} (.codenav/graph.json).`,
+    `No code graph found in ${folder.name} (${GRAPH_FILE}).`,
     'Index now',
   );
-  return choice === 'Index now' && (await reindex(folder));
+  return choice === 'Index now' && (await reindex(folder.uri));
 }
 
-async function reindex(folder: vscode.WorkspaceFolder): Promise<boolean> {
+async function reindex(root: vscode.Uri): Promise<boolean> {
+  const name = root.path.replace(/\/+$/, '').split('/').pop();
   const exe = vscode.workspace.getConfiguration('codenav').get<string>('executable', 'codenav') || 'codenav';
   output ??= vscode.window.createOutputChannel('CodeNav');
   return vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `CodeNav: indexing ${folder.name}…` },
+    { location: vscode.ProgressLocation.Notification, title: `CodeNav: indexing ${name}…` },
     () =>
       new Promise<boolean>((resolve) => {
         execFile(
           exe,
-          ['index', folder.uri.fsPath],
-          { cwd: folder.uri.fsPath, maxBuffer: 16 * 1024 * 1024 },
+          ['index', root.fsPath],
+          { cwd: root.fsPath, maxBuffer: 16 * 1024 * 1024 },
           (err, stdout, stderr) => {
-            output!.appendLine(`$ ${exe} index ${folder.uri.fsPath}`);
+            output!.appendLine(`$ ${exe} index ${root.fsPath}`);
             if (stdout) {
               output!.append(stdout);
             }
@@ -121,7 +123,7 @@ async function reindex(folder: vscode.WorkspaceFolder): Promise<boolean> {
               });
               resolve(false);
             } else {
-              // The graph store's file watcher picks up the new graph.json.
+              // The graph store's file watchers pick up the new graph file.
               resolve(true);
             }
           },

@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build (or rebuild) the graph and save it to `<repo>/.codenav/graph.json`.
+    /// Build (or rebuild) the graph and save it to `<repo>/.codenav/graph.cnav`.
     Index {
         #[arg(default_value = ".")]
         path: PathBuf,

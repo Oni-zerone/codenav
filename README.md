@@ -7,7 +7,7 @@ possa navigarlo per capire le relazioni tra i componenti.
 ## Come funziona
 
 ```
-repo ──walk (.gitignore)──▶ tree-sitter parse (parallelo) ──▶ fatti per file ──▶ risoluzione nomi ──▶ grafo ──▶ .codenav/graph.json
+repo ──walk (.gitignore)──▶ tree-sitter parse (parallelo) ──▶ fatti per file ──▶ risoluzione nomi ──▶ grafo ──▶ .codenav/graph.cnav
                                                                                                        │
                                                        LLM ◀── MCP stdio (JSON-RPC) ◀── codenav serve ◀┘
 ```
@@ -44,7 +44,7 @@ cargo install --path .
 ## Uso da CLI
 
 ```sh
-codenav index [PATH]              # crea/aggiorna PATH/.codenav/graph.json
+codenav index [PATH]              # crea/aggiorna PATH/.codenav/graph.cnav
 codenav serve [PATH]              # server MCP su stdio
 codenav tool <nome> '<json>'      # invoca un tool MCP da terminale (debug)
 codenav ast <file>                # albero tree-sitter (per scrivere nuove query)
@@ -83,8 +83,8 @@ quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`
 
 ## Estensione VS Code
 
-In [`vscode/`](vscode/README.md) c'è un'estensione che visualizza `.codenav/graph.json` dentro
-VS Code: vista per moduli, per file e focus su un simbolo, con apertura del sorgente al clic e
+In [`vscode/`](vscode/README.md) c'è un'estensione che visualizza `.codenav/graph.cnav` dentro
+VS Code (basta aprire il file): vista per moduli, per file e focus su un simbolo, con apertura del sorgente al clic e
 aggiornamento automatico quando l'indice cambia.
 
 ## Tool MCP

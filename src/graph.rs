@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::lang::Lang;
 
 pub const INDEX_DIR: &str = ".codenav";
-const GRAPH_FILE: &str = "graph.json";
+const GRAPH_FILE: &str = "graph.cnav";
+/// Name used before the switch to `.cnav`; removed on save so stale copies don't linger.
+const LEGACY_GRAPH_FILE: &str = "graph.json";
 const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -225,9 +227,10 @@ impl Graph {
             fs::write(&ignore, "*\n")?;
         }
         let path = Self::index_path(root);
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension("cnav.tmp");
         fs::write(&tmp, serde_json::to_vec(self)?)?;
         fs::rename(&tmp, &path)?;
+        let _ = fs::remove_file(dir.join(LEGACY_GRAPH_FILE));
         Ok(path)
     }
 
@@ -283,5 +286,27 @@ impl Graph {
     /// The file node that (transitively) contains a symbol.
     pub fn file_of(&self, i: usize) -> Option<usize> {
         self.by_file.get(&self.nodes[i].file).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_writes_cnav_and_removes_the_legacy_json() {
+        let root = std::env::temp_dir().join(format!("codenav-unit-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(INDEX_DIR)).unwrap();
+        fs::write(root.join(INDEX_DIR).join(LEGACY_GRAPH_FILE), "{}").unwrap();
+
+        let path = Graph::new(&root).save(&root).unwrap();
+
+        assert_eq!(path, root.join(".codenav/graph.cnav"));
+        assert!(path.exists());
+        assert!(!root.join(".codenav/graph.json").exists());
+        assert!(!root.join(".codenav/graph.cnav.tmp").exists());
+        assert_eq!(Graph::load(&root).unwrap().version, FORMAT_VERSION);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

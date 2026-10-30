@@ -1,7 +1,7 @@
 {
   "name": "codenav-graph",
   "displayName": "CodeNav Graph",
-  "description": "Visualize the code graph built by codenav (.codenav/graph.json).",
+  "description": "Visualize the code graph built by codenav: open a .cnav file (e.g. .codenav/graph.cnav) to see it.",
   "version": "0.1.0",
   "publisher": "codenav",
   "license": "MIT",
@@ -19,9 +19,21 @@
   ],
   "main": "./out/src/extension.js",
   "activationEvents": [
-    "workspaceContains:.codenav/graph.json"
+    "workspaceContains:.codenav/graph.cnav"
   ],
   "contributes": {
+    "customEditors": [
+      {
+        "viewType": "codenav.graphFile",
+        "displayName": "CodeNav Graph",
+        "selector": [
+          {
+            "filenamePattern": "*.cnav"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
     "commands": [
       {
         "command": "codenav.showGraph",
