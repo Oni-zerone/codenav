@@ -80,7 +80,7 @@ quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`
 | `reindex` | Ricostruisce il grafo |
 
 Tutti i tool che restituiscono dati strutturati rispondono di default in **testo compatto**
-(simile a YAML, senza virgolette e parentesi) tagliato a `token_budget` (default 2000, da 100 a
+(simile a YAML, senza virgolette e parentesi) tagliato a `token_budget` (default 2000, da 200 a
 100000). Se l'output viene tagliato, la prima riga lo dice e indica il `token_budget` necessario
 per vedere tutto, più un suggerimento per restringere la richiesta. Con `format: "json"` si ottiene
 invece il risultato JSON completo, senza budget.

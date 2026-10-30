@@ -6,16 +6,23 @@ use serde_json::{Map, Value};
 
 pub const CHARS_PER_TOKEN: usize = 3;
 pub const DEFAULT_TOKEN_BUDGET: usize = 2000;
-pub const MIN_TOKEN_BUDGET: usize = 100;
+pub const MIN_TOKEN_BUDGET: usize = 200;
 pub const MAX_TOKEN_BUDGET: usize = 100_000;
-/// Room kept for the truncation notice.
-const NOTICE_RESERVE: usize = 260;
+/// Room kept for the truncation notice when the output has to be cut.
+const NOTICE_RESERVE: usize = 300;
+/// Room kept for the `… N more lines cut` marker of a partially shown block.
+const MARKER_RESERVE: usize = 40;
+/// Headers longer than this are clipped, so they cannot eat the budget.
+const HEADER_MAX: usize = 400;
 /// Collections of scalars shorter than this are written on one line.
 const INLINE_MAX: usize = 200;
 
 /// Keeps whole blocks within the budget, cutting the first block that does not fit
 /// line by line, and announces any cut at the top. `unit` names what a block is
 /// ("nodes", "lines"); `hint` tells the reader how to narrow the request.
+///
+/// Lengths are measured on the exact text written, so the suggested budget in the
+/// notice is always enough to show everything.
 pub fn fit_blocks(
     header: &str,
     blocks: &[Vec<String>],
@@ -24,41 +31,45 @@ pub fn fit_blocks(
     hint: &str,
 ) -> String {
     // Node blocks are separated by a blank line, plain lines are not.
-    let block_sep = if unit == "nodes" { "\n\n" } else { "\n" };
-    let budget = token_budget
-        .saturating_mul(CHARS_PER_TOKEN)
-        .saturating_sub(NOTICE_RESERVE)
-        .max(header.len());
-    let block_len = |b: &[String]| b.iter().map(|l| l.len() + 1).sum::<usize>() + block_sep.len();
-    let full = header.len() + blocks.iter().map(|b| block_len(b)).sum::<usize>();
+    let sep = if unit == "nodes" { "\n\n" } else { "\n" };
+    let limit = token_budget.saturating_mul(CHARS_PER_TOKEN);
+    let header = clip(header, HEADER_MAX);
+    let rendered: Vec<String> = blocks.iter().map(|b| b.join("\n")).collect();
+    let full = join(&header, None, sep, &rendered).len();
+    if full <= limit {
+        return join(&header, None, sep, &rendered);
+    }
 
+    // Cut: header + body must leave room for the notice.
+    let budget = limit.saturating_sub(NOTICE_RESERVE);
+    let prefix = if header.is_empty() {
+        0
+    } else {
+        header.len() + sep.len()
+    };
     let mut body = String::new();
-    let mut used = header.len() + block_sep.len();
     let mut whole = 0;
     let mut partial = false;
-    for b in blocks {
-        let len = block_len(b);
-        let fits_whole = used + len <= budget;
-        let mut lines = 0;
-        for line in b {
-            if !fits_whole && used + line.len() + block_sep.len() > budget {
-                break;
-            }
-            if lines == 0 && !body.is_empty() {
-                body.push_str(block_sep);
-            } else if lines > 0 {
-                body.push('\n');
-            }
-            body.push_str(line);
-            used += line.len() + 1;
-            lines += 1;
-        }
-        if fits_whole {
+    for (b, text) in blocks.iter().zip(&rendered) {
+        let gap = if body.is_empty() { 0 } else { sep.len() };
+        if prefix + body.len() + gap + text.len() <= budget {
+            body.push_str(&sep[..gap]);
+            body.push_str(text);
             whole += 1;
             continue;
         }
         // The first block that does not fit is cut line by line, so a single huge
         // one cannot blow the budget; nothing after it is shown.
+        let mut lines = 0;
+        for line in b {
+            let cost = if lines == 0 { gap } else { 1 } + line.len();
+            if prefix + body.len() + cost + MARKER_RESERVE > budget {
+                break;
+            }
+            body.push_str(if lines == 0 { &sep[..gap] } else { "\n" });
+            body.push_str(line);
+            lines += 1;
+        }
         if lines > 0 {
             body.push_str(&format!("\n    … {} more lines cut", b.len() - lines));
             partial = true;
@@ -66,30 +77,50 @@ pub fn fit_blocks(
         break;
     }
 
-    let mut out = String::with_capacity(used + NOTICE_RESERVE);
-    out.push_str(header);
-    if whole < blocks.len() {
-        let shown = if partial {
-            format!("{whole} of {} {unit} in full, 1 partially", blocks.len())
-        } else {
-            format!("{whole} of {} {unit}", blocks.len())
-        };
+    let shown = if partial {
+        format!("{whole} of {} {unit} in full, 1 partially", blocks.len())
+    } else {
+        format!("{whole} of {} {unit}", blocks.len())
+    };
+    let needed = full.div_ceil(CHARS_PER_TOKEN);
+    let advice = if needed <= MAX_TOKEN_BUDGET {
+        format!("token_budget={needed} would show all; or {hint}")
+    } else {
+        format!("the full output exceeds the max token_budget={MAX_TOKEN_BUDGET}; {hint}")
+    };
+    let notice =
+        format!("[!] TRUNCATED: showing {shown} (~{token_budget}-token budget). {advice}.");
+    join(&header, Some(&notice), sep, &[body])
+}
+
+/// `header`, optional notice and blocks, skipping empty parts.
+fn join(header: &str, notice: Option<&str>, sep: &str, blocks: &[String]) -> String {
+    let mut out = String::from(header);
+    if let Some(n) = notice {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!(
-            "[!] TRUNCATED: showing {shown} (~{token_budget}-token budget). \
-             token_budget={} would show all; or {hint}.",
-            (full + NOTICE_RESERVE).div_ceil(CHARS_PER_TOKEN)
-        ));
+        out.push_str(n);
     }
-    if !body.is_empty() {
+    for b in blocks.iter().filter(|b| !b.is_empty()) {
         if !out.is_empty() {
-            out.push_str(block_sep);
+            out.push_str(sep);
         }
-        out.push_str(&body);
+        out.push_str(b);
     }
     out
+}
+
+/// Cuts `s` to at most `max` bytes on a char boundary, marking the cut.
+pub fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max.saturating_sub('…'.len_utf8());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Renders a JSON result as compact YAML-like text cut to the budget.
@@ -116,6 +147,7 @@ fn pad(indent: usize) -> String {
 
 fn scalar_str(v: &Value) -> String {
     match v {
+        Value::String(s) if s.is_empty() => "\"\"".to_string(),
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         other => other.to_string(),
@@ -127,14 +159,16 @@ fn is_scalar(v: &Value) -> bool {
 }
 
 fn is_multiline(v: &Value) -> bool {
-    matches!(v, Value::String(s) if s.contains('\n'))
+    matches!(v, Value::String(s) if s.contains(['\n', '\r']))
 }
 
 /// `prefix` is `"key: "` or `"- "`.
 fn push_scalar(prefix: &str, v: &Value, indent: usize, out: &mut Vec<String>) {
     if is_multiline(v) {
         out.push(format!("{}{prefix}|", pad(indent)));
-        for line in scalar_str(v).lines() {
+        // Keep blank and trailing lines: they are part of the value.
+        let text = scalar_str(v).replace("\r\n", "\n").replace('\r', "\n");
+        for line in text.split('\n') {
             out.push(format!("{}{line}", pad(indent + 2)));
         }
     } else {
@@ -146,11 +180,17 @@ fn push_scalar(prefix: &str, v: &Value, indent: usize, out: &mut Vec<String>) {
 /// contain commas), `a, b` for arrays of single-word scalars.
 fn inline(v: &Value) -> Option<String> {
     let s = match v {
-        Value::Object(m) if m.values().all(|x| is_scalar(x) && !is_multiline(x)) => m
-            .iter()
-            .map(|(k, x)| format!("{k}: {}", scalar_str(x)))
-            .collect::<Vec<_>>()
-            .join("; "),
+        // Values containing the separator or braces would make the line ambiguous.
+        Value::Object(m)
+            if m.values().all(|x| {
+                is_scalar(x) && !is_multiline(x) && !scalar_str(x).contains(['{', '}', ';'])
+            }) =>
+        {
+            m.iter()
+                .map(|(k, x)| format!("{k}: {}", scalar_str(x)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
         Value::Array(a)
             if a.iter().all(|x| {
                 is_scalar(x) && !scalar_str(x).contains(|c: char| c == ',' || c.is_whitespace())
@@ -191,6 +231,7 @@ fn write_fields(m: &Map<String, Value>, indent: usize, out: &mut Vec<String>) {
 
 fn write_item(item: &Value, indent: usize, out: &mut Vec<String>) {
     match item {
+        Value::Object(m) if m.is_empty() => out.push(format!("{}- {{}}", pad(indent))),
         Value::Object(m) => {
             if let Some(s) = inline(item) {
                 out.push(format!("{}- {s}", pad(indent)));
@@ -260,19 +301,103 @@ mod tests {
     fn value_cut_respects_budget_and_announces_it() {
         let v =
             json!({ "items": (0..500).map(|i| format!("item number {i}")).collect::<Vec<_>>() });
-        let out = fit_value(&v, 100, "narrow it");
-        assert!(out.len() <= 100 * CHARS_PER_TOKEN, "{}", out.len());
+        let out = fit_value(&v, 200, "narrow it");
+        assert!(out.len() <= 200 * CHARS_PER_TOKEN, "{}", out.len());
         assert!(out.starts_with("[!] TRUNCATED: showing"), "{out}");
         assert!(out.contains("narrow it"));
-        assert!(!fit_value(&json!({ "a": 1 }), 100, "").contains("TRUNCATED"));
+        assert!(!fit_value(&json!({ "a": 1 }), 200, "").contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn rendering_is_unambiguous() {
+        let v = json!({
+            "sig": { "id": "a", "signature": "fn f(x: [u8; 4])" },
+            "items": [{}, ""],
+            "text": "a\n\nb\n",
+        });
+        assert_eq!(
+            to_lines(&v),
+            vec![
+                "sig:",
+                "  id: a",
+                "  signature: fn f(x: [u8; 4])",
+                "items:",
+                "  - {}",
+                "  - \"\"",
+                "text: |",
+                "  a",
+                "  ",
+                "  b",
+                "  ",
+            ]
+        );
+    }
+
+    /// The exact-length accounting: whatever the shape, the output fits the budget and
+    /// the suggested budget shows everything.
+    #[test]
+    fn suggested_budget_always_shows_all() {
+        let suggested = |out: &str| -> Option<usize> {
+            out.split("token_budget=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        };
+        let shapes: Vec<Vec<Vec<String>>> = vec![
+            vec![vec!["x".repeat(700)]],
+            vec![vec!["a".repeat(33), "b".into()]],
+            (0..3000).map(|i| vec![format!("f{i}")]).collect(),
+            (0..50)
+                .map(|i| vec![format!("node {i}"), "    calls → y".into()])
+                .collect(),
+        ];
+        for unit in ["nodes", "lines"] {
+            for blocks in &shapes {
+                for budget in [200, 333, 1000, 5000] {
+                    let out = fit_blocks("Question: q", blocks, budget, unit, "narrow");
+                    assert!(
+                        out.len() <= budget * CHARS_PER_TOKEN,
+                        "{unit} {budget}: {}",
+                        out.len()
+                    );
+                    if let Some(s) = suggested(&out) {
+                        let all = fit_blocks("Question: q", blocks, s, unit, "narrow");
+                        assert!(!all.contains("TRUNCATED"), "{unit} {budget} -> {s}");
+                    }
+                    assert!(!out.contains("… 0 more lines"), "{out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_headers_are_clipped_and_huge_outputs_say_so() {
+        let header = "漢".repeat(500);
+        let out = fit_blocks(
+            &header,
+            &vec![vec!["x".to_string()]; 10],
+            200,
+            "nodes",
+            "narrow",
+        );
+        assert!(out.len() <= 600, "{}", out.len());
+        let huge: Vec<Vec<String>> = (0..40_000).map(|i| vec![format!("line {i:08}")]).collect();
+        let out = fit_blocks("", &huge, 1000, "lines", "narrow");
+        assert!(
+            out.contains("exceeds the max token_budget=100000"),
+            "{}",
+            &out[..200]
+        );
     }
 
     #[test]
     fn budget_holds_for_one_huge_block() {
         let mut block = vec!["hub".to_string()];
         block.extend((0..1500).map(|i| format!("    called_by ← caller_{i}")));
-        let out = fit_blocks("H", &[block], 100, "nodes", "narrow");
-        assert!(out.len() <= 100 * CHARS_PER_TOKEN, "{}", out.len());
+        let out = fit_blocks("H", &[block], 200, "nodes", "narrow");
+        assert!(out.len() <= 200 * CHARS_PER_TOKEN, "{}", out.len());
         assert!(
             out.contains("1 partially") && out.contains("more lines cut"),
             "{out}"

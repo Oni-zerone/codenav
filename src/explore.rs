@@ -515,10 +515,7 @@ fn render(
         Mode::Dfs => "DFS",
     };
     let seed_ids: Vec<&str> = seeds.iter().map(|&s| g.nodes[s].id.as_str()).collect();
-    let mut shown_question: String = question.chars().take(200).collect();
-    if shown_question.len() < question.len() {
-        shown_question.push('…');
-    }
+    let shown_question = output::clip(question, 120);
     let mut header = format!(
         "Question: {shown_question}\nTraversal: {mode} depth={} | {} nodes | seeds: {}",
         opts.depth,
@@ -530,7 +527,7 @@ fn render(
         header.push_str(&format!(" | edges: {}", kinds.join(",")));
     }
     for note in notes.iter().take(5) {
-        header.push_str(&format!("\nNote: {note}"));
+        header.push_str(&format!("\nNote: {}", output::clip(note, 160)));
     }
     if notes.len() > 5 {
         header.push_str(&format!("\nNote: … and {} more notes", notes.len() - 5));

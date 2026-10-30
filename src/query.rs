@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::graph::{EdgeKind, Graph, SymKind};
 
 const MAX_CODE_LINES: usize = 150;
+const MAX_LINE_BYTES: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -213,6 +214,18 @@ fn cap_lists(map: BTreeMap<&str, Vec<Value>>, max: usize) -> Value {
     Value::Object(out)
 }
 
+/// Minified or generated code can have huge lines: keep the start and say how much is cut.
+fn clip_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= MAX_LINE_BYTES {
+        return line.into();
+    }
+    let mut end = MAX_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} …[+{} bytes]", &line[..end], line.len() - end).into()
+}
+
 pub fn read_lines(root: &Path, file: &str, start: u32, end: u32) -> Option<String> {
     let text = fs::read_to_string(root.join(file)).ok()?;
     let start = start.max(1) as usize;
@@ -229,7 +242,7 @@ pub fn read_lines(root: &Path, file: &str, start: u32, end: u32) -> Option<Strin
             out.push_str(&format!("… ({} more lines)\n", end - n));
             break;
         }
-        out.push_str(&format!("{:>5} | {line}\n", n + 1));
+        out.push_str(&format!("{:>5} | {}\n", n + 1, clip_line(line)));
     }
     Some(out)
 }

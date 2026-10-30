@@ -148,6 +148,9 @@ impl Server {
             format == "text" || format == "json",
             "format must be text or json, got `{format}`"
         );
+        if format == "json" && matches!(name, "explore" | "read_code") {
+            anyhow::bail!("`{name}` always returns text; format=json is not supported");
+        }
         let budget = token_budget(a)?;
         Ok(match self.run_tool(name, a)? {
             Value::String(text) => text,
@@ -213,10 +216,7 @@ impl Server {
             }
             "get_symbol" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
-                let code = a
-                    .get("include_code")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
+                let code = opt_bool(a, "include_code")?.unwrap_or(true);
                 Ok(query::symbol_details(g, &self.root, i, code))
             }
             "get_neighbors" => {
@@ -246,7 +246,7 @@ impl Server {
                     from,
                     to,
                     &edge_kinds(a)?,
-                    a.get("directed").and_then(Value::as_bool).unwrap_or(false),
+                    opt_bool(a, "directed")?.unwrap_or(false),
                     uint(a, "max_depth", 6)?.clamp(1, 12) as u32,
                     uint(a, "max_paths", 3)?.clamp(1, 20),
                 ))
@@ -280,7 +280,14 @@ impl Server {
                 );
                 let code = query::read_lines(&self.root, &file, start, end)
                     .ok_or_else(|| anyhow!("cannot read {file}"))?;
-                Ok(Value::String(format!("{file}\n{code}")))
+                let lines: Vec<Vec<String>> = code.lines().map(|l| vec![l.to_string()]).collect();
+                Ok(Value::String(output::fit_blocks(
+                    &file,
+                    &lines,
+                    token_budget(a)?,
+                    "lines",
+                    "request a smaller line range",
+                )))
             }
             _ => Err(anyhow!("unknown tool `{name}`")),
         }
@@ -328,6 +335,14 @@ fn uint(a: &Value, key: &str, default: usize) -> Result<usize> {
     }
 }
 
+fn opt_bool(a: &Value, key: &str) -> Result<Option<bool>> {
+    match a.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(anyhow!("argument `{key}` must be true or false, got {v}")),
+    }
+}
+
 fn opt_str<'a>(a: &'a Value, key: &str) -> Result<Option<&'a str>> {
     match a.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -372,18 +387,18 @@ fn edge_kinds(a: &Value) -> Result<Vec<EdgeKind>> {
 
 fn tool_definitions() -> Value {
     let mut tools = base_tool_definitions();
-    let budget = json!({ "type": "integer", "description": "Approximate max output tokens, 100-100000, default 2000. Output beyond it is cut with a notice at the top." });
+    let budget = json!({ "type": "integer", "description": "Approximate max output tokens, 200-100000, default 2000. Output beyond it is cut with a notice at the top." });
     let format = json!({ "type": "string", "enum": ["text", "json"], "description": "text (default): compact, cut to token_budget. json: the full structured result, no budget." });
     for tool in tools.as_array_mut().into_iter().flatten() {
         let name = tool["name"].as_str().unwrap_or("").to_string();
         let Some(props) = tool["inputSchema"]["properties"].as_object_mut() else {
             continue;
         };
-        if matches!(name.as_str(), "reindex" | "read_code") {
+        if name == "reindex" {
             continue;
         }
         props.entry("token_budget").or_insert(budget.clone());
-        if name != "explore" {
+        if !matches!(name.as_str(), "explore" | "read_code") {
             props.insert("format".into(), format.clone());
         }
     }
@@ -422,7 +437,7 @@ fn base_tool_definitions() -> Value {
                 "depth": { "type": "integer", "description": "1-6, default 2." },
                 "direction": { "type": "string", "enum": ["out", "in", "both"], "description": "Default both (bfs) / out (dfs)." },
                 "edge_kinds": edge_kinds.clone(),
-                "token_budget": { "type": "integer", "description": "Approximate max output tokens, 100-100000, default 2000." }
+                "token_budget": { "type": "integer", "description": "Approximate max output tokens, 200-100000, default 2000." }
             }, "required": ["question"] }
         },
         {
