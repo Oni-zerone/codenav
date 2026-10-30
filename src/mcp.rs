@@ -15,6 +15,7 @@ use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::insights;
 use crate::output;
+use crate::packages;
 use crate::query::{self, Direction, EdgeFilter};
 use crate::tests_for;
 use crate::vcs;
@@ -54,6 +55,8 @@ struct State {
 struct Project {
     name: String,
     root: PathBuf,
+    /// Package names it declares (package.json, Cargo.toml).
+    packages: Vec<String>,
     /// Its state while another project is active; None when not loaded (or dropped).
     parked: Option<State>,
     last_used: u64,
@@ -90,6 +93,7 @@ impl Server {
         let projects = vec![Project {
             name: project_name(&root, &[]),
             root: root.clone(),
+            packages: packages::names(&root),
             parked: None,
             last_used: 0,
         }];
@@ -120,6 +124,7 @@ impl Server {
         let name = project_name(&root, &names);
         self.projects.push(Project {
             name,
+            packages: packages::names(&root),
             root,
             parked: None,
             last_used: 0,
@@ -189,6 +194,7 @@ impl Server {
         let name = project_name(&root, &taken);
         self.projects.push(Project {
             name,
+            packages: packages::names(&root),
             root,
             parked: Some(state),
             last_used: 0,
@@ -253,6 +259,7 @@ impl Server {
                     "default": i == 0,
                     "active": i == self.active,
                     "loaded": i == self.active || p.parked.is_some(),
+                    "packages": p.packages,
                 }))
                 .collect::<Vec<_>>()
         )
@@ -545,7 +552,16 @@ impl Server {
             "get_symbol" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 let code = opt_bool(a, "include_code")?.unwrap_or(true);
-                Ok(query::symbol_details(g, &self.cur.root, i, code))
+                let mut v = query::symbol_details(g, &self.cur.root, i, code);
+                // An external package that another served project declares: say which.
+                if g.nodes[i].kind == SymKind::External
+                    && let Some(p) = self.projects.iter().enumerate().find(|(k, p)| {
+                        *k != self.active && p.packages.iter().any(|n| *n == g.nodes[i].name)
+                    })
+                {
+                    v["provided_by_project"] = json!(p.1.name);
+                }
+                Ok(v)
             }
             "get_neighbors" => {
                 let i = query::resolve(g, &string(a, "id")?)?;

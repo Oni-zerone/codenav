@@ -24,7 +24,8 @@ const FORMAT_VERSION: u32 = 3;
 /// 2: `Edge::lines` (every line of a relation, e.g. call sites).
 /// 3: common methods on unknown receivers need the owner type named nearby; module
 ///    qualifiers must be single names.
-pub const ANALYSIS_VERSION: u32 = 3;
+/// 4: imports of local packages (npm workspaces, Cargo crates) resolve to their files.
+pub const ANALYSIS_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
