@@ -17,6 +17,11 @@ const LEGACY_GRAPH_FILE: &str = "graph.json";
 /// v2: communities (`Node::community`, `Graph::communities`).
 /// v3: `Edge::confidence` replaces the `ambiguous` flag.
 const FORMAT_VERSION: u32 = 3;
+/// Version of what the indexer extracts and how it resolves names. Bump it when the
+/// same sources would give a different graph: older indexes are then stale and rebuilt,
+/// while readers of the format (like the VS Code extension) are unaffected.
+/// 1: JS/TS module scoping, JSX components only, top-level constants.
+pub const ANALYSIS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -72,11 +77,14 @@ impl SymKind {
     }
 
     /// Used to pick a winner when one syntax node matches several patterns.
+    /// Which kind wins when one node matches several patterns: a JS `const f = () => {}`
+    /// is a function, not a constant.
     pub fn specificity(self) -> u8 {
         match self {
             SymKind::Type => 0,
-            SymKind::Function => 1,
-            _ => 2,
+            SymKind::Constant => 1,
+            SymKind::Function => 2,
+            _ => 3,
         }
     }
 
@@ -255,6 +263,9 @@ pub struct Graph {
     /// Structural communities, largest first (see `communities`).
     #[serde(default)]
     pub communities: Vec<Community>,
+    /// `ANALYSIS_VERSION` of the indexer that built the graph (0: before it existed).
+    #[serde(default)]
+    pub analysis: u32,
     /// Hub percentile the communities were computed with.
     #[serde(default = "default_hub_percentile")]
     pub hub_percentile: f64,
@@ -298,6 +309,7 @@ impl Graph {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             hub_percentile: default_hub_percentile(),
+            analysis: ANALYSIS_VERSION,
             ..Default::default()
         }
     }

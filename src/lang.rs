@@ -156,8 +156,39 @@ const JS_COMMON_QUERY: &str = r#"
 (new_expression constructor: (identifier) @name) @call
 (new_expression constructor: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call
 
+; Top-level `const` (functions are matched above and win over constants).
+(program (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant))
+(program (export_statement declaration: (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant)))
+
+; Module kind: ES exports / imports, CommonJS exports. Files with none are scripts.
+(export_statement) @export
+(import_statement) @esm
+((assignment_expression left: (member_expression object: (identifier) @_m property: (property_identifier) @_e))
+  (#eq? @_m "module") (#eq? @_e "exports")) @commonjs
+((assignment_expression left: (member_expression object: (identifier) @_x)) (#eq? @_x "exports")) @commonjs
+
+; Local names exported by `export { a, b }` / `export default a` (not `export { a } from`).
+(export_statement !source (export_clause (export_specifier name: (identifier) @export.name)))
+(export_statement value: (identifier) @export.name)
+
+; Names bound by imports, with their source (to recognise imports we cannot resolve).
+(import_statement (import_clause (named_imports (import_specifier !alias name: (identifier) @import.binding))) source: (string (string_fragment) @import.from))
+(import_statement (import_clause (identifier) @import.binding) source: (string (string_fragment) @import.from))
+
+; Local bindings (parameters, local variables, catch/loop variables): they shadow
+; top-level constants inside their function.
+(formal_parameters) @binding.pattern
+(arrow_function parameter: (identifier) @binding.pattern)
+(variable_declarator name: (_) @binding.pattern)
+(catch_clause parameter: (_) @binding.pattern)
+(for_in_statement left: (identifier) @binding.pattern)
+
+; Values that may name a top-level constant.
+(identifier) @valueref
+(shorthand_property_identifier) @valueref
+
 (import_statement source: (string (string_fragment) @path)) @import
-(export_statement source: (string (string_fragment) @path)) @import
+(export_statement source: (string (string_fragment) @path)) @import.reexport
 ((call_expression function: (identifier) @_req arguments: (arguments (string (string_fragment) @path)))
   (#eq? @_req "require")) @import
 ((call_expression function: (import) arguments: (arguments (string (string_fragment) @path)))) @import
@@ -188,9 +219,12 @@ const TS_QUERY: &str = r#"
 (type_identifier) @typeref
 "#;
 
+/// Components only: lowercase tags (`<p>`, `<summary>`) are HTML elements, not calls.
 const JSX_QUERY: &str = r#"
-(jsx_opening_element name: (identifier) @name) @call
-(jsx_self_closing_element name: (identifier) @name) @call
+((jsx_opening_element name: (identifier) @name) @call (#match? @name "^[A-Z]"))
+((jsx_self_closing_element name: (identifier) @name) @call (#match? @name "^[A-Z]"))
+((jsx_opening_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call (#match? @name "^[A-Z]"))
+((jsx_self_closing_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call (#match? @name "^[A-Z]"))
 "#;
 
 const GO_QUERY: &str = r#"

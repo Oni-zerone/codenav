@@ -23,6 +23,8 @@ pub struct Def {
     pub doc: Option<String>,
     /// Explicit owner type (Go receivers).
     pub owner: Option<String>,
+    /// JS/TS: declared with `export`, or named in an `export { … }` / `export default`.
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,8 @@ pub enum RefKind {
     Call,
     Base,
     TypeRef,
+    /// JS/TS identifier used as a value (may name a top-level constant).
+    Value,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,8 @@ pub struct Import {
     pub names: Vec<String>,
     /// Rust `mod foo;`
     pub is_mod: bool,
+    /// JS/TS `export … from '…'`: the file passes the target's exports on.
+    pub reexport: bool,
     pub line: u32,
 }
 
@@ -70,6 +76,13 @@ pub struct FileFacts {
     pub impls: Vec<ImplBlock>,
     pub refs: Vec<Ref>,
     pub imports: Vec<Import>,
+    /// JS/TS: the file has an `export` statement (an ES module).
+    pub has_exports: bool,
+    /// JS/TS: the file has an `import` statement or CommonJS exports: a module, not a
+    /// plain script (whose top-level definitions are globals).
+    pub is_module: bool,
+    /// JS/TS: names bound by `import { a } from 'p'` / `import a from 'p'`, with `p`.
+    pub import_bindings: Vec<(String, String)>,
 }
 
 fn query_for(lang: Lang) -> Result<&'static Query> {
@@ -116,7 +129,14 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
         impls: Vec::new(),
         refs: Vec::new(),
         imports: Vec::new(),
+        has_exports: false,
+        is_module: false,
+        import_bindings: Vec::new(),
     };
+    let mut export_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // name -> byte ranges of the functions where a local binding shadows it
+    let mut locals: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut value_refs: Vec<Ref> = Vec::new();
 
     let text = |n: Node| n.utf8_text(source).unwrap_or("").to_string();
 
@@ -154,6 +174,7 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 signature: signature_of(node, source),
                 doc: doc_of(node, source),
                 owner: caps.get("owner").map(|n| simple_type_name(&text(*n))),
+                exported: lang.family() == Lang::JavaScript.family() && has_export_ancestor(node),
             });
         } else if let Some(node) = caps.get("impl") {
             let Some(ty) = caps.get("impl.type") else {
@@ -166,7 +187,11 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 end_byte: node.end_byte(),
                 line: node.start_position().row as u32 + 1,
             });
-        } else if let Some(node) = caps.get("import").or(caps.get("import.mod")) {
+        } else if let Some(node) = caps
+            .get("import")
+            .or(caps.get("import.mod"))
+            .or(caps.get("import.reexport"))
+        {
             let Some(path_node) = caps.get("path") else {
                 continue;
             };
@@ -176,6 +201,39 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                     .to_string(),
                 names: import_names,
                 is_mod: caps.contains_key("import.mod"),
+                reexport: caps.contains_key("import.reexport"),
+                line: node.start_position().row as u32 + 1,
+            });
+        } else if caps.contains_key("export") {
+            facts.has_exports = true;
+        } else if caps.contains_key("esm") || caps.contains_key("commonjs") {
+            facts.is_module = true;
+        } else if let Some(n) = caps.get("export.name") {
+            export_names.insert(text(*n));
+        } else if let (Some(n), Some(from)) = (caps.get("import.binding"), caps.get("import.from"))
+        {
+            facts.import_bindings.push((text(*n), text(*from)));
+        } else if let Some(node) = caps.get("binding.pattern") {
+            if let Some(scope) = enclosing_function(*node) {
+                let mut names = Vec::new();
+                pattern_names(*node, source, &mut names);
+                for name in names {
+                    locals
+                        .entry(name)
+                        .or_default()
+                        .push((scope.start_byte(), scope.end_byte()));
+                }
+            }
+        } else if let Some(node) = caps.get("valueref") {
+            if in_import_or_export(*node) {
+                continue;
+            }
+            value_refs.push(Ref {
+                kind: RefKind::Value,
+                name: text(*node),
+                qualifier: None,
+                is_static: false,
+                byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
             });
         } else if let Some(node) = caps.get("call") {
@@ -209,7 +267,22 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
         }
     }
 
+    // A value ref shadowed by a local binding of an enclosing function is not the constant.
+    facts.refs.extend(value_refs.into_iter().filter(|r| {
+        !locals
+            .get(&r.name)
+            .is_some_and(|scopes| scopes.iter().any(|&(s, e)| s <= r.byte && r.byte < e))
+    }));
+
     dedupe_defs(&mut facts.defs);
+    // `export { a }` names a top-level definition (defs are sorted by start, -end).
+    let mut end_of_open = 0;
+    for d in &mut facts.defs {
+        if d.start_byte >= end_of_open {
+            d.exported |= export_names.contains(&d.name);
+            end_of_open = d.end_byte;
+        }
+    }
     // A supertype is also matched as a plain type reference: keep only the inheritance.
     let bases: std::collections::HashSet<usize> = facts
         .refs
@@ -221,6 +294,103 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
         .refs
         .retain(|r| r.kind != RefKind::TypeRef || !bases.contains(&r.byte));
     Ok(facts)
+}
+
+const FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "function",
+    "arrow_function",
+    "method_definition",
+    "generator_function_declaration",
+    "generator_function",
+];
+
+/// The innermost function (of any form) containing `node`; `None` at module level.
+fn enclosing_function(node: Node) -> Option<Node> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if FUNCTION_KINDS.contains(&n.kind()) {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Names bound by a parameter list or destructuring pattern (not default values or types).
+fn pattern_names(node: Node, source: &[u8], out: &mut Vec<String>) {
+    let text = |n: Node| n.utf8_text(source).unwrap_or("").to_string();
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => out.push(text(node)),
+        "pair_pattern" => {
+            if let Some(v) = node.child_by_field_name("value") {
+                pattern_names(v, source, out);
+            }
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(l) = node.child_by_field_name("left") {
+                pattern_names(l, source, out);
+            }
+        }
+        "required_parameter" | "optional_parameter" => {
+            if let Some(p) = node.child_by_field_name("pattern") {
+                pattern_names(p, source, out);
+            }
+        }
+        "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                pattern_names(child, source, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Identifiers in import/export clauses name bindings, not uses of a value.
+fn in_import_or_export(node: Node) -> bool {
+    // `export default name`
+    if node
+        .parent()
+        .is_some_and(|p| p.kind() == "export_statement")
+    {
+        return true;
+    }
+    let mut cur = node.parent();
+    for _ in 0..3 {
+        match cur {
+            Some(p)
+                if matches!(
+                    p.kind(),
+                    "import_specifier"
+                        | "import_clause"
+                        | "namespace_import"
+                        | "export_specifier"
+                        | "import_statement"
+                ) =>
+            {
+                return true;
+            }
+            Some(p) => cur = p.parent(),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// `export function f`, `export class C`, `export const x = …`, `export default …`.
+fn has_export_ancestor(node: Node) -> bool {
+    let mut cur = node.parent();
+    // A declarator sits in a declaration statement, which sits in the export.
+    for _ in 0..2 {
+        match cur {
+            Some(p) if p.kind() == "export_statement" => return true,
+            Some(p) if p.kind().ends_with("declaration") => cur = p.parent(),
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The same node can match several definition patterns (e.g. a Go `type_spec`
