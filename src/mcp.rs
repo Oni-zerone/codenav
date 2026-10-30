@@ -9,10 +9,10 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::explore;
-use crate::graph::{EdgeKind, Graph, SymKind};
+use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::output;
-use crate::query::{self, Direction};
+use crate::query::{self, Direction, EdgeFilter};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(20);
@@ -23,7 +23,11 @@ and external packages; edges are contains, imports, calls, inherits and referenc
 Start with graph_overview or module_graph for the big picture (get_community for structural clusters); for a question about specific code \
 call explore first, which returns the relevant subgraph in one call. Use search_symbols to get node ids, \
 then get_symbol, get_neighbors, find_paths and impact_analysis to explore relations. \
-Call resolution is name-based: edges flagged `ambiguous` may be false positives, verify them with read_code.";
+Call resolution is name-based, so each edge has a confidence: exact (same file, resolved import, \
+self/type qualifier), inferred (found by proximity or unique in the repository) or ambiguous (one of \
+several same-named candidates: may be a false positive, verify with read_code). Only non-exact edges \
+are labelled. Pass min_confidence to get_neighbors, find_paths, impact_analysis or explore to follow \
+only surer edges; audit_edges lists the guesses.";
 
 pub struct Server {
     root: PathBuf,
@@ -233,6 +237,7 @@ impl Server {
                         depth: uint(a, "depth", 2)?.clamp(1, 6) as u32,
                         direction,
                         kinds: &kinds,
+                        min_confidence: min_confidence(a)?,
                         token_budget: token_budget(a)?,
                     },
                 )?;
@@ -270,7 +275,10 @@ impl Server {
                     g,
                     i,
                     dir,
-                    &edge_kinds(a)?,
+                    EdgeFilter {
+                        kinds: &edge_kinds(a)?,
+                        min: min_confidence(a)?,
+                    },
                     uint(a, "depth", 1)?.clamp(1, 5) as u32,
                     uint(a, "limit", 60)?,
                 ))
@@ -282,7 +290,10 @@ impl Server {
                     g,
                     from,
                     to,
-                    &edge_kinds(a)?,
+                    EdgeFilter {
+                        kinds: &edge_kinds(a)?,
+                        min: min_confidence(a)?,
+                    },
                     opt_bool(a, "directed")?.unwrap_or(false),
                     uint(a, "max_depth", 6)?.clamp(1, 12) as u32,
                     uint(a, "max_paths", 3)?.clamp(1, 20),
@@ -304,6 +315,20 @@ impl Server {
                     i,
                     uint(a, "depth", 3)?.clamp(1, 8) as u32,
                     uint(a, "limit", 200)?,
+                    min_confidence(a)?,
+                ))
+            }
+            "audit_edges" => {
+                let level = match opt_str(a, "confidence")? {
+                    Some(c) => parse_confidence(c)?,
+                    None => Confidence::Ambiguous,
+                };
+                Ok(query::audit_edges(
+                    g,
+                    level,
+                    opt_str(a, "path")?,
+                    &edge_kinds(a)?,
+                    uint(a, "limit", 100)?,
                 ))
             }
             "read_code" => {
@@ -346,6 +371,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "impact_analysis" => "lower depth or limit",
         "module_graph" => "lower depth or raise min_weight",
         "get_community" => "lower limit",
+        "audit_edges" => "narrow with path or edge_kinds, or lower limit",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -379,6 +405,19 @@ fn opt_bool(a: &Value, key: &str) -> Result<Option<bool>> {
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(v) => Err(anyhow!("argument `{key}` must be true or false, got {v}")),
     }
+}
+
+fn parse_confidence(s: &str) -> Result<Confidence> {
+    Confidence::parse(&s.to_lowercase())
+        .ok_or_else(|| anyhow!("confidence must be exact, inferred or ambiguous, got `{s}`"))
+}
+
+/// `min_confidence`: follow only edges at least this sure (default: all).
+fn min_confidence(a: &Value) -> Result<Confidence> {
+    opt_str(a, "min_confidence")?
+        .map(parse_confidence)
+        .transpose()
+        .map(|c| c.unwrap_or(Confidence::Ambiguous))
 }
 
 fn opt_str<'a>(a: &'a Value, key: &str) -> Result<Option<&'a str>> {
@@ -427,6 +466,7 @@ fn tool_definitions() -> Value {
     let mut tools = base_tool_definitions();
     let budget = json!({ "type": "integer", "description": "Approximate max output tokens, 200-100000, default 2000. Output beyond it is cut with a notice at the top." });
     let format = json!({ "type": "string", "enum": ["text", "json"], "description": "text (default): compact, cut to token_budget. json: the full structured result, no budget." });
+    let min_confidence = json!({ "type": "string", "enum": ["exact", "inferred", "ambiguous"], "description": "Follow only edges at least this sure: exact, inferred (exact + inferred) or ambiguous (all, default)." });
     for tool in tools.as_array_mut().into_iter().flatten() {
         let name = tool["name"].as_str().unwrap_or("").to_string();
         let Some(props) = tool["inputSchema"]["properties"].as_object_mut() else {
@@ -436,6 +476,12 @@ fn tool_definitions() -> Value {
             continue;
         }
         props.entry("token_budget").or_insert(budget.clone());
+        if matches!(
+            name.as_str(),
+            "get_neighbors" | "find_paths" | "impact_analysis" | "explore"
+        ) {
+            props.insert("min_confidence".into(), min_confidence.clone());
+        }
         if !matches!(name.as_str(), "explore" | "read_code") {
             props.insert("format".into(), format.clone());
         }
@@ -534,6 +580,16 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "audit_edges",
+            "description": "Check the name-based resolver: edge counts per kind and confidence (exact / inferred / ambiguous), then the edges at one confidence level grouped by source file with their line, to verify with read_code.",
+            "inputSchema": { "type": "object", "properties": {
+                "confidence": { "type": "string", "enum": ["exact", "inferred", "ambiguous"], "description": "Level to list (default ambiguous)." },
+                "path": { "type": "string", "description": "Only edges whose source file starts with this path." },
+                "edge_kinds": edge_kinds.clone(),
+                "limit": { "type": "integer", "description": "Edges listed, default 100." }
+            } }
         },
         {
             "name": "impact_analysis",

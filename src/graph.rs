@@ -15,7 +15,8 @@ const GRAPH_FILE: &str = "graph.cnav";
 /// Name used before the switch to `.cnav`; removed on save so stale copies don't linger.
 const LEGACY_GRAPH_FILE: &str = "graph.json";
 /// v2: communities (`Node::community`, `Graph::communities`).
-const FORMAT_VERSION: u32 = 2;
+/// v3: `Edge::confidence` replaces the `ambiguous` flag.
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -99,6 +100,58 @@ impl SymKind {
     }
 }
 
+/// How sure the resolver is about an edge's target (resolution is name-based).
+/// Ordered from least to most certain, so `a >= min` means "at least as sure as `min`".
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    /// One of several same-named candidates, or a common method on a value of unknown type.
+    Ambiguous,
+    /// A unique candidate found by proximity (same directory or crate, or the only one in
+    /// the repository), or a method called on a value of unknown type.
+    Inferred,
+    /// Structural (containment, imports), or a unique candidate in the same file, an
+    /// imported file, or named by a `self`/type/module qualifier.
+    #[default]
+    Exact,
+}
+
+impl Confidence {
+    pub const ALL: [Confidence; 3] = [
+        Confidence::Exact,
+        Confidence::Inferred,
+        Confidence::Ambiguous,
+    ];
+
+    pub fn parse(s: &str) -> Option<Confidence> {
+        Some(match s {
+            "exact" => Confidence::Exact,
+            "inferred" => Confidence::Inferred,
+            "ambiguous" => Confidence::Ambiguous,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Exact => "exact",
+            Confidence::Inferred => "inferred",
+            Confidence::Ambiguous => "ambiguous",
+        }
+    }
+
+    pub fn is_exact(&self) -> bool {
+        *self == Confidence::Exact
+    }
+
+    /// The name to show next to an edge or a result, or `None` when exact (the default).
+    pub fn label(self) -> Option<&'static str> {
+        (!self.is_exact()).then(|| self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum EdgeKind {
@@ -178,11 +231,17 @@ pub struct Edge {
     pub kind: EdgeKind,
     /// Number of occurrences (e.g. call sites) merged into this edge.
     pub count: u32,
-    /// The target was chosen by name among several candidates.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub ambiguous: bool,
+    /// How sure the resolver is about the target (omitted when exact).
+    #[serde(default, skip_serializing_if = "Confidence::is_exact")]
+    pub confidence: Confidence,
     /// First line in the source file where the relation occurs.
     pub line: u32,
+}
+
+impl Edge {
+    pub fn is_ambiguous(&self) -> bool {
+        self.confidence == Confidence::Ambiguous
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

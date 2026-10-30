@@ -432,6 +432,303 @@ fn hub_percentile_is_kept_across_reindexing() {
     assert_eq!(saved(), json!(99.0));
 }
 
+/// Confidence of the edge `from -kind-> to` as get_symbol reports it.
+fn confidence(from: &str, kind: &str, to: &str) -> String {
+    let v = tool("get_symbol", json!({ "id": from, "include_code": false }));
+    let list = v["outgoing"][kind]
+        .as_array()
+        .unwrap_or_else(|| panic!("{from} has no {kind} edges: {v:#}"));
+    for item in list {
+        if item.as_str() == Some(to) {
+            return "exact".into();
+        }
+        if item["id"] == to {
+            return item["confidence"].as_str().unwrap_or("exact").into();
+        }
+    }
+    panic!("no {kind} edge {from} -> {to}: {v:#}")
+}
+
+#[test]
+fn edges_carry_the_expected_confidence() {
+    let cases = [
+        // Same file / imported file / self / package qualifier: exact.
+        (
+            "py/app/models.py::User",
+            "inherits",
+            "py/app/models.py::Base",
+            "exact",
+        ),
+        (
+            "py/app/services/users.py::UserService::create",
+            "calls",
+            "py/app/models.py::User",
+            "exact",
+        ),
+        (
+            "ios/Sources/App/ViewModel.swift::ViewModel::reset",
+            "calls",
+            "ios/Sources/App/ViewModel.swift::ViewModel::refresh",
+            "exact",
+        ),
+        (
+            "goapp/main.go::main",
+            "calls",
+            "goapp/internal/store/store.go::New",
+            "exact",
+        ),
+        (
+            "py/app/services/users.py",
+            "imports",
+            "py/app/models.py",
+            "exact",
+        ),
+        // Same directory, no import (Swift) / unknown receiver with a unique method: inferred.
+        (
+            "ios/Sources/App/ViewModel.swift::ViewModel",
+            "references",
+            "ios/Sources/App/Model.swift::Repository",
+            "inferred",
+        ),
+        (
+            "goapp/main.go::main",
+            "calls",
+            "goapp/internal/store/store.go::Store::Get",
+            "inferred",
+        ),
+        // Several same-named candidates: ambiguous.
+        (
+            "ios/Sources/App/ViewModel.swift::ViewModel::refresh",
+            "calls",
+            "ios/Sources/App/Model.swift::Repository::load",
+            "ambiguous",
+        ),
+        (
+            "ios/Sources/App/ViewModel.swift::ViewModel::refresh",
+            "calls",
+            "ios/Sources/App/Model.swift::ItemStore::load",
+            "ambiguous",
+        ),
+        (
+            "web/src/components/Profile.tsx::Profile",
+            "calls",
+            "web/src/lib/api.ts::HttpClient::get",
+            "ambiguous",
+        ),
+    ];
+    for (from, kind, to, expected) in cases {
+        assert_eq!(
+            confidence(from, kind, to),
+            expected,
+            "{from} -{kind}-> {to}"
+        );
+    }
+
+    let overview = tool("graph_overview", json!({}));
+    let shares = &overview["edge_confidence"];
+    let total: f64 = ["exact", "inferred", "ambiguous"]
+        .iter()
+        .map(|c| shares[c]["percent"].as_f64().unwrap())
+        .sum();
+    assert!((total - 100.0).abs() < 0.5, "{shares}");
+    assert!(
+        shares["ambiguous"]["edges"].as_u64().unwrap() >= 3,
+        "{shares}"
+    );
+}
+
+#[test]
+fn min_confidence_filters_traversals() {
+    let refresh = "ios/Sources/App/ViewModel.swift::ViewModel::refresh";
+    let load = "ios/Sources/App/Model.swift::ItemStore::load";
+
+    let all = tool(
+        "get_neighbors",
+        json!({ "id": refresh, "direction": "out" }),
+    )
+    .to_string();
+    assert!(
+        all.contains(load) && all.contains("\"confidence\":\"ambiguous\""),
+        "{all}"
+    );
+    let sure = tool(
+        "get_neighbors",
+        json!({ "id": refresh, "direction": "out", "min_confidence": "inferred" }),
+    )
+    .to_string();
+    assert!(
+        !sure.contains(load) && sure.contains("ViewModel::render"),
+        "{sure}"
+    );
+
+    let impact = tool("impact_analysis", json!({ "id": load }));
+    let text = impact["by_file"].to_string();
+    assert!(
+        text.contains("ViewModel::refresh (method) via called_by [depth 1, ambiguous]"),
+        "{impact:#}"
+    );
+    // The weakest link is reported along the path.
+    assert!(
+        text.contains("ViewModel::reset (method) via called_by [depth 2, ambiguous]"),
+        "{impact:#}"
+    );
+    let impact = tool(
+        "impact_analysis",
+        json!({ "id": load, "min_confidence": "exact" }),
+    );
+    assert_eq!(impact["affected_symbols"], 0, "{impact:#}");
+
+    let path = |min: &str| {
+        tool(
+            "find_paths",
+            json!({ "from": refresh, "to": load, "directed": true, "min_confidence": min }),
+        )["found"]
+            .clone()
+    };
+    assert_eq!(path("ambiguous"), true);
+    assert_eq!(path("exact"), false);
+
+    let (ok, text) = tool_text(
+        "explore",
+        json!({ "seeds": [refresh], "question": "", "min_confidence": "exact" }),
+    );
+    assert!(
+        ok && text.contains("min confidence: exact") && !text.contains(load),
+        "{text}"
+    );
+
+    let (ok, text) = tool_text(
+        "get_neighbors",
+        json!({ "id": refresh, "min_confidence": "sure" }),
+    );
+    assert!(
+        !ok && text.contains("exact, inferred or ambiguous"),
+        "{text}"
+    );
+}
+
+#[test]
+fn audit_edges_lists_guesses() {
+    let v = tool("audit_edges", json!({}));
+    assert_eq!(v["confidence"], "ambiguous");
+    assert_eq!(
+        v["totals_by_kind"]["calls"]["ambiguous"], v["matching_edges"],
+        "{v:#}"
+    );
+    let swift = v["by_file"]["ios/Sources/App/ViewModel.swift"].to_string();
+    assert!(
+        swift
+            .contains("L7 ViewModel::refresh calls → ios/Sources/App/Model.swift::ItemStore::load"),
+        "{v:#}"
+    );
+
+    let v = tool(
+        "audit_edges",
+        json!({ "confidence": "inferred", "path": "goapp/" }),
+    );
+    assert_eq!(v["matching_edges"], 1, "{v:#}");
+    assert!(
+        v["by_file"]["goapp/main.go"]
+            .to_string()
+            .contains("Store::Get"),
+        "{v:#}"
+    );
+
+    let v = tool(
+        "audit_edges",
+        json!({ "confidence": "exact", "edge_kinds": ["imports"], "limit": 2 }),
+    );
+    assert_eq!(
+        v["by_file"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|l| l.as_array().unwrap().len())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(v["truncated"], true);
+}
+
+#[test]
+fn owner_and_overload_confidence() {
+    let repo = TempRepo::new(
+        "confowner",
+        &[
+            ("src/a.rs", "pub struct Foo;\n".into()),
+            ("src/b.rs", "pub struct Foo;\n".into()),
+            // `impl Foo` with two candidate owners in the directory: a guess.
+            ("src/c.rs", "impl Foo {\n    pub fn m(&self) {}\n}\n".into()),
+            // Two same-named members of the current type: the owner is certain.
+            (
+                "src/d.rs",
+                "pub struct T;\nimpl T {\n    fn f(&self) {}\n    fn show(&self) { self.f(); }\n}\n\
+                 impl Other for T {\n    fn f(&self) {}\n}\n"
+                    .into(),
+            ),
+        ],
+    );
+    let symbol = |id: &str| -> Value {
+        let (ok, text) = tool_text_in(
+            &repo.0,
+            "get_symbol",
+            json!({ "id": id, "include_code": false, "format": "json" }),
+        );
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+    let foo = symbol("src/a.rs::Foo");
+    assert_eq!(
+        foo["outgoing"]["contains"],
+        json!([{ "id": "src/c.rs::Foo::m", "confidence": "ambiguous" }]),
+        "{foo:#}"
+    );
+    let show = symbol("src/d.rs::T::show");
+    let calls = show["outgoing"]["calls"].to_string();
+    assert!(
+        calls.contains("src/d.rs::T::f") && !calls.contains("confidence"),
+        "{show:#}"
+    );
+
+    // audit_edges paths are whole components.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "audit_edges",
+        json!({ "confidence": "exact", "path": "src/a", "format": "json" }),
+    );
+    assert!(ok, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["matching_edges"],
+        0,
+        "{text}"
+    );
+}
+
+/// Several occurrences of one relation: a single sure one makes the edge sure.
+#[test]
+fn merged_edges_keep_the_best_confidence() {
+    let repo = TempRepo::new(
+        "confmerge",
+        &[(
+            "a.py",
+            "class A:\n    def helper(self):\n        pass\n\n    def run(self, other):\n        other.helper()\n        self.helper()\n"
+                .into(),
+        )],
+    );
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_symbol",
+        json!({ "id": "a.py::A::run", "include_code": false, "format": "json" }),
+    );
+    assert!(ok, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        v["outgoing"]["calls"],
+        json!([{ "id": "a.py::A::helper", "count": 2 }]),
+        "{v:#}"
+    );
+}
+
 #[test]
 fn explore_question_returns_relevant_subgraph() {
     let (ok, text) = tool_text(
@@ -666,6 +963,10 @@ fn every_structured_tool_respects_token_budget() {
         (
             "get_community",
             json!({ "id": "src/graph.rs::Graph", "limit": 200 }),
+        ),
+        (
+            "audit_edges",
+            json!({ "confidence": "exact", "limit": 500 }),
         ),
     ];
     let mut truncated = 0;

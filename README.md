@@ -15,7 +15,8 @@ repo ──walk (.gitignore)──▶ tree-sitter parse (parallelo) ──▶ fa
 - **Nodi**: file, simboli (`class`, `struct`, `enum`, `interface` = trait/protocol, `type`,
   `function`, `method`, `module`, `constant`, `macro`) e pacchetti esterni (`ext:requests`).
 - **Archi**: `contains`, `imports`, `calls`, `inherits` (extends/implements/conformance),
-  `references` (uso di un tipo). Ogni arco ha un conteggio delle occorrenze e un flag `ambiguous`.
+  `references` (uso di un tipo). Ogni arco ha un conteggio delle occorrenze e una confidenza
+  (`exact`, `inferred`, `ambiguous`).
 - **Id stabili** leggibili: `src/graph.rs::Graph::load`, `py/app/models.py::User`.
 
 Linguaggi supportati: **Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Swift**.
@@ -24,13 +25,27 @@ Linguaggi supportati: **Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Swift*
 
 L'analisi è sintattica (nessun type checker), quindi i riferimenti sono collegati per nome con
 priorità: stesso file → file importati → stessa directory → stesso crate (Rust) → candidati
-globali (al massimo 3, marcati `ambiguous`). Alcune euristiche riducono i falsi positivi:
+globali (al massimo 3). Alcune euristiche riducono i falsi positivi:
 
 - `Vec::new()`, `Math.max()`: qualificatore statico non presente nel repo → scartato;
 - `x.foo()`: può puntare solo a metodi; nomi molto comuni (`get`, `len`, `push`…) non vengono
   risolti globalmente;
 - `self.foo()` / `this.foo()`: preferisce i membri del tipo corrente;
 - `store.New()` (Go), `utils.helper()` (Python): il qualificatore può essere package/modulo.
+
+Ogni arco dice quanto è sicuro il collegamento (`confidence`):
+
+| Confidenza | Quando |
+|---|---|
+| `exact` | contenimento e import; candidato unico nello stesso file, in un file importato, o indicato da un qualificatore (`self.foo()`, `Store::new()`, `store.New()`) |
+| `inferred` | candidato unico trovato per vicinanza (stessa directory o crate) o unico nel repo, oppure metodo unico chiamato su un valore di tipo sconosciuto (`x.save()`) |
+| `ambiguous` | uno tra più candidati con lo stesso nome, o un metodo comune su un valore di tipo sconosciuto: può essere un falso positivo |
+
+Se la stessa relazione compare più volte, basta un'occorrenza sicura per renderla sicura.
+`graph_overview` riporta la percentuale di ogni livello; `get_neighbors`, `find_paths`,
+`impact_analysis` ed `explore` accettano `min_confidence` (`exact` o `inferred`) per seguire solo
+gli archi più sicuri; `audit_edges` elenca gli archi di un livello con file e riga, per verificarli.
+Nelle risposte la confidenza compare solo quando non è `exact`.
 
 Gli import sono risolti a file del repo (path relativi, `crate::`/`super::`, moduli Python,
 alias `@/` e `~/`, package Go) oppure a nodi `ext:*`.
@@ -101,6 +116,7 @@ aggiornamento automatico quando l'indice cambia.
 | `get_neighbors` | BFS attorno a un nodo (es. chi chiama X: `direction=in`, `edge_kinds=[calls]`) |
 | `find_paths` | Catene di relazioni più brevi tra due nodi ("come sono collegati A e B?") |
 | `file_outline` | Simboli di un file (annidati), import, importatori, file più correlati |
+| `audit_edges` | Verifica del resolver: archi per tipo e confidenza, poi quelli di un livello (default `ambiguous`) con file e riga |
 | `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base) |
 | `read_code` | Legge un intervallo di righe di un file del repo |
 | `reindex` | Ricostruisce il grafo |

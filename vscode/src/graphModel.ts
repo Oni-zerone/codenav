@@ -1,8 +1,8 @@
 // Pure model of `.codenav/graph.cnav` (JSON) and the views drawn by the webview.
 // No `vscode` import here, so it can be unit-tested with plain Node.
 
-/** Graph format versions this extension reads (v2 adds communities). */
-export const SUPPORTED_VERSIONS = [1, 2];
+/** Graph format versions this extension reads (v2 adds communities, v3 edge confidence). */
+export const SUPPORTED_VERSIONS = [1, 2, 3];
 
 export type SymKind =
   | 'file' | 'external' | 'module' | 'class' | 'struct' | 'enum'
@@ -32,7 +32,10 @@ export interface RawEdge {
   to: number;
   kind: EdgeKind;
   count: number;
+  /** v1-v2: the target was guessed among several candidates. */
   ambiguous?: boolean;
+  /** v3: how sure the resolver is (absent = exact). */
+  confidence?: 'exact' | 'inferred' | 'ambiguous';
   line: number;
 }
 
@@ -139,6 +142,12 @@ export class CodeGraph {
   constructor(raw: RawGraph) {
     this.nodes = raw.nodes;
     this.edges = raw.edges;
+    // v3 encodes guesses as `confidence`; the views only need the `ambiguous` flag.
+    for (const e of this.edges) {
+      if (e.confidence === 'ambiguous') {
+        e.ambiguous = true;
+      }
+    }
     this.root = raw.root;
     this.indexedAt = raw.indexed_at;
     this.communities = (raw.communities ?? []).map((c, id) => ({ id, label: c.label, size: c.size }));
