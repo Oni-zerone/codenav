@@ -52,8 +52,8 @@ pub struct Ref {
     pub qualifier: Option<String>,
     /// The qualifier is a static path (type or module), not a value.
     pub is_static: bool,
-    /// The qualifier is a single name (`utils.f()`), not a chain (`self.graph.f()`).
-    pub simple_qualifier: bool,
+    /// The whole qualifier as written (`self.graph`, `pkg.utils`, `crate::store`).
+    pub qualifier_path: Option<String>,
     pub byte: usize,
     pub line: u32,
 }
@@ -235,7 +235,7 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 name: text(*node),
                 qualifier: None,
                 is_static: false,
-                simple_qualifier: false,
+                qualifier_path: None,
                 byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
             });
@@ -251,10 +251,10 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                     .or(caps.get("scope"))
                     .map(|n| last_segment(&text(*n))),
                 is_static: caps.contains_key("scope"),
-                simple_qualifier: caps
+                qualifier_path: caps
                     .get("qualifier")
                     .or(caps.get("scope"))
-                    .is_some_and(|n| !text(*n).contains(['.', ':', '(', '[', '-'])),
+                    .map(|n| text(*n)),
                 byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
             });
@@ -268,7 +268,7 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 name: simple_type_name(&text(node)),
                 qualifier: None,
                 is_static: false,
-                simple_qualifier: false,
+                qualifier_path: None,
                 byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
             });

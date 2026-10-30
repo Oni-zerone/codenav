@@ -2110,6 +2110,86 @@ fn common_methods_need_their_type_nearby() {
     );
 }
 
+#[test]
+fn common_method_evidence_review_cases() {
+    let repo = TempRepo::new(
+        "commonmethods2",
+        &[
+            (
+                "src/lib.rs",
+                "pub struct WGraph;\nimpl WGraph {\n    pub fn new() -> WGraph { WGraph }\n    pub fn len(&self) -> usize { 0 }\n}\n\
+                 pub struct Foo;\nimpl Foo {\n    pub fn m(&self) -> usize { let g = WGraph::new(); g.len() }\n}\n\
+                 pub trait Container { fn items(&self) -> usize { 0 } }\n\
+                 pub struct Bag;\nimpl Container for Bag {}\nimpl Bag {\n    pub fn f(&self) -> usize { self.items() }\n}\n\
+                 pub fn via_path() { crate::store::load(); }\n"
+                    .into(),
+            ),
+            ("src/store.rs", "pub fn load() {}\n".into()),
+            (
+                "py/service.py",
+                "from cache import Cache\nimport pkg.utils\n\nclass Service:\n    def make(self):\n        return Cache()\n\n    def lookup(self, d, k):\n        return d.get(k)\n\n    def helper(self):\n        return pkg.utils.helper()\n\n\
+                 data = {}\nvalue = data.get('x')\n\ndef uses_cache(c: Cache):\n    return c.get('k')\n"
+                    .into(),
+            ),
+            ("py/cache.py", "class Cache:\n    def get(self, k):\n        return k\n".into()),
+            ("py/pkg/utils.py", "def helper():\n    pass\n".into()),
+            ("js/a.ts", "export class Repo { load() {} }\n".into()),
+            ("js/b.ts", "import { Repo } from './a';\nexport function use(r: any) { r.load(); }\n".into()),
+        ],
+    );
+    let calls = |id: &str| symbol_in(&repo, id)["outgoing"]["calls"].to_string();
+    // A method in an `impl` block: its own body names WGraph.
+    assert!(
+        calls("src/lib.rs::Foo::m").contains("WGraph::len"),
+        "{}",
+        calls("src/lib.rs::Foo::m")
+    );
+    // `self.items()` reaches the trait's default method (the receiver is known).
+    assert!(
+        calls("src/lib.rs::Bag::f").contains("Container::items"),
+        "{}",
+        calls("src/lib.rs::Bag::f")
+    );
+    // A multi-segment Rust path still names the module.
+    assert!(
+        calls("src/lib.rs::via_path").contains("src/store.rs::load"),
+        "{}",
+        calls("src/lib.rs::via_path")
+    );
+    // Cache is named in another method only: d.get() is a dict's.
+    assert!(
+        !calls("py/service.py::Service::lookup").contains("Cache"),
+        "{}",
+        calls("py/service.py::Service::lookup")
+    );
+    // A dotted module path the file imports.
+    assert!(
+        calls("py/service.py::Service::helper").contains("py/pkg/utils.py::helper"),
+        "{}",
+        calls("py/service.py::Service::helper")
+    );
+    // Top-level code: a mention inside a function does not count.
+    assert!(
+        !calls("py/service.py").contains("Cache::get"),
+        "{}",
+        calls("py/service.py")
+    );
+    // The type named in the annotation: linked, as inferred.
+    let c = symbol_in(&repo, "py/service.py::uses_cache");
+    assert!(
+        c["outgoing"]["calls"]
+            .to_string()
+            .contains("\"confidence\":\"inferred\""),
+        "{c:#}"
+    );
+    // `r: any` names no type: `r.load()` is not guessed to be Repo's.
+    assert!(
+        !calls("js/b.ts::use").contains("Repo::load"),
+        "{}",
+        calls("js/b.ts::use")
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
