@@ -817,7 +817,7 @@ pub fn overview(g: &Graph, top: usize) -> Value {
 
     json!({
         "root": g.root,
-        "indexed_at_unix": g.indexed_at,
+        "index": { "built_at_unix": g.indexed_at },
         "languages": langs,
         "node_kinds": kinds,
         "edge_kinds": edge_kinds,

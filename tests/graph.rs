@@ -1114,6 +1114,83 @@ fn fixture_has_no_cycles() {
     }
 }
 
+#[test]
+fn overview_reports_the_indexed_commit() {
+    let repo = TempRepo::new("vcs", &[("a.py", "def f():\n    pass\n".into())]);
+    // Staleness compares mtimes with whole seconds: leave the second the files were
+    // written in, or a fresh index would already look stale.
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(1100));
+    settle();
+    let overview = || -> Value {
+        let (ok, text) = tool_text_in(&repo.0, "graph_overview", json!({ "format": "json" }));
+        assert!(ok, "{text}");
+        serde_json::from_str::<Value>(&text).unwrap()["index"].clone()
+    };
+    // Not a Git repository: no commit, no error.
+    let index = overview();
+    assert!(index["built_at_unix"].is_u64(), "{index}");
+    assert!(
+        index.get("commit").is_none() && index.get("warnings").is_none(),
+        "{index}"
+    );
+
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo.0)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.0.join(".gitignore"), ".codenav/\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "one"]);
+    let first = git(&["rev-parse", "HEAD"]);
+    settle();
+    let out = codenav().arg("index").arg(&repo.0).output().unwrap();
+    assert!(out.status.success());
+
+    let index = overview();
+    assert_eq!(index["commit"], first, "{index}");
+    assert_eq!(index["branch"], "main", "{index}");
+    assert_eq!(index["uncommitted_changes"], false, "{index}");
+    assert!(index.get("warnings").is_none(), "{index}");
+
+    // HEAD moves without touching sources: the graph is kept, with a warning.
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    let index = overview();
+    assert_eq!(index["commit"], first);
+    assert!(
+        index["warnings"].to_string().contains("HEAD is now"),
+        "{index}"
+    );
+
+    // An uncommitted edit makes the graph stale; the rebuilt one records the change.
+    settle();
+    std::fs::write(repo.0.join("a.py"), "def f():\n    return 1\n").unwrap();
+    let index = overview();
+    assert_eq!(index["uncommitted_changes"], true, "{index}");
+    assert_ne!(
+        index["commit"], first,
+        "re-indexed at the new HEAD: {index}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {

@@ -14,6 +14,7 @@ use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::output;
 use crate::query::{self, Direction, EdgeFilter};
+use crate::vcs;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(20);
@@ -180,7 +181,11 @@ impl Server {
         self.refresh_if_stale();
         let g = &self.graph;
         match name {
-            "graph_overview" => Ok(query::overview(g, uint(a, "top", 15)?)),
+            "graph_overview" => {
+                let mut v = query::overview(g, uint(a, "top", 15)?);
+                v["index"] = vcs::index_state(g, &self.root);
+                Ok(v)
+            }
             "get_community" => {
                 let (c, from) = match a.get("community").filter(|v| !v.is_null()) {
                     Some(_) => (uint(a, "community", 0)?, None),

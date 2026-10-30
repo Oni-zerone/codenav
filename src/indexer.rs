@@ -21,6 +21,7 @@ use crate::communities;
 use crate::extract::{self, FileFacts, RefKind};
 use crate::graph::{Confidence, Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
 use crate::lang::Lang;
+use crate::vcs;
 
 /// Project-specific exclusions, same syntax as `.gitignore`.
 pub const IGNORE_FILE: &str = ".codenavignore";
@@ -252,8 +253,11 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
 
 pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats)> {
     let started = Instant::now();
-    // Timestamp taken before reading so edits made during indexing count as stale.
+    // Timestamp and repository state taken before reading, so edits made during
+    // indexing count as stale.
     let indexed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let head = vcs::head(root);
+    let dirty = vcs::has_uncommitted_changes(root);
     let files = discover(root);
 
     let results: Vec<Result<FileFacts, String>> = files
@@ -275,6 +279,9 @@ pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats
 
     let mut graph = Builder::new(root, &facts).build();
     graph.indexed_at = indexed_at;
+    graph.git_commit = head.as_ref().map(|h| h.commit.clone());
+    graph.git_branch = head.and_then(|h| h.branch);
+    graph.git_dirty = dirty;
     graph.build_indexes();
     communities::detect(&mut graph, opts.hub_percentile);
 
