@@ -47,7 +47,8 @@ enum Command {
         #[arg(long)]
         any_project: bool,
         /// Graphs kept in memory at once; the least recently used are dropped (reloaded
-        /// from their index when needed).
+        /// from their index when needed). While switching to an unloaded repository, the
+        /// previously active graph is held until the new one is loaded.
         #[arg(long, default_value_t = mcp::DEFAULT_MAX_LOADED as u16,
               value_parser = clap::value_parser!(u16).range(1..))]
         max_loaded: u16,
@@ -135,8 +136,13 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|p| canonical_root(p))
                 .collect::<Result<_>>()?;
+            let load = mcp::LoadOptions {
+                fresh,
+                hub_percentile: opts.hub_percentile,
+            };
             let (graph, opts) = indexer::load_or_index(&roots[0], fresh, opts.hub_percentile)?;
             let mut server = mcp::Server::new(roots[0].clone(), graph, !no_refresh, opts);
+            server.set_load_options(load);
             for root in &roots[1..] {
                 server.add_project(root.clone());
             }

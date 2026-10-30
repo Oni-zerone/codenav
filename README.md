@@ -157,7 +157,9 @@ invece il risultato JSON completo, senza budget.
 `project` (il nome mostrato da `list_projects`, o il path), e senza `project` risponde sul primo.
 I grafi si caricano al primo uso; al massimo `--max-loaded` (default 4) restano in memoria, i meno
 usati di recente vengono scaricati e ricaricati dal loro indice quando servono. Con
-`--any-project` i tool possono aprire anche altri repository indicandone il path.
+`--any-project` i tool possono aprire anche altri repository indicandone il path assoluto (solo
+cartelle con `.git` o con un indice codenav). `--fresh` e `--hub-percentile` valgono per tutti i
+repository.
 
 ### Risorse e prompt MCP
 

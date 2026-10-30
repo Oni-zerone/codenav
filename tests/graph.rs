@@ -2030,16 +2030,51 @@ fn one_server_answers_about_several_projects() {
         .collect();
     assert_eq!(loaded, vec![true, false], "{projects:#}");
 
-    // --any-project opens other repositories by path.
+    // Listing does not switch: after a call on b, b is the active one.
+    let r = serve_calls(
+        &[poly, b, max1, one],
+        &[
+            search("sharpen", Some(&b_name)),
+            ("list_projects", json!({ "format": "json" })),
+        ],
+    );
+    let projects: Value = serde_json::from_str(&r[1].1).unwrap();
+    assert_eq!(projects["projects"][1]["active"], true, "{projects:#}");
+    assert_eq!(projects["projects"][0]["loaded"], false, "{projects:#}");
+
+    // --any-project opens other repositories by absolute path, but only repositories.
     let any: &std::ffi::OsStr = "--any-project".as_ref();
+    let not_repo = TempRepo::new("multi-d", &[("y.py", "def y():\n    pass\n".into())]);
+    std::fs::create_dir_all(third.0.join(".git")).unwrap();
     let r = serve_calls(
         &[poly, any],
-        &[search("only_in_third", Some(third.0.to_str().unwrap()))],
+        &[
+            search("only_in_third", Some(third.0.to_str().unwrap())),
+            search("y", Some(not_repo.0.to_str().unwrap())),
+            search("y", Some("relative/path")),
+            ("list_projects", json!({ "format": "json" })),
+        ],
     );
     assert!(
         r[0].0 && r[0].1.contains("x.py::only_in_third"),
         "{}",
         r[0].1
+    );
+    assert!(
+        !r[1].0 && r[1].1.contains("is not a repository"),
+        "{}",
+        r[1].1
+    );
+    assert!(!r[2].0 && r[2].1.contains("absolute path"), "{}", r[2].1);
+    let projects: Value = serde_json::from_str(&r[3].1).unwrap();
+    assert_eq!(
+        projects["projects"].as_array().unwrap().len(),
+        2,
+        "no entry for failures: {projects:#}"
+    );
+    assert!(
+        !not_repo.0.join(".codenav").exists(),
+        "nothing indexed in a non-repository"
     );
 }
 
