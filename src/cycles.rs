@@ -20,6 +20,9 @@ pub enum Level {
 const CYCLES_PER_COMPONENT: usize = 10;
 /// Members listed per component.
 const MEMBERS_SHOWN: usize = 20;
+/// Cycles are searched from at most this many members of a component (the most
+/// connected first), so a huge component stays cheap.
+const MAX_STARTS: usize = 100;
 
 pub fn find_cycles(
     g: &Graph,
@@ -28,73 +31,69 @@ pub fn find_cycles(
     max_length: usize,
     limit: usize,
 ) -> Value {
-    // Units and the dependencies between them (aggregated from symbol-level edges).
-    let unit_of = |i: usize| -> Option<String> {
+    // Unit of every node, computed once: files, or directory components as module_graph
+    // groups them (externals have none).
+    let unit_name = |i: usize| -> Option<String> {
         let n = &g.nodes[i];
-        if n.kind == SymKind::External || n.file.is_empty() {
-            return None;
+        match level {
+            _ if n.kind == SymKind::External => None,
+            Level::File if n.file.is_empty() => None,
+            Level::File => Some(n.file.clone()),
+            Level::Module(depth) => Some(query::component(&n.file, depth)),
         }
-        Some(match level {
-            Level::File => n.file.clone(),
-            Level::Module(depth) => query::component(&n.file, depth),
-        })
     };
-    let mut deps: BTreeMap<(String, String), BTreeMap<&str, u32>> = BTreeMap::new();
-    for e in &g.edges {
-        if e.kind == EdgeKind::Contains || !filter.allows(e) {
-            continue;
-        }
-        let (Some(a), Some(b)) = (unit_of(e.from), unit_of(e.to)) else {
-            continue;
-        };
-        if a == b {
-            continue;
-        }
-        *deps
-            .entry((a, b))
-            .or_default()
-            .entry(e.kind.as_str())
-            .or_default() += e.count;
-    }
+    let node_units: Vec<Option<String>> = (0..g.nodes.len()).map(unit_name).collect();
     // Ids follow the sorted unit names, so everything below is deterministic.
-    let names: Vec<&String> = deps
-        .keys()
-        .flat_map(|(a, b)| [a, b])
+    let names: Vec<&String> = node_units
+        .iter()
+        .flatten()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
     let ids: HashMap<&String, usize> = names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
-    for (a, b) in deps.keys() {
-        adj[ids[a]].push(ids[b]);
+    let unit: Vec<Option<usize>> = node_units
+        .iter()
+        .map(|u| u.as_ref().map(|u| ids[u]))
+        .collect();
+
+    // Dependencies between units, with the edge kinds behind each.
+    let mut deps: BTreeMap<(usize, usize), BTreeSet<&str>> = BTreeMap::new();
+    for e in &g.edges {
+        if e.kind == EdgeKind::Contains || !filter.allows(e) {
+            continue;
+        }
+        if let (Some(a), Some(b)) = (unit[e.from], unit[e.to])
+            && a != b
+        {
+            deps.entry((a, b)).or_default().insert(e.kind.as_str());
+        }
     }
-    for list in &mut adj {
-        list.sort_unstable();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
+    for &(a, b) in deps.keys() {
+        adj[a].push(b); // sorted: deps iterates in key order
     }
 
     let mut components: Vec<Vec<usize>> =
         tarjan(&adj).into_iter().filter(|c| c.len() > 1).collect();
     for c in &mut components {
-        c.sort_unstable_by_key(|&u| names[u]);
+        c.sort_unstable();
     }
-    components.sort_by(|a, b| b.len().cmp(&a.len()).then(names[a[0]].cmp(names[b[0]])));
+    components.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
 
     let total = components.len();
     let mut out = Vec::new();
     for comp in components.iter().take(limit) {
-        let cycles = shortest_cycles(&adj, comp, max_length);
+        let starts = start_nodes(&adj, comp);
+        let cycles = shortest_cycles(&adj, comp, &starts, max_length);
         let rendered: Vec<Value> = cycles
             .iter()
             .take(CYCLES_PER_COMPONENT)
             .map(|cycle| {
                 let mut text = names[cycle[0]].clone();
-                for w in cycle
-                    .windows(2)
-                    .chain(std::iter::once(&[cycle[cycle.len() - 1], cycle[0]][..]))
-                {
-                    let kinds = &deps[&(names[w[0]].clone(), names[w[1]].clone())];
-                    let kinds: Vec<&str> = kinds.keys().copied().collect();
-                    text.push_str(&format!(" --{}--> {}", kinds.join(","), names[w[1]]));
+                for (i, &from) in cycle.iter().enumerate() {
+                    let to = cycle[(i + 1) % cycle.len()];
+                    let kinds: Vec<&str> = deps[&(from, to)].iter().copied().collect();
+                    text.push_str(&format!(" --{}--> {}", kinds.join(","), names[to]));
                 }
                 json!(text)
             })
@@ -102,12 +101,19 @@ pub fn find_cycles(
         let mut v = json!({
             "size": comp.len(),
             "members": comp.iter().take(MEMBERS_SHOWN).map(|&u| names[u]).collect::<Vec<_>>(),
-            "shortest_cycles": rendered,
+            "cycles": rendered,
         });
         if cycles.is_empty() {
             v["note"] = json!(format!("no cycle within max_length {max_length}"));
         } else if cycles.len() > CYCLES_PER_COMPONENT {
-            v["more_cycles"] = json!(cycles.len() - CYCLES_PER_COMPONENT);
+            v["more_cycles_found"] = json!(cycles.len() - CYCLES_PER_COMPONENT);
+        }
+        if starts.len() < comp.len() {
+            v["searched_from"] = json!(format!(
+                "{} of {} members (the most connected)",
+                starts.len(),
+                comp.len()
+            ));
         }
         out.push(v);
     }
@@ -121,6 +127,27 @@ pub fn find_cycles(
         "truncated": total > limit,
         "components": out,
     })
+}
+
+/// Members to search cycles from: all of a small component, else the `MAX_STARTS` with
+/// the most links inside it (ties by id).
+fn start_nodes(adj: &[Vec<usize>], comp: &[usize]) -> Vec<usize> {
+    if comp.len() <= MAX_STARTS {
+        return comp.to_vec();
+    }
+    let inside: BTreeSet<usize> = comp.iter().copied().collect();
+    let mut degree: HashMap<usize, usize> = HashMap::new();
+    for &u in comp {
+        for &w in adj[u].iter().filter(|w| inside.contains(w)) {
+            *degree.entry(u).or_default() += 1;
+            *degree.entry(w).or_default() += 1;
+        }
+    }
+    let mut ranked = comp.to_vec();
+    ranked.sort_by(|a, b| degree.get(b).cmp(&degree.get(a)).then(a.cmp(b)));
+    ranked.truncate(MAX_STARTS);
+    ranked.sort_unstable();
+    ranked
 }
 
 /// Strongly connected components (iterative Tarjan).
@@ -179,12 +206,18 @@ fn tarjan(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     out
 }
 
-/// For each member, the shortest cycle through it inside the component (BFS), at most
-/// `max_length` long; deduplicated, rotated to start at the smallest unit, shortest first.
-fn shortest_cycles(adj: &[Vec<usize>], comp: &[usize], max_length: usize) -> Vec<Vec<usize>> {
+/// For each start, one shortest cycle through it inside the component (BFS), at most
+/// `max_length` long; deduplicated, rotated to start at the smallest unit, shortest
+/// first. Not every cycle: other cycles of the same length may exist.
+fn shortest_cycles(
+    adj: &[Vec<usize>],
+    comp: &[usize],
+    starts: &[usize],
+    max_length: usize,
+) -> Vec<Vec<usize>> {
     let inside: BTreeSet<usize> = comp.iter().copied().collect();
     let mut found: BTreeSet<(usize, Vec<usize>)> = BTreeSet::new();
-    for &start in comp {
+    for &start in starts {
         let mut prev: HashMap<usize, usize> = HashMap::new();
         let mut queue = VecDeque::from([(start, 1usize)]);
         let mut cycle = None;
@@ -249,10 +282,25 @@ mod tests {
         let adj = vec![vec![1, 2], vec![0], vec![3], vec![0]];
         let comp = vec![0, 1, 2, 3];
         assert_eq!(
-            shortest_cycles(&adj, &comp, 6),
+            shortest_cycles(&adj, &comp, &comp, 6),
             vec![vec![0, 1], vec![0, 2, 3]]
         );
-        assert_eq!(shortest_cycles(&adj, &comp, 2), vec![vec![0, 1]]);
+        assert_eq!(shortest_cycles(&adj, &comp, &comp, 2), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn large_components_search_from_the_most_connected() {
+        // A ring of 500 plus a hub (0) linked both ways with every member.
+        let n = 500;
+        let mut adj: Vec<Vec<usize>> = (0..n).map(|i| vec![(i + 1) % n]).collect();
+        for i in 1..n {
+            adj[0].push(i);
+            adj[i].push(0);
+        }
+        let comp: Vec<usize> = (0..n).collect();
+        let starts = start_nodes(&adj, &comp);
+        assert_eq!(starts.len(), MAX_STARTS);
+        assert_eq!(starts[0], 0, "the hub is searched");
     }
 
     #[test]

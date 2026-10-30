@@ -1046,12 +1046,12 @@ fn find_cycles_between_files_and_modules() {
     let comps = v["components"].as_array().unwrap();
     assert_eq!(comps[0]["size"], 3, "largest first: {v:#}");
     assert_eq!(
-        comps[0]["shortest_cycles"],
+        comps[0]["cycles"],
         json!(["core/z.ts --imports--> lib/x.ts --imports--> lib/y.ts --imports--> core/z.ts"]),
         "{v:#}"
     );
     assert_eq!(
-        comps[1]["shortest_cycles"],
+        comps[1]["cycles"],
         json!(["app/a.ts --imports--> app/b.ts --imports--> app/a.ts"]),
         "{v:#}"
     );
@@ -1076,13 +1076,21 @@ fn find_cycles_between_files_and_modules() {
     );
     let v = cycles(json!({ "level": "module", "depth": 1 }));
     assert_eq!(
-        v["components"][0]["shortest_cycles"],
+        v["components"][0]["cycles"],
         json!(["core --imports--> lib --imports--> core"]),
         "{v:#}"
     );
 
     let (ok, text) = tool_text_in(&repo.0, "find_cycles", json!({ "level": "dir" }));
     assert!(!ok && text.contains("file or module"), "{text}");
+    for (args, expected) in [
+        (json!({ "edge_kinds": ["contains"] }), "contains is not one"),
+        (json!({ "max_length": 1 }), "between 2 and 20"),
+        (json!({ "limit": 0 }), "at least 1"),
+    ] {
+        let (ok, text) = tool_text_in(&repo.0, "find_cycles", args);
+        assert!(!ok && text.contains(expected), "{text}");
+    }
 }
 
 fn comps_note(v: &Value) -> String {

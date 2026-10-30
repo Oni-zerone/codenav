@@ -677,7 +677,6 @@ fn overridden_members(g: &Graph, m: usize, min: Confidence) -> Vec<(usize, Confi
     found
 }
 
-/// Component-level view: edges aggregated between directories truncated at `depth`.
 /// The component of `file` at directory `depth` (`.` for top-level files), as used by
 /// module_graph and find_cycles.
 pub fn component(file: &str, depth: usize) -> String {
@@ -688,6 +687,7 @@ pub fn component(file: &str, depth: usize) -> String {
     parts[..(parts.len() - 1).min(depth)].join("/")
 }
 
+/// Component-level view: edges aggregated between directories truncated at `depth`.
 pub fn module_graph(g: &Graph, depth: usize, min_weight: u32) -> Value {
     let component = |file: &str| component(file, depth);
     let mut sizes: BTreeMap<String, (u32, u32)> = BTreeMap::new();
