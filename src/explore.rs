@@ -507,6 +507,14 @@ fn render(
             if let Some(l) = edge.confidence.label() {
                 line.push_str(&format!(" ({l})"));
             }
+            // Sites are lines of the edge's source: say which file when that is not `n`'s.
+            if let Some(sites) = edge.sites_text() {
+                if forward {
+                    line.push_str(&format!(" {sites}"));
+                } else {
+                    line.push_str(&format!(" {sites} in {}", g.nodes[edge.from].file));
+                }
+            }
             edges.push((r, line));
         }
         edges.sort();

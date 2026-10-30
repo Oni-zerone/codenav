@@ -780,7 +780,11 @@ fn js_resolution_respects_module_scope() {
         ],
     );
     let a = symbol_in(&repo, "lib/a.ts::a");
-    assert_eq!(a["outgoing"]["calls"], json!(["lib/a.ts::helper"]), "{a:#}");
+    assert_eq!(
+        a["outgoing"]["calls"],
+        json!([{ "id": "lib/a.ts::helper", "call_sites": [2] }]),
+        "{a:#}"
+    );
     let c = symbol_in(&repo, "app/c.ts::c");
     assert!(
         c["outgoing"].get("calls").is_none(),
@@ -1409,6 +1413,107 @@ fn insights_find_lone_links_and_bridges() {
     );
 }
 
+#[test]
+fn call_sites_record_every_line() {
+    let repo = TempRepo::new(
+        "callsites",
+        &[(
+            "m.py",
+            "def g():\n    pass\n\ndef f():\n    g()\n    x = 1\n    g()\n\ndef h():\n    g(); g()\n".into(),
+        )],
+    );
+    let f = symbol_in(&repo, "m.py::f");
+    assert_eq!(
+        f["outgoing"]["calls"],
+        json!([{ "id": "m.py::g", "count": 2, "call_sites": [5, 7] }]),
+        "{f:#}"
+    );
+    // Two calls on one line: counted twice, one site.
+    let h = symbol_in(&repo, "m.py::h");
+    assert_eq!(
+        h["outgoing"]["calls"],
+        json!([{ "id": "m.py::g", "count": 2, "call_sites": [10] }]),
+        "{h:#}"
+    );
+    // The callee sees where it is called from.
+    let g = symbol_in(&repo, "m.py::g");
+    assert!(
+        g["incoming"]["called_by"]
+            .to_string()
+            .contains("\"call_sites\":[5,7]"),
+        "{g:#}"
+    );
+
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_neighbors",
+        json!({ "id": "m.py::f", "direction": "out", "format": "json" }),
+    );
+    assert!(ok && text.contains("\"call_sites\":[5,7]"), "{text}");
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "", "seeds": ["m.py::f"] }),
+    );
+    assert!(ok && text.contains("calls → m.py::g (×2) L5,7"), "{text}");
+}
+
+#[test]
+fn call_sites_are_capped_and_stay_in_their_file() {
+    let mut many = String::from("def g():\n    pass\n\ndef f():\n");
+    for _ in 0..15 {
+        many.push_str("    g()\n");
+    }
+    let repo = TempRepo::new(
+        "callsites2",
+        &[
+            ("m.py", many),
+            ("Sources/A.swift", "class Foo {}\n".into()),
+            (
+                "Sources/B.swift",
+                "protocol P {}\nextension Foo: P {}\n".into(),
+            ),
+        ],
+    );
+    let f = symbol_in(&repo, "m.py::f");
+    let call = &f["outgoing"]["calls"][0];
+    assert_eq!(call["count"], 15, "{f:#}");
+    assert_eq!(call["call_sites"].as_array().unwrap().len(), 10, "{f:#}");
+    assert_eq!(call["more_sites"], 5, "{f:#}");
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "", "seeds": ["m.py::f"] }),
+    );
+    assert!(
+        ok && text.contains("L5,6,7,8,9,10,11,12,13,14,…(+5)"),
+        "{text}"
+    );
+
+    // The conformance is declared in B.swift but belongs to Foo (A.swift): no line of
+    // B.swift is reported as a line of A.swift.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_neighbors",
+        json!({ "id": "Sources/A.swift::Foo", "direction": "out", "edge_kinds": ["inherits"], "format": "json" }),
+    );
+    assert!(ok, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["edges"][0]["to"], "Sources/B.swift::P", "{v:#}");
+    assert!(v["edges"][0].get("lines").is_none(), "{v:#}");
+
+    // Incoming edges in explore name the file their lines belong to.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "", "seeds": ["m.py::g"] }),
+    );
+    assert!(
+        ok && text.contains("called_by ← m.py::f (×15) L5,") && text.contains(" in m.py"),
+        "{text}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
@@ -1429,7 +1534,7 @@ fn merged_edges_keep_the_best_confidence() {
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         v["outgoing"]["calls"],
-        json!([{ "id": "a.py::A::helper", "count": 2 }]),
+        json!([{ "id": "a.py::A::helper", "count": 2, "call_sites": [6, 7] }]),
         "{v:#}"
     );
 }
@@ -1745,7 +1850,7 @@ fn text_and_json_formats() {
         "{text}"
     );
     assert!(
-        text.contains("  calls:\n    - py/app/models.py::User\n"),
+        text.contains("  calls:\n    - id: py/app/models.py::User\n      call_sites: [7]\n"),
         "{text}"
     );
     assert!(text.contains("code: |\n      6 |     def create"), "{text}");

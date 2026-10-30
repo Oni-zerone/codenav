@@ -368,6 +368,7 @@ mod tests {
                 count: 1,
                 confidence: Confidence::Exact,
                 line: 1,
+                lines: Vec::new(),
             });
         }
         g.build_indexes();

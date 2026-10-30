@@ -190,19 +190,22 @@ pub fn symbol_details(g: &Graph, root: &Path, i: usize, include_code: bool) -> V
     v
 }
 
+/// One end of an edge: the bare id, or an object when there is more to say (calls always
+/// carry their call sites, other edges their lines when repeated or not exact).
 fn edge_ref(g: &Graph, other: usize, e: &crate::graph::Edge) -> Value {
-    let mut v = json!(g.nodes[other].id);
-    if e.count > 1 || !e.confidence.is_exact() {
-        let mut o = json!({ "id": g.nodes[other].id });
-        if e.count > 1 {
-            o["count"] = json!(e.count);
-        }
-        if let Some(l) = e.confidence.label() {
-            o["confidence"] = json!(l);
-        }
-        v = o;
+    let detailed = e.kind == EdgeKind::Calls || e.count > 1 || !e.confidence.is_exact();
+    if !detailed {
+        return json!(g.nodes[other].id);
     }
-    v
+    let mut o = json!({ "id": g.nodes[other].id });
+    if e.count > 1 {
+        o["count"] = json!(e.count);
+    }
+    if let Some(l) = e.confidence.label() {
+        o["confidence"] = json!(l);
+    }
+    e.add_sites(&mut o);
+    o
 }
 
 fn cap_lists(map: BTreeMap<&str, Vec<Value>>, max: usize) -> Value {
@@ -335,6 +338,7 @@ pub fn neighbors(
             if let Some(l) = edge.confidence.label() {
                 ev["confidence"] = json!(l);
             }
+            edge.add_sites(&mut ev);
             edges.push(ev);
             if seen.insert(next) {
                 if nodes.len() >= limit {
@@ -903,8 +907,8 @@ pub fn audit_edges(
             .entry(g.nodes[e.from].file.as_str())
             .or_default()
             .push(json!(format!(
-                "L{} {} {} → {}{count}",
-                e.line,
+                "{} {} {} → {}{count}",
+                e.sites_text().unwrap_or_else(|| format!("L{}", e.line)),
                 g.qualified_name(e.from),
                 e.kind.as_str(),
                 g.nodes[e.to].id
@@ -1095,6 +1099,7 @@ mod tests {
                 count: 1,
                 confidence,
                 line: 1,
+                lines: Vec::new(),
             });
         }
         g.build_indexes();

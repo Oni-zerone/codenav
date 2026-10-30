@@ -21,7 +21,8 @@ const FORMAT_VERSION: u32 = 3;
 /// same sources would give a different graph: older indexes are then stale and rebuilt,
 /// while readers of the format (like the VS Code extension) are unaffected.
 /// 1: JS/TS module scoping, JSX components only, top-level constants.
-pub const ANALYSIS_VERSION: u32 = 1;
+/// 2: `Edge::lines` (every line of a relation, e.g. call sites).
+pub const ANALYSIS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -244,11 +245,50 @@ pub struct Edge {
     pub confidence: Confidence,
     /// First line in the source file where the relation occurs.
     pub line: u32,
+    /// Every line where it occurs, ascending (dependency edges; empty in older indexes
+    /// and for containment).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<u32>,
 }
+
+/// Sites listed per edge in tool output.
+pub const MAX_SITES_SHOWN: usize = 10;
 
 impl Edge {
     pub fn is_ambiguous(&self) -> bool {
         self.confidence == Confidence::Ambiguous
+    }
+
+    /// Adds the sites to a JSON object: `call_sites` for calls, `lines` otherwise, at
+    /// most `MAX_SITES_SHOWN` of them plus `more_sites`.
+    pub fn add_sites(&self, o: &mut serde_json::Value) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let key = if self.kind == EdgeKind::Calls {
+            "call_sites"
+        } else {
+            "lines"
+        };
+        let shown = &self.lines[..self.lines.len().min(MAX_SITES_SHOWN)];
+        o[key] = serde_json::json!(shown);
+        if self.lines.len() > shown.len() {
+            o["more_sites"] = serde_json::json!(self.lines.len() - shown.len());
+        }
+    }
+
+    /// `L12,40` (`L1,2,…(+5)` when long) for the text views; None when unknown.
+    pub fn sites_text(&self) -> Option<String> {
+        use std::fmt::Write;
+        let (first, rest) = self.lines.split_first()?;
+        let mut text = format!("L{first}");
+        for l in rest.iter().take(MAX_SITES_SHOWN - 1) {
+            let _ = write!(text, ",{l}");
+        }
+        if self.lines.len() > MAX_SITES_SHOWN {
+            let _ = write!(text, ",…(+{})", self.lines.len() - MAX_SITES_SHOWN);
+        }
+        Some(text)
     }
 }
 
