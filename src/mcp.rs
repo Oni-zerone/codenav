@@ -100,7 +100,11 @@ impl Server {
                     .get("protocolVersion")
                     .and_then(Value::as_str)
                     .unwrap_or(PROTOCOL_VERSION),
-                "capabilities": { "tools": { "listChanged": false } },
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "listChanged": false, "subscribe": false },
+                    "prompts": { "listChanged": false },
+                },
                 "serverInfo": { "name": "codenav", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": INSTRUCTIONS,
             })),
@@ -120,8 +124,41 @@ impl Server {
                     }),
                 })
             }
-            "resources/list" => Ok(json!({ "resources": [] })),
-            "prompts/list" => Ok(json!({ "prompts": [] })),
+            "resources/list" => Ok(json!({ "resources": resource_list() })),
+            "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
+            "resources/read" => {
+                let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+                match RESOURCES.iter().find(|r| r.uri == uri) {
+                    None => Err((-32002, format!("resource not found: {uri}"))),
+                    Some(r) => {
+                        let mut args = r.args();
+                        args["token_budget"] = json!(RESOURCE_TOKEN_BUDGET);
+                        match self.call_tool(r.tool, &args) {
+                            Ok(text) => Ok(json!({ "contents": [{
+                                "uri": r.uri,
+                                "mimeType": "text/plain",
+                                "text": text,
+                            }] })),
+                            Err(e) => Err((-32603, format!("{e:#}"))),
+                        }
+                    }
+                }
+            }
+            "prompts/list" => Ok(json!({ "prompts": [architecture_review_definition()] })),
+            "prompts/get" => {
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                if name != "architecture-review" {
+                    Err((-32602, format!("unknown prompt: {name}")))
+                } else {
+                    let focus = params
+                        .get("arguments")
+                        .and_then(|a| a.get("focus"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|f| !f.is_empty());
+                    Ok(architecture_review(focus))
+                }
+            }
             _ => Err((-32601, format!("method not found: {method}"))),
         };
         Some(match result {
@@ -454,6 +491,121 @@ fn narrow_hint(tool: &str) -> &'static str {
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
+}
+
+/// A resource: a fixed read-only view produced by one tool.
+struct Resource {
+    uri: &'static str,
+    name: &'static str,
+    description: &'static str,
+    tool: &'static str,
+    args: &'static str,
+}
+
+impl Resource {
+    fn args(&self) -> Value {
+        serde_json::from_str(self.args).unwrap_or_else(|_| json!({}))
+    }
+}
+
+/// Resources are larger than a default tool answer: they are read once, as context.
+const RESOURCE_TOKEN_BUDGET: usize = 8000;
+
+const RESOURCES: &[Resource] = &[
+    Resource {
+        uri: "codenav://overview",
+        name: "Repository overview",
+        description: "Index state, languages, counts, most depended-on symbols and files, external dependencies, largest communities (graph_overview).",
+        tool: "graph_overview",
+        args: r#"{"top": 15}"#,
+    },
+    Resource {
+        uri: "codenav://modules",
+        name: "Module graph",
+        description: "Directories as components and the dependencies between them (module_graph, depth 2).",
+        tool: "module_graph",
+        args: r#"{"depth": 2}"#,
+    },
+    Resource {
+        uri: "codenav://insights",
+        name: "Insights",
+        description: "Surprising connections, bridge nodes between communities and suggested questions (insights).",
+        tool: "insights",
+        args: r#"{"top": 10}"#,
+    },
+    Resource {
+        uri: "codenav://cycles",
+        name: "Import cycles",
+        description: "Import cycles between files (find_cycles).",
+        tool: "find_cycles",
+        args: r#"{}"#,
+    },
+    Resource {
+        uri: "codenav://audit",
+        name: "Resolver audit",
+        description: "Edge counts by confidence and the edges guessed by name, to verify (audit_edges).",
+        tool: "audit_edges",
+        args: r#"{"limit": 100}"#,
+    },
+];
+
+fn resource_list() -> Value {
+    json!(
+        RESOURCES
+            .iter()
+            .map(|r| json!({
+                "uri": r.uri,
+                "name": r.name,
+                "description": r.description,
+                "mimeType": "text/plain",
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn architecture_review_definition() -> Value {
+    json!({
+        "name": "architecture-review",
+        "description": "Review the architecture of this repository (or of one area) with codenav's tools: components, dependencies, cycles, hotspots, risky guesses.",
+        "arguments": [{
+            "name": "focus",
+            "description": "Optional area to concentrate on: a directory, file or symbol.",
+            "required": false,
+        }],
+    })
+}
+
+fn architecture_review(focus: Option<&str>) -> Value {
+    let scope = match focus {
+        Some(f) => format!(
+            "Concentrate on `{f}`: locate it with search_symbols or file_outline, and read the rest \
+             of the repository only as far as it explains `{f}`.\n\n"
+        ),
+        None => String::new(),
+    };
+    let text = format!(
+        "Review the architecture of this repository using the codenav tools.\n\n{scope}\
+         1. Read codenav://overview (or call graph_overview): languages, size, central symbols, \
+         largest communities, and whether the index matches the current commit.\n\
+         2. Call module_graph, then get_community on the largest communities: what the real \
+         components are, and where they differ from the directory layout.\n\
+         3. Call find_cycles (level file, then module) and say which cycles look accidental.\n\
+         4. Call insights: explain the bridge nodes and the surprising connections. Verify every \
+         edge marked ambiguous or inferred with read_code before relying on it.\n\
+         5. For the most central symbols, call impact_analysis and tests_for to judge how risky \
+         and how covered a change there would be.\n\n\
+         Report: the components and their responsibilities, dependency problems (cycles, \
+         unexpected couplings, overloaded hubs), and concrete suggestions, each citing the files \
+         and symbols involved."
+    );
+    let description = match focus {
+        Some(f) => format!("Architecture review of {f}"),
+        None => "Architecture review".to_string(),
+    };
+    json!({
+        "description": description,
+        "messages": [{ "role": "user", "content": { "type": "text", "text": text } }],
+    })
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {

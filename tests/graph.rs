@@ -1774,6 +1774,100 @@ fn text_and_json_formats() {
     );
 }
 
+/// Sends JSON-RPC requests to `codenav serve` on the fixture and returns the responses.
+fn mcp_session(requests: &[Value]) -> Vec<Value> {
+    let mut child = codenav()
+        .arg("serve")
+        .arg(fixture())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for r in requests {
+            writeln!(stdin, "{r}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn mcp_resources_and_prompts() {
+    let lines = mcp_session(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"resources/list"}),
+        json!({"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"codenav://overview"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"codenav://insights"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"codenav://nope"}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"prompts/list"}),
+        json!({"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{"name":"architecture-review","arguments":{"focus":"py/app"}}}),
+        json!({"jsonrpc":"2.0","id":8,"method":"prompts/get","params":{"name":"other"}}),
+    ]);
+    let caps = &lines[0]["result"]["capabilities"];
+    assert!(
+        caps["resources"].is_object() && caps["prompts"].is_object(),
+        "{caps}"
+    );
+
+    let resources = lines[1]["result"]["resources"].as_array().unwrap();
+    let uris: Vec<&str> = resources
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    for uri in [
+        "codenav://overview",
+        "codenav://modules",
+        "codenav://insights",
+        "codenav://cycles",
+        "codenav://audit",
+    ] {
+        assert!(uris.contains(&uri), "{uris:?}");
+    }
+
+    // Every listed resource can be read; the overview carries the index state.
+    let overview = &lines[2]["result"]["contents"][0];
+    assert_eq!(overview["uri"], "codenav://overview");
+    assert!(
+        overview["text"].as_str().unwrap().contains("index:"),
+        "{overview}"
+    );
+    let insights = lines[3]["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(insights.contains("suggested_questions"), "{insights}");
+    assert_eq!(lines[4]["error"]["code"], -32002, "{}", lines[4]);
+
+    let prompts = lines[5]["result"]["prompts"].as_array().unwrap();
+    assert_eq!(prompts[0]["name"], "architecture-review");
+    let text = lines[6]["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.contains("`py/app`") && text.contains("find_cycles"),
+        "{text}"
+    );
+    assert_eq!(lines[7]["error"]["code"], -32602, "{}", lines[7]);
+
+    // The other resources read without errors too.
+    let reads: Vec<Value> = uris
+        .iter()
+        .enumerate()
+        .map(|(i, uri)| json!({"jsonrpc":"2.0","id":i,"method":"resources/read","params":{"uri":uri}}))
+        .collect();
+    for r in mcp_session(&reads) {
+        assert!(
+            r.get("error").is_none() && r["result"]["contents"][0]["text"].is_string(),
+            "{r}"
+        );
+    }
+}
+
 #[test]
 fn mcp_stdio_handshake() {
     let mut child = codenav()
