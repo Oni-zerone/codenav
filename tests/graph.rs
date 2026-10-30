@@ -1776,43 +1776,41 @@ fn text_and_json_formats() {
 
 #[test]
 fn tool_takes_the_path_positionally_or_as_a_flag() {
-    let run = |args: &[&std::ffi::OsStr]| -> (bool, String) {
+    let run = |args: &[&std::ffi::OsStr]| -> (Option<i32>, String) {
         let out = codenav().arg("tool").args(args).output().unwrap();
+        let text = if out.status.success() {
+            &out.stdout
+        } else {
+            &out.stderr
+        };
         (
-            out.status.success(),
-            String::from_utf8_lossy(if out.status.success() {
-                &out.stdout
-            } else {
-                &out.stderr
-            })
-            .into_owned(),
+            out.status.code(),
+            String::from_utf8_lossy(text).into_owned(),
         )
     };
     let f = fixture().as_os_str();
-    let positional = run(&["graph_overview".as_ref(), "{}".as_ref(), f]);
-    let flag = run(&[
-        "graph_overview".as_ref(),
-        "{}".as_ref(),
-        "--path".as_ref(),
-        f,
-    ]);
-    let flag_first = run(&["graph_overview".as_ref(), "--path".as_ref(), f]);
-    assert!(positional.0, "{}", positional.1);
-    assert_eq!(positional, flag);
-    assert_eq!(positional, flag_first);
-    // Both at once is ambiguous.
-    let both = run(&[
-        "graph_overview".as_ref(),
-        "{}".as_ref(),
-        f,
-        "--path".as_ref(),
-        f,
-    ]);
-    assert!(
-        !both.0 && both.1.contains("cannot be used with"),
-        "{}",
-        both.1
-    );
+    let name: &std::ffi::OsStr = "graph_overview".as_ref();
+    let empty: &std::ffi::OsStr = "{}".as_ref();
+    let flag: &std::ffi::OsStr = "--path".as_ref();
+    let positional = run(&[name, empty, f]);
+    assert_eq!(positional.0, Some(0), "{}", positional.1);
+    assert_eq!(run(&[name, empty, flag, f]), positional);
+    assert_eq!(run(&[name, flag, f]), positional);
+    // Without JSON, a single extra argument is the path, as for `index PATH`.
+    assert_eq!(run(&[name, f]), positional);
+
+    // Both at once is a usage error.
+    assert_eq!(run(&[name, empty, f, flag, f]).0, Some(2));
+
+    // Bad arguments fail before indexing anything.
+    let dir = TempRepo::new("toolargs", &[("a.py", "def f():\n    pass\n".into())]);
+    let d = dir.0.as_os_str();
+    for bad in ["[1]", "{oops"] {
+        let (code, text) = run(&[name, bad.as_ref(), d]);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(text.contains("must be a JSON object"), "{text}");
+    }
+    assert!(!dir.0.join(".codenav").exists(), "nothing was indexed");
 }
 
 /// Sends JSON-RPC requests to `codenav serve` on the fixture and returns the responses.

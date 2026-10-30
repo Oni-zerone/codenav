@@ -55,9 +55,9 @@ enum Command {
     Tool {
         /// Tool name, e.g. graph_overview, search_symbols, get_symbol, impact_analysis.
         name: String,
-        /// Tool arguments as a JSON object.
-        #[arg(default_value = "{}")]
-        args: String,
+        /// Tool arguments as a JSON object (default `{}`). A single argument that does not
+        /// start with `{` is taken as PATH: `codenav tool graph_overview ../repo`.
+        args: Option<String>,
         /// Repository (default: current directory), as for `index` and `serve`.
         #[arg(conflicts_with = "path_flag")]
         path: Option<PathBuf>,
@@ -140,11 +140,14 @@ fn main() -> Result<()> {
             path,
             path_flag,
         } => {
-            let path = path.or(path_flag).unwrap_or_else(|| PathBuf::from("."));
+            let (args, path) = tool_args_and_path(args, path.or(path_flag));
+            // Validate before indexing: a wrong argument must not index anything.
+            let args: serde_json::Value = serde_json::from_str(&args)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .ok_or_else(|| anyhow!("arguments must be a JSON object, got `{args}`"))?;
             let root = canonical_root(&path)?;
             let (graph, opts) = load_or_index(&root, false, None)?;
-            let args: serde_json::Value =
-                serde_json::from_str(&args).context("arguments must be a JSON object")?;
             let mut server = mcp::Server::new(root, graph, false, opts);
             let result = server.call_tool(&name, &args)?;
             println!("{result}");
@@ -161,6 +164,18 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `codenav tool NAME [ARGS] [PATH]`: with one extra argument, JSON (starting with `{`)
+/// is ARGS and anything else is PATH, so `tool NAME PATH` works like `index PATH`.
+fn tool_args_and_path(args: Option<String>, path: Option<PathBuf>) -> (String, PathBuf) {
+    match (args, path) {
+        (Some(a), None) if !a.trim_start().starts_with('{') => ("{}".into(), PathBuf::from(a)),
+        (a, p) => (
+            a.unwrap_or_else(|| "{}".into()),
+            p.unwrap_or_else(|| PathBuf::from(".")),
+        ),
+    }
 }
 
 fn canonical_root(path: &Path) -> Result<PathBuf> {

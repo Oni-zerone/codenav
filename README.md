@@ -89,6 +89,7 @@ codenav tool explore '{"question":"come UserService crea gli utenti"}'
 codenav tool search_symbols '{"query":"UserService"}'
 codenav tool find_paths '{"from":"Server::run","to":"extract","directed":true}'
 codenav tool module_graph '{"depth":2}'
+codenav tool graph_overview ../altro-repo   # path posizionale, come per index e serve
 codenav tool get_community '{"id":"UserService"}'
 ```
 
