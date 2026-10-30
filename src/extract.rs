@@ -431,12 +431,22 @@ fn signature_of(node: Node, source: &[u8]) -> String {
 /// Collects comments directly above a definition (skipping attributes/decorators),
 /// or the docstring for Python definitions.
 fn doc_of(node: Node, source: &[u8]) -> Option<String> {
+    // Comments sit before the whole statement: `/** doc */ export const f = () => {}`.
+    let mut anchor = node;
+    while let Some(p) = anchor.parent().filter(|p| {
+        matches!(
+            p.kind(),
+            "export_statement" | "lexical_declaration" | "variable_declaration"
+        )
+    }) {
+        anchor = p;
+    }
     let mut lines = Vec::new();
-    let mut prev = node.prev_sibling();
+    let mut prev = anchor.prev_sibling();
     while let Some(p) = prev {
         let kind = p.kind();
         if kind.contains("comment") {
-            if p.end_position().row + 1 < node.start_position().row && lines.is_empty() {
+            if p.end_position().row + 1 < anchor.start_position().row && lines.is_empty() {
                 break;
             }
             let t = p.utf8_text(source).unwrap_or("");
@@ -465,6 +475,23 @@ fn doc_of(node: Node, source: &[u8]) -> Option<String> {
                 .trim_matches(|c| c == '"' || c == '\'')
                 .trim()
                 .to_string();
+        }
+    }
+    if doc.is_empty() {
+        // Comments opening the body (`fn f() { // does X`), for code documented inside.
+        let body = node.child_by_field_name("body").or_else(|| {
+            node.child_by_field_name("value")
+                .and_then(|v| v.child_by_field_name("body"))
+        });
+        if let Some(body) = body {
+            let mut cursor = body.walk();
+            let leading: Vec<String> = body
+                .named_children(&mut cursor)
+                .take_while(|c| c.kind().contains("comment"))
+                .take(6)
+                .map(|c| clean_comment(c.utf8_text(source).unwrap_or("")))
+                .collect();
+            doc = leading.join(" ").trim().to_string();
         }
     }
     (!doc.is_empty()).then(|| truncate(doc, 300))
