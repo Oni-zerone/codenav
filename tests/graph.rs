@@ -1194,6 +1194,76 @@ fn overview_reports_the_indexed_commit() {
     assert!(index.get("commit").is_none(), "{index}");
 }
 
+#[test]
+fn tests_for_finds_direct_and_indirect_tests() {
+    let repo = TempRepo::new(
+        "testsfor",
+        &[
+            ("src/a.ts", "export function a() { return 1; }\n".into()),
+            ("src/b.ts", "import { a } from './a';\nexport function b() { return a(); }\n".into()),
+            (
+                "src/a.test.ts",
+                "import { a } from './a';\ntest('a', () => { a(); });\n".into(),
+            ),
+            (
+                "src/b.test.ts",
+                "import { b } from './b';\ntest('b', () => { b(); });\n".into(),
+            ),
+            // Named like the target but does not use it: not a test of it.
+            ("src/c.test.ts", "export function unrelated() {}\n".into()),
+            ("src/c.ts", "export function c() {}\n".into()),
+            // Python and Rust conventions.
+            ("py/models.py", "def save():\n    pass\n".into()),
+            (
+                "py/test_models.py",
+                "from models import save\n\ndef test_save():\n    save()\n".into(),
+            ),
+            (
+                "rs/lib.rs",
+                "pub fn add() -> i32 { 1 }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn adds() { let x = add(); }\n}\n"
+                    .into(),
+            ),
+        ],
+    );
+    let tests_for = |id: &str| -> Value {
+        let (ok, text) = tool_text_in(&repo.0, "tests_for", json!({ "id": id, "format": "json" }));
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+
+    let v = tests_for("src/a.ts");
+    assert_eq!(v["test_files"], 2, "{v:#}");
+    assert_eq!(v["direct"][0]["file"], "src/a.test.ts", "{v:#}");
+    assert_eq!(v["indirect"][0]["file"], "src/b.test.ts", "{v:#}");
+    assert_eq!(v["indirect"][0]["distance"], 2, "{v:#}");
+    let path = v["indirect"][0]["path"].as_str().unwrap();
+    assert!(
+        path.starts_with("src/b.test.ts") && path.ends_with("src/a.ts"),
+        "{path}"
+    );
+    assert!(!v.to_string().contains("c.test.ts"), "{v:#}");
+
+    // A symbol target, and nothing for code no test reaches.
+    let v = tests_for("src/b.ts::b");
+    assert_eq!(v["direct"][0]["file"], "src/b.test.ts", "{v:#}");
+    assert_eq!(tests_for("src/c.ts")["test_files"], 0);
+
+    let v = tests_for("py/models.py::save");
+    assert_eq!(v["direct"][0]["file"], "py/test_models.py", "{v:#}");
+    assert_eq!(v["direct"][0]["symbols"], json!(["test_save"]), "{v:#}");
+
+    let v = tests_for("rs/lib.rs::add");
+    assert_eq!(v["direct"][0]["symbols"], json!(["tests::adds"]), "{v:#}");
+    let v = tests_for("rs/lib.rs");
+    assert!(
+        v["direct"][0]["path"]
+            .as_str()
+            .unwrap()
+            .contains("inside the target"),
+        "{v:#}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
@@ -1457,6 +1527,10 @@ fn every_structured_tool_respects_token_budget() {
         (
             "audit_edges",
             json!({ "confidence": "exact", "limit": 500 }),
+        ),
+        (
+            "tests_for",
+            json!({ "id": "src/graph.rs::Graph", "depth": 8 }),
         ),
         (
             "find_cycles",

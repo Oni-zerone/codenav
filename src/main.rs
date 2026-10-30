@@ -8,6 +8,7 @@ mod lang;
 mod mcp;
 mod output;
 mod query;
+mod tests_for;
 mod vcs;
 
 use std::path::{Path, PathBuf};

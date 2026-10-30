@@ -14,6 +14,7 @@ use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::output;
 use crate::query::{self, Direction, EdgeFilter};
+use crate::tests_for;
 use crate::vcs;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -329,6 +330,16 @@ impl Server {
                     min_confidence(a)?,
                 ))
             }
+            "tests_for" => {
+                let i = query::resolve(g, &string(a, "id")?)?;
+                Ok(tests_for::tests_for(
+                    g,
+                    i,
+                    uint(a, "depth", 4)?.clamp(1, 8) as u32,
+                    uint(a, "limit", 50)?.max(1),
+                    min_confidence(a)?,
+                ))
+            }
             "find_cycles" => {
                 let level = match opt_str(a, "level")?.unwrap_or("file") {
                     "file" => cycles::Level::File,
@@ -418,6 +429,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "get_community" => "lower limit",
         "audit_edges" => "narrow with path or edge_kinds, or lower limit",
         "find_cycles" => "lower limit or max_length",
+        "tests_for" => "lower depth or limit, or raise min_confidence",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -524,7 +536,7 @@ fn tool_definitions() -> Value {
         props.entry("token_budget").or_insert(budget.clone());
         if matches!(
             name.as_str(),
-            "get_neighbors" | "find_paths" | "impact_analysis" | "explore"
+            "get_neighbors" | "find_paths" | "impact_analysis" | "explore" | "tests_for"
         ) {
             props.insert("min_confidence".into(), min_confidence.clone());
         }
@@ -626,6 +638,15 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "tests_for",
+            "description": "Tests to run after changing a symbol or file: test files (by path convention: *.test.*, *.spec.*, __tests__/, tests/, test_*.py, *_test.go, *Tests.swift, Rust `mod tests`) that depend on it, split into direct (the test calls, references or imports it) and indirect (through other code, with distance and the shortest path), closest first. No matching by name similarity.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "Symbol or file (id, unique name or path)." },
+                "depth": { "type": "integer", "description": "Max dependency hops from a test to the target (1-8, default 4)." },
+                "limit": { "type": "integer", "description": "Test files listed (default 50)." }
+            }, "required": ["id"] }
         },
         {
             "name": "find_cycles",
