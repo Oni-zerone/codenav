@@ -81,6 +81,12 @@ L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, qui
 nel versionamento). `serve` riusa l'indice se è aggiornato e, mentre gira, re-indicizza da solo
 quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`).
 
+## Estensione VS Code
+
+In [`vscode/`](vscode/README.md) c'è un'estensione che visualizza `.codenav/graph.json` dentro
+VS Code: vista per moduli, per file e focus su un simbolo, con apertura del sorgente al clic e
+aggiornamento automatico quando l'indice cambia.
+
 ## Tool MCP
 
 | Tool | A cosa serve |
