@@ -1514,6 +1514,80 @@ fn call_sites_are_capped_and_stay_in_their_file() {
     );
 }
 
+#[test]
+fn search_says_how_results_match() {
+    let repo = TempRepo::new(
+        "searchmatch",
+        &[(
+            "m.py",
+            "def validate(x):\n    \"\"\"Checks x against planContentSchema.\"\"\"\n    pass\n\n\
+             def plan():\n    pass\n\ndef planner():\n    pass\n"
+                .into(),
+        )],
+    );
+    let search = |q: &str| -> Value {
+        let (ok, text) = tool_text_in(
+            &repo.0,
+            "search_symbols",
+            json!({ "query": q, "format": "json" }),
+        );
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+    // Absent name, mentioned in a doc only.
+    let v = search("planContentSchema");
+    assert_eq!(
+        v["note"], "no symbol named \"planContentSchema\"; showing doc/text matches",
+        "{v:#}"
+    );
+    assert_eq!(v["results"][0]["id"], "m.py::validate");
+    assert_eq!(v["results"][0]["match"], "doc");
+
+    let v = search("plan");
+    assert!(v.get("note").is_none(), "{v:#}");
+    assert_eq!(v["results"][0]["match"], "exact");
+    assert_eq!(v["results"][1]["match"], "prefix");
+
+    let v = search("plann");
+    assert_eq!(
+        v["note"], "no symbol named \"plann\"; showing partial name matches",
+        "{v:#}"
+    );
+    let v = search("lann");
+    assert_eq!(v["results"][0]["match"], "fragment", "{v:#}");
+
+    // Qualified ids and paths are exact when they name a node.
+    let v = search("m.py::plan");
+    assert!(v.get("note").is_none(), "{v:#}");
+    assert_eq!(v["results"][0]["id"], "m.py::plan");
+    assert_eq!(v["results"][0]["match"], "exact");
+    assert_eq!(search("m.py")["results"][0]["match"], "exact");
+    // A match only through the file path is labelled as such.
+    let v = search("m");
+    assert!(
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["match"] == "id"),
+        "{v:#}"
+    );
+    // The symbol exists, but the filters leave it out.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "search_symbols",
+        json!({ "query": "plan", "kinds": ["class"], "format": "json" }),
+    );
+    assert!(
+        ok && text.contains("matches the kinds/path filters"),
+        "{text}"
+    );
+    let v = search("nothing_like_this");
+    assert!(v["note"].as_str().unwrap().ends_with("no matches"), "{v:#}");
+    // Several words are not a name: no note.
+    assert!(search("m.py plan").get("note").is_none());
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
