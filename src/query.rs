@@ -85,6 +85,30 @@ pub fn resolve(g: &Graph, query: &str) -> Result<usize> {
     }
 }
 
+/// How a search result matched the query, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Match {
+    /// The name is the query.
+    Exact,
+    /// The name starts with it.
+    Prefix,
+    /// Part of the name, or of the qualified id (`Graph::load`, a path).
+    Fragment,
+    /// Only the doc comment mentions it.
+    Doc,
+}
+
+impl Match {
+    fn as_str(self) -> &'static str {
+        match self {
+            Match::Exact => "exact",
+            Match::Prefix => "prefix",
+            Match::Fragment => "fragment",
+            Match::Doc => "doc",
+        }
+    }
+}
+
 pub fn search(
     g: &Graph,
     query: &str,
@@ -94,7 +118,7 @@ pub fn search(
 ) -> Value {
     let q = query.trim().to_lowercase();
     let terms: Vec<&str> = q.split_whitespace().collect();
-    let mut scored: Vec<(i64, usize)> = Vec::new();
+    let mut scored: Vec<(i64, usize, Option<Match>)> = Vec::new();
     for (i, n) in g.nodes.iter().enumerate() {
         if !kinds.is_empty() && !kinds.contains(&n.kind) {
             continue;
@@ -106,44 +130,59 @@ pub fn search(
         }
         let name = n.name.to_lowercase();
         let id = n.id.to_lowercase();
-        let mut score = if terms.is_empty() {
-            1
+        let (score, how) = if terms.is_empty() {
+            (1, None)
         } else if name == q {
-            100
+            (100, Some(Match::Exact))
         } else if name.starts_with(&q) {
-            60
+            (60, Some(Match::Prefix))
         } else if name.contains(&q) {
-            40
+            (40, Some(Match::Fragment))
         } else if id.contains(&q) {
-            25
+            (25, Some(Match::Fragment))
         } else if terms.iter().all(|t| id.contains(t)) {
-            15
+            (15, Some(Match::Fragment))
         } else if n.doc.as_ref().is_some_and(|d| {
             let d = d.to_lowercase();
             terms.iter().all(|t| d.contains(t))
         }) {
-            10
+            (10, Some(Match::Doc))
         } else {
-            0
-        };
-        if score == 0 {
             continue;
-        }
+        };
         // Prefer well-connected symbols over files and externals on ties.
-        score = score * 1000 + (g.degree(i).min(999) as i64);
+        let mut score = score * 1000 + (g.degree(i).min(999) as i64);
         if matches!(n.kind, SymKind::File | SymKind::External) {
             score -= 500;
         }
-        scored.push((score, i));
+        scored.push((score, i, how));
     }
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let total = scored.len();
     let results: Vec<Value> = scored
         .iter()
         .take(limit)
-        .map(|&(_, i)| summary(g, i))
+        .map(|&(_, i, how)| {
+            let mut v = summary(g, i);
+            if let Some(how) = how {
+                v["match"] = json!(how.as_str());
+            }
+            v
+        })
         .collect();
-    json!({ "total_matches": total, "results": results })
+    let mut out = json!({ "total_matches": total });
+    // A single name with no symbol of that name: say what the results are instead.
+    let best = scored.iter().filter_map(|s| s.2).min();
+    if terms.len() == 1 && best != Some(Match::Exact) {
+        let shown = match best {
+            None => "no matches".to_string(),
+            Some(Match::Doc) => "showing doc/text matches".to_string(),
+            Some(_) => "showing partial name matches".to_string(),
+        };
+        out["note"] = json!(format!("no symbol named \"{}\"; {shown}", query.trim()));
+    }
+    out["results"] = json!(results);
+    out
 }
 
 pub fn symbol_details(g: &Graph, root: &Path, i: usize, include_code: bool) -> Value {

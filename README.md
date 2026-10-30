@@ -133,7 +133,7 @@ aggiornamento automatico quando l'indice cambia.
 | `tests_for` | Test da eseguire dopo una modifica: file di test (per convenzione di percorso, mai per somiglianza di nome) che dipendono dal simbolo o file, diretti e indiretti con distanza e percorso |
 | `find_cycles` | Cicli di dipendenze tra file o moduli: componenti fortemente connesse e cicli più corti (default: import, archi almeno `inferred`) |
 | `get_community` | Community strutturale di un nodo (o per numero): file, membri più collegati, community da cui dipende e che la usano |
-| `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path |
+| `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path. Ogni risultato dice come corrisponde (`exact`, `prefix`, `fragment`, `doc`), e una nota avvisa quando nessun simbolo ha il nome cercato |
 | `get_symbol` | Dettaglio di un nodo: firma, doc, relazioni in/out per tipo, codice sorgente |
 | `get_neighbors` | BFS attorno a un nodo (es. chi chiama X: `direction=in`, `edge_kinds=[calls]`) |
 | `find_paths` | Catene di relazioni più brevi tra due nodi ("come sono collegati A e B?") |
