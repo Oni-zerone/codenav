@@ -1,0 +1,10 @@
+src/**
+test/**
+out/test/**
+scripts/**
+node_modules/**
+**/*.map
+tsconfig.json
+.vscode/**
+out/harness.html
+.gitignore
