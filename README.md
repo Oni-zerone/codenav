@@ -53,6 +53,7 @@ codenav ast <file>                # albero tree-sitter (per scrivere nuove query
 Esempi:
 
 ```sh
+codenav tool explore '{"question":"come UserService crea gli utenti"}'
 codenav tool search_symbols '{"query":"UserService"}'
 codenav tool find_paths '{"from":"Server::run","to":"extract","directed":true}'
 codenav tool module_graph '{"depth":2}'
@@ -66,6 +67,7 @@ quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`
 
 | Tool | A cosa serve |
 |---|---|
+| `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`) |
 | `graph_overview` | Linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali |
 | `module_graph` | Architettura: dipendenze aggregate tra directory/componenti |
 | `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path |
