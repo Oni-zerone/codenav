@@ -251,33 +251,44 @@ pub struct Edge {
     pub lines: Vec<u32>,
 }
 
+/// Sites listed per edge in tool output.
+pub const MAX_SITES_SHOWN: usize = 10;
+
 impl Edge {
     pub fn is_ambiguous(&self) -> bool {
         self.confidence == Confidence::Ambiguous
     }
 
-    /// Lines of the source file of `from` where the relation occurs.
-    pub fn sites(&self) -> Vec<u32> {
+    /// Adds the sites to a JSON object: `call_sites` for calls, `lines` otherwise, at
+    /// most `MAX_SITES_SHOWN` of them plus `more_sites`.
+    pub fn add_sites(&self, o: &mut serde_json::Value) {
         if self.lines.is_empty() {
-            vec![self.line]
-        } else {
-            self.lines.clone()
+            return;
         }
-    }
-
-    /// Name of `sites` in tool output: `call_sites` for calls, `lines` otherwise.
-    pub fn sites_key(&self) -> &'static str {
-        if self.kind == EdgeKind::Calls {
+        let key = if self.kind == EdgeKind::Calls {
             "call_sites"
         } else {
             "lines"
+        };
+        let shown = &self.lines[..self.lines.len().min(MAX_SITES_SHOWN)];
+        o[key] = serde_json::json!(shown);
+        if self.lines.len() > shown.len() {
+            o["more_sites"] = serde_json::json!(self.lines.len() - shown.len());
         }
     }
 
-    /// `L12,40` for the text views.
-    pub fn sites_text(&self) -> String {
-        let lines: Vec<String> = self.sites().iter().map(u32::to_string).collect();
-        format!("L{}", lines.join(","))
+    /// `L12,40` (`L1,2,…(+5)` when long) for the text views; None when unknown.
+    pub fn sites_text(&self) -> Option<String> {
+        use std::fmt::Write;
+        let (first, rest) = self.lines.split_first()?;
+        let mut text = format!("L{first}");
+        for l in rest.iter().take(MAX_SITES_SHOWN - 1) {
+            let _ = write!(text, ",{l}");
+        }
+        if self.lines.len() > MAX_SITES_SHOWN {
+            let _ = write!(text, ",…(+{})", self.lines.len() - MAX_SITES_SHOWN);
+        }
+        Some(text)
     }
 }
 

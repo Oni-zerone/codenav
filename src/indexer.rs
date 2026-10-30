@@ -627,21 +627,34 @@ impl<'a> Builder<'a> {
                     .get(&i)
                     .copied()
                     .unwrap_or(Confidence::Exact);
-                self.add_edge(p, i, EdgeKind::Contains, line, conf);
+                self.add_edge(p, i, EdgeKind::Contains, line, conf, None);
             }
         }
     }
 
-    fn add_edge(&mut self, from: usize, to: usize, kind: EdgeKind, line: u32, conf: Confidence) {
+    /// Adds (or merges into) an edge. `in_file` is the file the occurrence was found in:
+    /// its line is a site of the edge only when that is `from`'s own file (a reference
+    /// attributed to an owner type declared elsewhere has no line there).
+    fn add_edge(
+        &mut self,
+        from: usize,
+        to: usize,
+        kind: EdgeKind,
+        line: u32,
+        conf: Confidence,
+        in_file: Option<usize>,
+    ) {
+        let site = (kind != EdgeKind::Contains
+            && in_file.is_some_and(|fi| self.facts[fi].path == self.graph.nodes[from].file))
+        .then_some(line);
         if let Some(&e) = self.edge_index.get(&(from, to, kind)) {
             let edge = &mut self.graph.edges[e];
             edge.count += 1;
             edge.line = edge.line.min(line);
-            if kind != EdgeKind::Contains {
-                // Refs arrive in source order per file: keep ascending, distinct lines.
-                if let Err(at) = edge.lines.binary_search(&line) {
-                    edge.lines.insert(at, line);
-                }
+            if let Some(site) = site
+                && let Err(at) = edge.lines.binary_search(&site)
+            {
+                edge.lines.insert(at, site);
             }
             // One sure occurrence is enough to trust the relation.
             edge.confidence = edge.confidence.max(conf);
@@ -656,11 +669,7 @@ impl<'a> Builder<'a> {
             count: 1,
             confidence: conf,
             line,
-            lines: if kind == EdgeKind::Contains {
-                Vec::new()
-            } else {
-                vec![line]
-            },
+            lines: site.into_iter().collect(),
         });
     }
 
@@ -762,7 +771,14 @@ impl<'a> Builder<'a> {
                         }
                         Target::External(name) => self.external(&name),
                     };
-                    self.add_edge(from, to, EdgeKind::Imports, imp.line, Confidence::Exact);
+                    self.add_edge(
+                        from,
+                        to,
+                        EdgeKind::Imports,
+                        imp.line,
+                        Confidence::Exact,
+                        Some(fi),
+                    );
                 }
             }
         }
@@ -938,7 +954,7 @@ impl<'a> Builder<'a> {
                 };
                 if let Some((t, conf)) = self.find_type(tr, fi) {
                     let conf = conf.min(owner_conf);
-                    self.add_edge(owner, t, EdgeKind::Inherits, imp.line, conf);
+                    self.add_edge(owner, t, EdgeKind::Inherits, imp.line, conf, Some(fi));
                 }
             }
         }
@@ -977,7 +993,7 @@ impl<'a> Builder<'a> {
                     if kind == EdgeKind::References && self.graph.nodes[scope].parent == Some(t) {
                         continue;
                     }
-                    self.add_edge(scope, t, kind, r.line, conf);
+                    self.add_edge(scope, t, kind, r.line, conf, Some(fi));
                 }
             }
         }

@@ -1458,6 +1458,62 @@ fn call_sites_record_every_line() {
     assert!(ok && text.contains("calls → m.py::g (×2) L5,7"), "{text}");
 }
 
+#[test]
+fn call_sites_are_capped_and_stay_in_their_file() {
+    let mut many = String::from("def g():\n    pass\n\ndef f():\n");
+    for _ in 0..15 {
+        many.push_str("    g()\n");
+    }
+    let repo = TempRepo::new(
+        "callsites2",
+        &[
+            ("m.py", many),
+            ("Sources/A.swift", "class Foo {}\n".into()),
+            (
+                "Sources/B.swift",
+                "protocol P {}\nextension Foo: P {}\n".into(),
+            ),
+        ],
+    );
+    let f = symbol_in(&repo, "m.py::f");
+    let call = &f["outgoing"]["calls"][0];
+    assert_eq!(call["count"], 15, "{f:#}");
+    assert_eq!(call["call_sites"].as_array().unwrap().len(), 10, "{f:#}");
+    assert_eq!(call["more_sites"], 5, "{f:#}");
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "", "seeds": ["m.py::f"] }),
+    );
+    assert!(
+        ok && text.contains("L5,6,7,8,9,10,11,12,13,14,…(+5)"),
+        "{text}"
+    );
+
+    // The conformance is declared in B.swift but belongs to Foo (A.swift): no line of
+    // B.swift is reported as a line of A.swift.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_neighbors",
+        json!({ "id": "Sources/A.swift::Foo", "direction": "out", "edge_kinds": ["inherits"], "format": "json" }),
+    );
+    assert!(ok, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["edges"][0]["to"], "Sources/B.swift::P", "{v:#}");
+    assert!(v["edges"][0].get("lines").is_none(), "{v:#}");
+
+    // Incoming edges in explore name the file their lines belong to.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "", "seeds": ["m.py::g"] }),
+    );
+    assert!(
+        ok && text.contains("called_by ← m.py::f (×15) L5,") && text.contains(" in m.py"),
+        "{text}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {

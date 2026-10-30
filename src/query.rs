@@ -204,9 +204,7 @@ fn edge_ref(g: &Graph, other: usize, e: &crate::graph::Edge) -> Value {
     if let Some(l) = e.confidence.label() {
         o["confidence"] = json!(l);
     }
-    if e.kind != EdgeKind::Contains {
-        o[e.sites_key()] = json!(e.sites());
-    }
+    e.add_sites(&mut o);
     o
 }
 
@@ -340,9 +338,7 @@ pub fn neighbors(
             if let Some(l) = edge.confidence.label() {
                 ev["confidence"] = json!(l);
             }
-            if edge.kind != EdgeKind::Contains {
-                ev[edge.sites_key()] = json!(edge.sites());
-            }
+            edge.add_sites(&mut ev);
             edges.push(ev);
             if seen.insert(next) {
                 if nodes.len() >= limit {
@@ -911,8 +907,8 @@ pub fn audit_edges(
             .entry(g.nodes[e.from].file.as_str())
             .or_default()
             .push(json!(format!(
-                "L{} {} {} → {}{count}",
-                e.line,
+                "{} {} {} → {}{count}",
+                e.sites_text().unwrap_or_else(|| format!("L{}", e.line)),
                 g.qualified_name(e.from),
                 e.kind.as_str(),
                 g.nodes[e.to].id
