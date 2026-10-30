@@ -126,14 +126,16 @@ impl Server {
             }
             "resources/list" => Ok(json!({ "resources": resource_list() })),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
-            "resources/read" => {
-                let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-                match RESOURCES.iter().find(|r| r.uri == uri) {
+            "resources/read" => match params.get("uri").and_then(Value::as_str) {
+                None => Err((-32602, "resources/read needs a `uri` string".to_string())),
+                Some(uri) => match RESOURCES.iter().find(|r| r.uri == uri) {
                     None => Err((-32002, format!("resource not found: {uri}"))),
                     Some(r) => {
-                        let mut args = r.args();
-                        args["token_budget"] = json!(RESOURCE_TOKEN_BUDGET);
-                        match self.call_tool(r.tool, &args) {
+                        // The tool's defaults, with a larger budget; a reader cannot narrow
+                        // a resource, so a cut points to the tool instead.
+                        let args = json!({ "token_budget": RESOURCE_TOKEN_BUDGET });
+                        let hint = format!("call the {} tool with narrower arguments", r.tool);
+                        match self.render_tool(r.tool, &args, &hint) {
                             Ok(text) => Ok(json!({ "contents": [{
                                 "uri": r.uri,
                                 "mimeType": "text/plain",
@@ -142,21 +144,23 @@ impl Server {
                             Err(e) => Err((-32603, format!("{e:#}"))),
                         }
                     }
-                }
-            }
+                },
+            },
             "prompts/list" => Ok(json!({ "prompts": [architecture_review_definition()] })),
             "prompts/get" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 if name != "architecture-review" {
                     Err((-32602, format!("unknown prompt: {name}")))
                 } else {
-                    let focus = params
-                        .get("arguments")
-                        .and_then(|a| a.get("focus"))
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|f| !f.is_empty());
-                    Ok(architecture_review(focus))
+                    match params.get("arguments").and_then(|a| a.get("focus")) {
+                        None | Some(Value::Null) => Ok(architecture_review(None)),
+                        Some(Value::String(f)) => {
+                            // Backticks would break the inline code it is quoted in.
+                            let f = f.replace('`', "").trim().to_string();
+                            Ok(architecture_review((!f.is_empty()).then_some(f.as_str())))
+                        }
+                        Some(v) => Err((-32602, format!("`focus` must be a string, got {v}"))),
+                    }
                 }
             }
             _ => Err((-32601, format!("method not found: {method}"))),
@@ -203,6 +207,11 @@ impl Server {
     /// Runs a tool and renders its result: plain text tools as is, structured ones as
     /// compact text cut to `token_budget`, or as full JSON with `format: "json"`.
     pub fn call_tool(&mut self, name: &str, a: &Value) -> Result<String> {
+        self.render_tool(name, a, narrow_hint(name))
+    }
+
+    /// A tool's answer as text (or JSON); `hint` says how to get a smaller one when cut.
+    fn render_tool(&mut self, name: &str, a: &Value, hint: &str) -> Result<String> {
         let format = opt_str(a, "format")?.unwrap_or("text").to_lowercase();
         anyhow::ensure!(
             format == "text" || format == "json",
@@ -215,7 +224,7 @@ impl Server {
         Ok(match self.run_tool(name, a)? {
             Value::String(text) => text,
             v if format == "json" => serde_json::to_string(&v)?,
-            v => output::fit_value(&v, budget, narrow_hint(name)),
+            v => output::fit_value(&v, budget, hint),
         })
     }
 
@@ -493,19 +502,12 @@ fn narrow_hint(tool: &str) -> &'static str {
     }
 }
 
-/// A resource: a fixed read-only view produced by one tool.
+/// A resource: a fixed read-only view, one tool's answer with its default arguments.
 struct Resource {
     uri: &'static str,
     name: &'static str,
     description: &'static str,
     tool: &'static str,
-    args: &'static str,
-}
-
-impl Resource {
-    fn args(&self) -> Value {
-        serde_json::from_str(self.args).unwrap_or_else(|_| json!({}))
-    }
 }
 
 /// Resources are larger than a default tool answer: they are read once, as context.
@@ -517,35 +519,30 @@ const RESOURCES: &[Resource] = &[
         name: "Repository overview",
         description: "Index state, languages, counts, most depended-on symbols and files, external dependencies, largest communities (graph_overview).",
         tool: "graph_overview",
-        args: r#"{"top": 15}"#,
     },
     Resource {
         uri: "codenav://modules",
         name: "Module graph",
         description: "Directories as components and the dependencies between them (module_graph, depth 2).",
         tool: "module_graph",
-        args: r#"{"depth": 2}"#,
     },
     Resource {
         uri: "codenav://insights",
         name: "Insights",
         description: "Surprising connections, bridge nodes between communities and suggested questions (insights).",
         tool: "insights",
-        args: r#"{"top": 10}"#,
     },
     Resource {
         uri: "codenav://cycles",
         name: "Import cycles",
         description: "Import cycles between files (find_cycles).",
         tool: "find_cycles",
-        args: r#"{}"#,
     },
     Resource {
         uri: "codenav://audit",
         name: "Resolver audit",
         description: "Edge counts by confidence and the edges guessed by name, to verify (audit_edges).",
         tool: "audit_edges",
-        args: r#"{"limit": 100}"#,
     },
 ];
 
@@ -585,7 +582,7 @@ fn architecture_review(focus: Option<&str>) -> Value {
     };
     let text = format!(
         "Review the architecture of this repository using the codenav tools.\n\n{scope}\
-         1. Read codenav://overview (or call graph_overview): languages, size, central symbols, \
+         1. Call graph_overview (also offered as the codenav://overview resource): languages, size, central symbols, \
          largest communities, and whether the index matches the current commit.\n\
          2. Call module_graph, then get_community on the largest communities: what the real \
          components are, and where they differ from the directory layout.\n\

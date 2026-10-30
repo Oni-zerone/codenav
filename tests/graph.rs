@@ -1854,13 +1854,29 @@ fn mcp_resources_and_prompts() {
     );
     assert_eq!(lines[7]["error"]["code"], -32602, "{}", lines[7]);
 
+    // Invalid parameters are errors, not silent defaults; backticks don't break the prompt.
+    let lines = mcp_session(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"resources/read","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"architecture-review","arguments":{"focus":42}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"architecture-review","arguments":{"focus":"a`b"}}}),
+    ]);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["error"]["code"], -32602, "{}", lines[0]);
+    assert_eq!(lines[1]["error"]["code"], -32602, "{}", lines[1]);
+    let text = lines[2]["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("`ab`"), "{text}");
+
     // The other resources read without errors too.
     let reads: Vec<Value> = uris
         .iter()
         .enumerate()
         .map(|(i, uri)| json!({"jsonrpc":"2.0","id":i,"method":"resources/read","params":{"uri":uri}}))
         .collect();
-    for r in mcp_session(&reads) {
+    let responses = mcp_session(&reads);
+    assert_eq!(responses.len(), uris.len());
+    for r in responses {
         assert!(
             r.get("error").is_none() && r["result"]["contents"][0]["text"].is_string(),
             "{r}"
