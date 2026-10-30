@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::explore;
 use crate::graph::{EdgeKind, Graph, SymKind};
 use crate::indexer;
+use crate::output;
 use crate::query::{self, Direction};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -91,8 +92,8 @@ impl Server {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 Ok(match self.call_tool(name, &args) {
-                    Ok(v) => json!({
-                        "content": [{ "type": "text", "text": render_text(&v) }],
+                    Ok(text) => json!({
+                        "content": [{ "type": "text", "text": text }],
                         "isError": false,
                     }),
                     Err(e) => json!({
@@ -139,7 +140,26 @@ impl Server {
         }))
     }
 
-    pub fn call_tool(&mut self, name: &str, a: &Value) -> Result<Value> {
+    /// Runs a tool and renders its result: plain text tools as is, structured ones as
+    /// compact text cut to `token_budget`, or as full JSON with `format: "json"`.
+    pub fn call_tool(&mut self, name: &str, a: &Value) -> Result<String> {
+        let format = opt_str(a, "format")?.unwrap_or("text").to_lowercase();
+        anyhow::ensure!(
+            format == "text" || format == "json",
+            "format must be text or json, got `{format}`"
+        );
+        if format == "json" && matches!(name, "explore" | "read_code") {
+            anyhow::bail!("`{name}` always returns text; format=json is not supported");
+        }
+        let budget = token_budget(a)?;
+        Ok(match self.run_tool(name, a)? {
+            Value::String(text) => text,
+            v if format == "json" => serde_json::to_string(&v)?,
+            v => output::fit_value(&v, budget, narrow_hint(name)),
+        })
+    }
+
+    fn run_tool(&mut self, name: &str, a: &Value) -> Result<Value> {
         if name == "reindex" {
             self.last_stale_check = Instant::now();
             return self.reindex();
@@ -176,7 +196,7 @@ impl Server {
                         depth: uint(a, "depth", 2)?.clamp(1, 6) as u32,
                         direction,
                         kinds: &kinds,
-                        token_budget: uint(a, "token_budget", 2000)?.clamp(100, 100_000),
+                        token_budget: token_budget(a)?,
                     },
                 )?;
                 Ok(Value::String(text))
@@ -196,10 +216,7 @@ impl Server {
             }
             "get_symbol" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
-                let code = a
-                    .get("include_code")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
+                let code = opt_bool(a, "include_code")?.unwrap_or(true);
                 Ok(query::symbol_details(g, &self.root, i, code))
             }
             "get_neighbors" => {
@@ -229,7 +246,7 @@ impl Server {
                     from,
                     to,
                     &edge_kinds(a)?,
-                    a.get("directed").and_then(Value::as_bool).unwrap_or(false),
+                    opt_bool(a, "directed")?.unwrap_or(false),
                     uint(a, "max_depth", 6)?.clamp(1, 12) as u32,
                     uint(a, "max_paths", 3)?.clamp(1, 20),
                 ))
@@ -263,18 +280,36 @@ impl Server {
                 );
                 let code = query::read_lines(&self.root, &file, start, end)
                     .ok_or_else(|| anyhow!("cannot read {file}"))?;
-                Ok(json!({ "file": file, "code": code }))
+                let lines: Vec<Vec<String>> = code.lines().map(|l| vec![l.to_string()]).collect();
+                Ok(Value::String(output::fit_blocks(
+                    &file,
+                    &lines,
+                    token_budget(a)?,
+                    "lines",
+                    "request a smaller line range",
+                )))
             }
             _ => Err(anyhow!("unknown tool `{name}`")),
         }
     }
 }
 
-/// Tools return either structured JSON or ready-to-read text (a JSON string).
-pub fn render_text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        _ => serde_json::to_string_pretty(v).unwrap_or_default(),
+fn token_budget(a: &Value) -> Result<usize> {
+    Ok(uint(a, "token_budget", output::DEFAULT_TOKEN_BUDGET)?
+        .clamp(output::MIN_TOKEN_BUDGET, output::MAX_TOKEN_BUDGET))
+}
+
+/// How to get a smaller answer from each tool, shown when its output is cut.
+fn narrow_hint(tool: &str) -> &'static str {
+    match tool {
+        "get_symbol" => "pass include_code=false, or use get_neighbors with edge_kinds",
+        "get_neighbors" => "narrow with direction, edge_kinds, depth or limit",
+        "search_symbols" => "narrow with kinds, path or limit",
+        "file_outline" => "use get_symbol on the members you need",
+        "impact_analysis" => "lower depth or limit",
+        "module_graph" => "lower depth or raise min_weight",
+        "find_paths" => "lower max_paths or restrict edge_kinds",
+        _ => "narrow the request",
     }
 }
 
@@ -297,6 +332,14 @@ fn uint(a: &Value, key: &str, default: usize) -> Result<usize> {
             .as_u64()
             .map(|v| v as usize)
             .ok_or_else(|| anyhow!("argument `{key}` must be a non-negative integer, got {v}")),
+    }
+}
+
+fn opt_bool(a: &Value, key: &str) -> Result<Option<bool>> {
+    match a.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(v) => Err(anyhow!("argument `{key}` must be true or false, got {v}")),
     }
 }
 
@@ -343,6 +386,26 @@ fn edge_kinds(a: &Value) -> Result<Vec<EdgeKind>> {
 }
 
 fn tool_definitions() -> Value {
+    let mut tools = base_tool_definitions();
+    let budget = json!({ "type": "integer", "description": "Approximate max output tokens, 200-100000, default 2000. Output beyond it is cut with a notice at the top." });
+    let format = json!({ "type": "string", "enum": ["text", "json"], "description": "text (default): compact, cut to token_budget. json: the full structured result, no budget." });
+    for tool in tools.as_array_mut().into_iter().flatten() {
+        let name = tool["name"].as_str().unwrap_or("").to_string();
+        let Some(props) = tool["inputSchema"]["properties"].as_object_mut() else {
+            continue;
+        };
+        if name == "reindex" {
+            continue;
+        }
+        props.entry("token_budget").or_insert(budget.clone());
+        if !matches!(name.as_str(), "explore" | "read_code") {
+            props.insert("format".into(), format.clone());
+        }
+    }
+    tools
+}
+
+fn base_tool_definitions() -> Value {
     let edge_kinds = json!({
         "type": "array",
         "items": { "type": "string", "enum": ["contains", "imports", "calls", "inherits", "references"] },
@@ -374,7 +437,7 @@ fn tool_definitions() -> Value {
                 "depth": { "type": "integer", "description": "1-6, default 2." },
                 "direction": { "type": "string", "enum": ["out", "in", "both"], "description": "Default both (bfs) / out (dfs)." },
                 "edge_kinds": edge_kinds.clone(),
-                "token_budget": { "type": "integer", "description": "Approximate max output tokens, 100-100000, default 2000." }
+                "token_budget": { "type": "integer", "description": "Approximate max output tokens, 200-100000, default 2000." }
             }, "required": ["question"] }
         },
         {

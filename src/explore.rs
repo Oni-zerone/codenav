@@ -11,16 +11,14 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::{Result, bail};
 
 use crate::graph::{EdgeKind, Graph, SymKind};
+use crate::output;
 use crate::query::{self, Direction};
 
-const CHARS_PER_TOKEN: usize = 3;
 const MAX_SEEDS: usize = 8;
 const MAX_VISITED: usize = 3000;
 const MAX_TERMS: usize = 32;
 /// Edge lines listed under one node; the rest are summarized.
 const MAX_EDGES_PER_NODE: usize = 30;
-/// Room kept for the truncation notice.
-const NOTICE_RESERVE: usize = 260;
 /// Name substrings only count for terms at least this long (`get` ⊄ `budget`).
 const MIN_SUBSTRING_TERM: usize = 4;
 
@@ -517,10 +515,7 @@ fn render(
         Mode::Dfs => "DFS",
     };
     let seed_ids: Vec<&str> = seeds.iter().map(|&s| g.nodes[s].id.as_str()).collect();
-    let mut shown_question: String = question.chars().take(200).collect();
-    if shown_question.len() < question.len() {
-        shown_question.push('…');
-    }
+    let shown_question = output::clip(question, 120);
     let mut header = format!(
         "Question: {shown_question}\nTraversal: {mode} depth={} | {} nodes | seeds: {}",
         opts.depth,
@@ -532,12 +527,18 @@ fn render(
         header.push_str(&format!(" | edges: {}", kinds.join(",")));
     }
     for note in notes.iter().take(5) {
-        header.push_str(&format!("\nNote: {note}"));
+        header.push_str(&format!("\nNote: {}", output::clip(note, 160)));
     }
     if notes.len() > 5 {
         header.push_str(&format!("\nNote: … and {} more notes", notes.len() - 5));
     }
-    cut_to_budget(&header, &blocks, opts.token_budget)
+    output::fit_blocks(
+        &header,
+        &blocks,
+        opts.token_budget,
+        "nodes",
+        "narrow with edge_kinds, depth or seeds",
+    )
 }
 
 fn node_line(g: &Graph, n: usize, dist: u32, seed: bool) -> String {
@@ -560,67 +561,6 @@ fn node_line(g: &Graph, n: usize, dist: u32, seed: bool) -> String {
     line
 }
 
-/// Keeps whole node blocks within the budget, cutting the last one line by line,
-/// and announces any cut at the top.
-fn cut_to_budget(header: &str, blocks: &[Vec<String>], token_budget: usize) -> String {
-    let budget = token_budget
-        .saturating_mul(CHARS_PER_TOKEN)
-        .saturating_sub(NOTICE_RESERVE)
-        .max(header.len());
-    let block_len = |b: &[String]| b.iter().map(|l| l.len() + 1).sum::<usize>() + 1;
-    let full = header.len() + blocks.iter().map(|b| block_len(b)).sum::<usize>();
-
-    let mut body = String::new();
-    let mut used = header.len();
-    let mut whole = 0;
-    let mut partial = false;
-    for b in blocks {
-        let len = block_len(b);
-        if used + len <= budget {
-            for (i, line) in b.iter().enumerate() {
-                body.push_str(if i == 0 { "\n\n" } else { "\n" });
-                body.push_str(line);
-            }
-            used += len;
-            whole += 1;
-            continue;
-        }
-        // Fit what we can of this block, so a single huge node cannot blow the budget.
-        let mut lines = 0;
-        for line in b {
-            if used + line.len() + 2 > budget {
-                break;
-            }
-            body.push_str(if lines == 0 { "\n\n" } else { "\n" });
-            body.push_str(line);
-            used += line.len() + 1;
-            lines += 1;
-        }
-        if lines > 0 {
-            body.push_str(&format!("\n    … {} more lines cut", b.len() - lines));
-            partial = true;
-        }
-        break;
-    }
-
-    let mut out = String::with_capacity(used + NOTICE_RESERVE);
-    out.push_str(header);
-    if whole < blocks.len() {
-        let shown = if partial {
-            format!("{whole} of {} nodes in full, 1 partially", blocks.len())
-        } else {
-            format!("{whole} of {} nodes", blocks.len())
-        };
-        out.push_str(&format!(
-            "\n[!] TRUNCATED: showing {shown} (~{token_budget}-token budget). \
-             token_budget={} would show all; or narrow with edge_kinds, depth or seeds.",
-            (full + NOTICE_RESERVE).div_ceil(CHARS_PER_TOKEN)
-        ));
-    }
-    out.push_str(&body);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,34 +578,6 @@ mod tests {
             query_terms("Come viene usato lo UserService con il Repository?"),
             vec!["viene", "usato", "userservice", "repository"]
         );
-    }
-
-    #[test]
-    fn budget_cut_keeps_whole_blocks() {
-        let blocks: Vec<Vec<String>> = (0..50)
-            .map(|i| vec![format!("node {i} {}", "x".repeat(40))])
-            .collect();
-        let out = cut_to_budget("H", &blocks, 100);
-        assert!(out.contains("[!] TRUNCATED"));
-        assert!(out.len() <= 100 * CHARS_PER_TOKEN, "{}", out.len());
-        assert!(
-            out.lines()
-                .filter(|l| l.starts_with("node"))
-                .all(|l| l.ends_with('x'))
-        );
-    }
-
-    #[test]
-    fn budget_holds_for_one_huge_block() {
-        let mut block = vec!["hub".to_string()];
-        block.extend((0..1500).map(|i| format!("    called_by ← caller_{i}")));
-        let out = cut_to_budget("H", &[block], 100);
-        assert!(out.len() <= 100 * CHARS_PER_TOKEN, "{}", out.len());
-        assert!(
-            out.contains("1 partially") && out.contains("more lines cut"),
-            "{out}"
-        );
-        assert!(!cut_to_budget("H", &[vec!["a".into()]], usize::MAX).contains("TRUNCATED"));
     }
 
     #[test]
