@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use serde_json::{Value, json};
 
 use crate::communities;
-use crate::graph::{Confidence, Edge, EdgeKind, Graph, SymKind};
+use crate::graph::{Confidence, Edge, EdgeKind, Graph, SymKind, dir_of};
 
 /// Betweenness is computed from at most this many source nodes (evenly spaced).
 const MAX_SOURCES: usize = 256;
@@ -20,14 +20,13 @@ fn active(g: &Graph, i: usize) -> bool {
     g.nodes[i].kind != SymKind::External
 }
 
-fn dir(file: &str) -> &str {
-    file.rsplit_once('/').map_or("", |(d, _)| d)
-}
-
 fn label(g: &Graph, c: Option<u32>) -> String {
     c.and_then(|c| g.communities.get(c as usize))
         .map_or_else(|| "?".into(), |info| info.label.clone())
 }
+
+type CommunityPair = (u32, u32);
+type FilePair<'g> = (&'g str, &'g str);
 
 struct Surprise {
     score: u32,
@@ -35,34 +34,50 @@ struct Surprise {
     reasons: Vec<String>,
 }
 
-/// Cross-file dependency edges ranked by how unexpected they are; the best per file pair.
+/// A cross-file dependency worth scoring: between repository files, and not a guess across
+/// languages (that is noise, not a finding).
+fn candidate(g: &Graph, e: &Edge) -> bool {
+    if !is_dependency(e) || !active(g, e.from) || !active(g, e.to) {
+        return false;
+    }
+    let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
+    let languages_differ = match (a.lang, b.lang) {
+        (Some(x), Some(y)) => x.family() != y.family(),
+        _ => false,
+    };
+    a.file != b.file && !(languages_differ && !e.confidence.is_exact())
+}
+
+/// The two files of an edge, in a fixed order (a pair, whichever the direction).
+fn file_pair<'g>(g: &'g Graph, e: &Edge) -> (&'g str, &'g str) {
+    let (a, b) = (g.nodes[e.from].file.as_str(), g.nodes[e.to].file.as_str());
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Cross-file dependency edges ranked by how unexpected they are; the best per file pair
+/// (either direction).
 fn surprising_connections(g: &Graph, degree: &[usize], hub: usize) -> Vec<Surprise> {
-    // Edges between each pair of communities: a lone link is more surprising.
-    let mut between: HashMap<(u32, u32), usize> = HashMap::new();
-    for e in g.edges.iter().filter(|e| is_dependency(e)) {
+    // Distinct file pairs linking each pair of communities: a lone link is surprising,
+    // however many edges (an import and a call) make it up.
+    let mut links: BTreeSet<(CommunityPair, FilePair)> = BTreeSet::new();
+    for e in g.edges.iter().filter(|e| candidate(g, e)) {
         if let (Some(a), Some(b)) = (g.nodes[e.from].community, g.nodes[e.to].community)
             && a != b
         {
-            *between.entry((a.min(b), a.max(b))).or_default() += 1;
+            links.insert(((a.min(b), a.max(b)), file_pair(g, e)));
         }
     }
+    let mut between: HashMap<(u32, u32), usize> = HashMap::new();
+    for (pair, _) in &links {
+        *between.entry(*pair).or_default() += 1;
+    }
+
     let mut best: BTreeMap<(&str, &str), Surprise> = BTreeMap::new();
     for (i, e) in g.edges.iter().enumerate() {
-        if !is_dependency(e) || !active(g, e.from) || !active(g, e.to) {
+        if !candidate(g, e) {
             continue;
         }
         let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
-        if a.file == b.file {
-            continue;
-        }
-        // A guess across languages is noise, not a finding.
-        let languages_differ = match (a.lang, b.lang) {
-            (Some(x), Some(y)) => x.family() != y.family(),
-            _ => false,
-        };
-        if languages_differ && !e.confidence.is_exact() {
-            continue;
-        }
         let mut score = 0;
         let mut reasons = Vec::new();
         match e.confidence {
@@ -79,15 +94,15 @@ fn surprising_connections(g: &Graph, degree: &[usize], hub: usize) -> Vec<Surpri
         if let (Some(ca), Some(cb)) = (a.community, b.community)
             && ca != cb
         {
-            score += 2;
-            let links = between[&(ca.min(cb), ca.max(cb))];
-            let rare = match links {
+            // Crossing alone is routine; crossing where almost nothing else does is not.
+            score += 1;
+            let rare = match between[&(ca.min(cb), ca.max(cb))] {
                 1 => {
-                    score += 2;
+                    score += 3;
                     ", the only link between them"
                 }
                 2..=3 => {
-                    score += 1;
+                    score += 2;
                     ", one of few links between them"
                 }
                 _ => "",
@@ -97,31 +112,33 @@ fn surprising_connections(g: &Graph, degree: &[usize], hub: usize) -> Vec<Surpri
                 label(g, Some(ca)),
                 label(g, Some(cb))
             ));
-        } else if dir(&a.file) != dir(&b.file) {
+        } else if dir_of(&a.file) != dir_of(&b.file) {
             score += 1;
             reasons.push(format!(
                 "crosses directories {} → {}",
-                dir(&a.file),
-                dir(&b.file)
+                dir_of(&a.file),
+                dir_of(&b.file)
             ));
         }
-        if degree[e.from] <= 2 && degree[e.to] >= hub {
+        if degree[e.from] <= 2 && degree[e.to] > hub {
             score += 1;
             reasons.push("from a peripheral node to a hub".to_string());
         }
         if score < 2 {
             continue;
         }
-        let key = (a.file.as_str(), b.file.as_str());
-        let candidate = Surprise {
-            score,
-            edge: i,
-            reasons,
-        };
+        let key = file_pair(g, e);
         match best.get(&key) {
-            Some(old) if old.score >= candidate.score => {}
+            Some(old) if old.score >= score => {}
             _ => {
-                best.insert(key, candidate);
+                best.insert(
+                    key,
+                    Surprise {
+                        score,
+                        edge: i,
+                        reasons,
+                    },
+                );
             }
         }
     }
@@ -211,15 +228,9 @@ pub fn insights(g: &Graph, top: usize) -> Value {
             }
         })
         .collect();
-    // A hub: in the top 5% by degree, and at least 5 neighbours.
-    let hub = {
-        let mut d: Vec<usize> = degree.iter().copied().filter(|&d| d > 0).collect();
-        d.sort_unstable();
-        d.get(d.len() * 95 / 100)
-            .copied()
-            .unwrap_or(usize::MAX)
-            .max(5)
-    };
+    // Hubs as community detection sees them (same percentile, same minimum degree).
+    let is_active: Vec<bool> = (0..g.nodes.len()).map(|i| active(g, i)).collect();
+    let hub = communities::hub_threshold(&degree, &is_active, g.hub_percentile);
 
     let surprises = surprising_connections(g, &degree, hub);
     let surprising: Vec<Value> = surprises
@@ -240,20 +251,26 @@ pub fn insights(g: &Graph, top: usize) -> Value {
         })
         .collect();
 
-    // Bridges: highest betweenness among nodes whose neighbours span several communities.
+    // Bridges: highest betweenness among nodes whose neighbours lie in several
+    // communities; those communities, most linked first.
     let bc = betweenness(g);
-    let mut bridges: Vec<(usize, BTreeSet<u32>)> = (0..g.nodes.len())
+    let mut bridges: Vec<(usize, Vec<u32>)> = (0..g.nodes.len())
         .filter(|&i| bc[i] > 0.0)
         .filter_map(|i| {
-            let comms: BTreeSet<u32> = g.out_edges[i]
-                .iter()
-                .chain(&g.in_edges[i])
-                .map(|&e| &g.edges[e])
-                .filter(|e| is_structural(e))
-                .flat_map(|e| [g.nodes[e.from].community, g.nodes[e.to].community])
-                .flatten()
-                .collect();
-            (comms.len() >= 2).then_some((i, comms))
+            let mut links: BTreeMap<u32, usize> = BTreeMap::new();
+            for &e in g.out_edges[i].iter().chain(&g.in_edges[i]) {
+                let edge = &g.edges[e];
+                if !is_structural(edge) {
+                    continue;
+                }
+                let other = if edge.from == i { edge.to } else { edge.from };
+                if let Some(c) = g.nodes[other].community {
+                    *links.entry(c).or_default() += 1;
+                }
+            }
+            let mut comms: Vec<(u32, usize)> = links.into_iter().collect();
+            comms.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            (comms.len() >= 2).then(|| (i, comms.into_iter().map(|(c, _)| c).collect()))
         })
         .collect();
     bridges.sort_by(|a, b| bc[b.0].total_cmp(&bc[a.0]).then(a.0.cmp(&b.0)));
@@ -288,11 +305,15 @@ pub fn insights(g: &Graph, top: usize) -> Value {
         ));
     }
     for (i, comms) in bridges.iter().take(top.div_ceil(2)) {
-        let names: Vec<String> = comms.iter().take(3).map(|&c| label(g, Some(c))).collect();
+        let more = match comms.len() - 2 {
+            0 => String::new(),
+            n => format!(" (and {n} more)"),
+        };
         questions.push(format!(
-            "Why does {} connect the communities {}?",
+            "Why does {} connect the communities {} and {}{more}?",
             g.nodes[*i].id,
-            names.join(" and ")
+            label(g, Some(comms[0])),
+            label(g, Some(comms[1])),
         ));
     }
     questions.truncate(top);

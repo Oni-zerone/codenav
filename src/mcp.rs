@@ -39,6 +39,8 @@ pub struct Server {
     last_stale_check: Instant,
     auto_refresh: bool,
     index_options: IndexOptions,
+    /// insights for (graph build time in ms, top): costly, changes only on reindex.
+    insights_cache: Option<((u64, usize), Value)>,
 }
 
 impl Server {
@@ -54,6 +56,7 @@ impl Server {
             last_stale_check: Instant::now(),
             auto_refresh,
             index_options,
+            insights_cache: None,
         }
     }
 
@@ -185,6 +188,17 @@ impl Server {
             return self.reindex();
         }
         self.refresh_if_stale();
+        if name == "insights" {
+            let key = (self.graph.indexed_at_ms, uint(a, "top", 10)?.clamp(1, 50));
+            if let Some((k, v)) = &self.insights_cache
+                && *k == key
+            {
+                return Ok(v.clone());
+            }
+            let v = insights::insights(&self.graph, key.1);
+            self.insights_cache = Some((key, v.clone()));
+            return Ok(v);
+        }
         let g = &self.graph;
         match name {
             "graph_overview" => {
@@ -331,7 +345,6 @@ impl Server {
                     min_confidence(a)?,
                 ))
             }
-            "insights" => Ok(insights::insights(g, uint(a, "top", 10)?.clamp(1, 50))),
             "tests_for" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 // Guesses among same-named candidates would list unrelated tests.

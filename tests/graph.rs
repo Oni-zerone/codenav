@@ -1384,7 +1384,7 @@ fn insights_find_lone_links_and_bridges() {
     assert_eq!(v["bridges"][0]["id"], "hub/bridge.py::bridge", "{v:#}");
     assert_eq!(
         v["bridges"][0]["connects"].as_array().unwrap().len(),
-        3,
+        2,
         "{v:#}"
     );
     let surprises = v["surprising_connections"].as_array().unwrap();
@@ -1398,7 +1398,7 @@ fn insights_find_lone_links_and_bridges() {
             s["why"]
                 .as_str()
                 .unwrap()
-                .contains("few links between them"),
+                .contains("the only link between them"),
             "{v:#}"
         );
     }
