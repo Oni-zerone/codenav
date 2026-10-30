@@ -22,7 +22,9 @@ const FORMAT_VERSION: u32 = 3;
 /// while readers of the format (like the VS Code extension) are unaffected.
 /// 1: JS/TS module scoping, JSX components only, top-level constants.
 /// 2: `Edge::lines` (every line of a relation, e.g. call sites).
-pub const ANALYSIS_VERSION: u32 = 2;
+/// 3: common methods on unknown receivers need the owner type named nearby; module
+///    qualifiers must be single names.
+pub const ANALYSIS_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]

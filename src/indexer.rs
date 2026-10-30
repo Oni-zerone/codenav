@@ -384,6 +384,12 @@ struct Builder<'a> {
     owner_confidence: HashMap<usize, Confidence>,
     /// exact name -> symbol nodes
     names: HashMap<String, Vec<usize>>,
+    /// definition node -> its byte range in its file
+    def_ranges: HashMap<usize, (usize, usize)>,
+    /// node (definition or file) -> byte ranges of the definitions nested directly in it
+    child_ranges: HashMap<usize, Vec<(usize, usize)>>,
+    /// file index -> name or qualifier -> byte offsets of the refs using it
+    mentions: Vec<HashMap<String, Vec<usize>>>,
     /// path without extension -> file node (also `dir` for mod.rs / __init__.py / index.ts)
     stems: HashMap<String, usize>,
     /// every path suffix of a stem (by component) -> file nodes
@@ -429,6 +435,9 @@ impl<'a> Builder<'a> {
             edge_index: HashMap::new(),
             lang_of_node: Vec::new(),
             hidden: HashSet::new(),
+            def_ranges: HashMap::new(),
+            child_ranges: HashMap::new(),
+            mentions: Vec::new(),
             script_files: HashSet::new(),
             reexports: HashMap::new(),
             unresolved_imports: Vec::new(),
@@ -513,6 +522,11 @@ impl<'a> Builder<'a> {
                     f.lang,
                 );
                 self.names.entry(d.name.clone()).or_default().push(node);
+                self.def_ranges.insert(node, (d.start_byte, d.end_byte));
+                self.child_ranges
+                    .entry(parent)
+                    .or_default()
+                    .push((d.start_byte, d.end_byte));
                 // Without any `export`, a JS file is CommonJS or a script: nothing is hidden.
                 if is_js && f.has_exports && !d.exported {
                     self.hidden.insert(node);
@@ -1024,7 +1038,29 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Where each name and qualifier is used, per file, for `scope_mentions`.
+    fn index_mentions(&mut self) {
+        self.mentions = self
+            .facts
+            .iter()
+            .map(|f| {
+                let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+                for r in &f.refs {
+                    m.entry(r.name.clone()).or_default().push(r.byte);
+                    if let Some(q) = &r.qualifier {
+                        m.entry(q.clone()).or_default().push(r.byte);
+                    }
+                }
+                for v in m.values_mut() {
+                    v.sort_unstable();
+                }
+                m
+            })
+            .collect();
+    }
+
     fn resolve_refs(&mut self) {
+        self.index_mentions();
         for fi in 0..self.facts.len() {
             let f = &self.facts[fi];
             for r in &f.refs {
@@ -1121,6 +1157,7 @@ impl<'a> Builder<'a> {
         // on values whose type we cannot know; `qualified` a match on the qualifier's name.
         let mut risky = false;
         let mut qualified = false;
+        let mut unknown_receiver = false;
         if let Some(q) = r.qualifier.as_deref() {
             if matches!(q, "self" | "this" | "Self") {
                 let owner = self.enclosing_type(scope);
@@ -1140,7 +1177,7 @@ impl<'a> Builder<'a> {
                 let matched: Vec<usize> = cands
                     .iter()
                     .copied()
-                    .filter(|&n| self.qualifier_matches(n, q))
+                    .filter(|&n| self.qualifier_matches(fi, n, q, r))
                     .collect();
                 if !matched.is_empty() {
                     cands = matched;
@@ -1152,6 +1189,7 @@ impl<'a> Builder<'a> {
                     // `value.method()` can only target methods.
                     cands.retain(|&n| self.graph.nodes[n].kind == SymKind::Method);
                     risky = true;
+                    unknown_receiver = true;
                 }
             }
         }
@@ -1159,9 +1197,27 @@ impl<'a> Builder<'a> {
             return none;
         }
         let common = COMMON_METHODS.contains(&r.name.as_str());
+        // `x.len()`, `it.filter(…)` on an unknown receiver are almost always library
+        // methods: link a same-named repo method only when the calling code names its
+        // type (an annotation, `WGraph::new()`, a reference).
+        let mut evidenced = false;
+        if unknown_receiver && common {
+            evidenced = true;
+            cands.retain(|&n| {
+                self.graph.nodes[n]
+                    .parent
+                    .filter(|&p| self.graph.nodes[p].kind.is_type())
+                    .is_some_and(|p| self.scope_mentions(fi, scope, &self.graph.nodes[p].name))
+            });
+            if cands.is_empty() {
+                return none;
+            }
+        }
         // A unique match: `sure` when found where it should be (same or imported file) or
         // named by a qualifier; an unknown receiver lowers it, a common method name on an
         // unknown receiver is a guess.
+        // With the type named nearby, a common method is no longer a blind guess.
+        let common = common && !evidenced;
         let unique = |sure: bool, risky: bool| -> Confidence {
             if risky && common {
                 Confidence::Ambiguous
@@ -1226,6 +1282,59 @@ impl<'a> Builder<'a> {
             k if k <= MAX_AMBIGUOUS => (cands, Confidence::Ambiguous),
             _ => none,
         }
+    }
+
+    /// Whether `name` is used in file `fi` within `range`, outside the `excluded` ranges.
+    fn mentioned_in(
+        &self,
+        fi: usize,
+        name: &str,
+        range: (usize, usize),
+        excluded: &[(usize, usize)],
+    ) -> bool {
+        let Some(bytes) = self.mentions[fi].get(name) else {
+            return false;
+        };
+        let from = bytes.partition_point(|&b| b < range.0);
+        bytes[from..]
+            .iter()
+            .take_while(|&&b| b < range.1)
+            .any(|&b| !excluded.iter().any(|&(s, e)| s <= b && b < e))
+    }
+
+    /// Code that belongs to `node` itself: its range without the definitions nested in it
+    /// (the whole file without its functions, a type without its methods: its fields).
+    fn own_code_mentions(&self, fi: usize, node: usize, name: &str) -> bool {
+        let range = if node == self.file_nodes[fi] {
+            (0, usize::MAX)
+        } else if let Some(&r) = self.def_ranges.get(&node) {
+            r
+        } else {
+            return false;
+        };
+        let excluded = self.child_ranges.get(&node).map_or(&[][..], Vec::as_slice);
+        self.mentioned_in(fi, name, range, excluded)
+    }
+
+    /// Whether the code around a reference in `scope` names `name` (as a type, a value, a
+    /// call or a qualifier like `Name::new()`): the scope's whole body when it is a
+    /// definition of this file (else its file's top-level code), and the fields of the
+    /// type it belongs to. Not the type's other methods.
+    fn scope_mentions(&self, fi: usize, scope: usize, name: &str) -> bool {
+        let in_scope = match self.def_ranges.get(&scope) {
+            Some(&r) if self.graph.nodes[scope].file == self.facts[fi].path => {
+                self.mentioned_in(fi, name, r, &[])
+            }
+            _ => self.own_code_mentions(fi, self.file_nodes[fi], name),
+        };
+        in_scope
+            || self.graph.nodes[scope]
+                .parent
+                .filter(|&p| {
+                    self.graph.nodes[p].kind.is_type()
+                        && self.graph.nodes[p].file == self.facts[fi].path
+                })
+                .is_some_and(|t| self.own_code_mentions(fi, t, name))
     }
 
     /// JS/TS module scoping: can code in file `fi`, inside `scope`, see definition `n`
@@ -1293,10 +1402,25 @@ impl<'a> Builder<'a> {
 
     /// `q.name()` / `q::name()` may target a member of type `q`, a function in module
     /// (file) `q`, or in Go package (directory) `q`.
-    fn qualifier_matches(&self, n: usize, q: &str) -> bool {
+    /// A module or package qualifier is a single name: `utils.f()` (Python/JS), `store.F()`
+    /// (Go), or a `::` path in Rust; `self.graph.len()` or a Rust field `x.items.len()`
+    /// names a value, whatever the file it happens to share its name with.
+    fn qualifier_matches(&self, fi: usize, n: usize, q: &str, r: &extract::Ref) -> bool {
         let node = &self.graph.nodes[n];
         if node.parent.is_some_and(|p| self.graph.nodes[p].name == q) {
             return true;
+        }
+        let path = r.qualifier_path.as_deref().unwrap_or(q);
+        let module_like = if self.lang_of_node[n] == Lang::Rust {
+            // `crate::store::load()` is a path; `s.communities.len()` is a field.
+            r.is_static
+        } else {
+            // `utils.f()`, or a dotted path the file imports (`pkg.utils.f()`).
+            !path.contains(['.', ':', '(', '[', '-'])
+                || self.facts[fi].imports.iter().any(|i| i.path == path)
+        };
+        if !module_like {
+            return false;
         }
         let mut parts = node.file.rsplit('/');
         let file_stem = parts.next().and_then(|f| f.split('.').next());
