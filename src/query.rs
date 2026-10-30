@@ -530,10 +530,22 @@ pub fn file_outline(g: &Graph, file: usize) -> Value {
 ///
 /// Only edges at least as sure as `min` are followed; each hit reports the confidence of
 /// the weakest edge on the path that reached it.
-pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
-    // Seeds: the target, its members (through containment at least `min` sure), and the
-    // members they override, each with the confidence of how it was reached.
-    let mut seeds: Vec<(usize, Confidence)> = vec![(start, Confidence::Exact)];
+/// Edge kinds through which code depends on other code (everything but containment).
+pub const DEPENDENCY_KINDS: [EdgeKind; 4] = [
+    EdgeKind::Calls,
+    EdgeKind::Inherits,
+    EdgeKind::References,
+    EdgeKind::Imports,
+];
+
+/// Nodes with the confidence of how they were reached.
+pub type Seeds = Vec<(usize, Confidence)>;
+
+/// What a change to `start` touches: `start`, its members (through containment at least
+/// `min` sure), and the members they override, each with the confidence of how it was
+/// reached. Shared by impact_analysis and tests_for.
+pub fn change_seeds(g: &Graph, start: usize, min: Confidence) -> (Seeds, Seeds) {
+    let mut seeds: Seeds = vec![(start, Confidence::Exact)];
     let mut i = 0;
     while i < seeds.len() {
         let (s, conf) = seeds[i];
@@ -554,14 +566,14 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
             }
         }
     }
+    (seeds, overridden)
+}
+
+pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
+    let (mut seeds, overridden) = change_seeds(g, start, min);
     seeds.extend(&overridden);
     let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
-    let kinds = [
-        EdgeKind::Calls,
-        EdgeKind::Inherits,
-        EdgeKind::References,
-        EdgeKind::Imports,
-    ];
+    let kinds = DEPENDENCY_KINDS;
 
     // One BFS per confidence level, surest first, following only edges (and seeds) at least
     // that sure: a node gets the best confidence any path within `depth` gives it, and the

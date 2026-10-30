@@ -332,12 +332,17 @@ impl Server {
             }
             "tests_for" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
+                // Guesses among same-named candidates would list unrelated tests.
+                let min = match opt_str(a, "min_confidence")? {
+                    Some(c) => parse_confidence(c)?,
+                    None => Confidence::Inferred,
+                };
                 Ok(tests_for::tests_for(
                     g,
                     i,
                     uint(a, "depth", 4)?.clamp(1, 8) as u32,
                     uint(a, "limit", 50)?.max(1),
-                    min_confidence(a)?,
+                    min,
                 ))
             }
             "find_cycles" => {
@@ -536,7 +541,7 @@ fn tool_definitions() -> Value {
         props.entry("token_budget").or_insert(budget.clone());
         if matches!(
             name.as_str(),
-            "get_neighbors" | "find_paths" | "impact_analysis" | "explore" | "tests_for"
+            "get_neighbors" | "find_paths" | "impact_analysis" | "explore"
         ) {
             props.insert("min_confidence".into(), min_confidence.clone());
         }
@@ -545,6 +550,17 @@ fn tool_definitions() -> Value {
         }
     }
     tools
+}
+
+fn tests_for_description() -> String {
+    format!(
+        "Tests to run after changing a symbol or file: tests that depend on it (or on its \
+         members, or on the interface methods they implement), split into direct (the test \
+         calls, references or imports it) and indirect (through other code, with distance and \
+         the shortest path), closest first. Tests are recognised by path only: {}. No matching \
+         by name similarity; edges at least inferred by default.",
+        tests_for::CONVENTIONS
+    )
 }
 
 fn base_tool_definitions() -> Value {
@@ -641,10 +657,11 @@ fn base_tool_definitions() -> Value {
         },
         {
             "name": "tests_for",
-            "description": "Tests to run after changing a symbol or file: test files (by path convention: *.test.*, *.spec.*, __tests__/, tests/, test_*.py, *_test.go, *Tests.swift, Rust `mod tests`) that depend on it, split into direct (the test calls, references or imports it) and indirect (through other code, with distance and the shortest path), closest first. No matching by name similarity.",
+            "description": tests_for_description(),
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string", "description": "Symbol or file (id, unique name or path)." },
                 "depth": { "type": "integer", "description": "Max dependency hops from a test to the target (1-8, default 4)." },
+                "min_confidence": { "type": "string", "enum": ["exact", "inferred", "ambiguous"], "description": "Least confidence of the edges followed (default inferred; ambiguous adds tests reached through name guesses)." },
                 "limit": { "type": "integer", "description": "Test files listed (default 50)." }
             }, "required": ["id"] }
         },

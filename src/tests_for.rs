@@ -6,23 +6,31 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
-use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
+use crate::graph::{Confidence, Graph, SymKind};
 use crate::query;
 
-/// Dependency kinds followed from the target to its dependents.
-const KINDS: [EdgeKind; 4] = [
-    EdgeKind::Calls,
-    EdgeKind::References,
-    EdgeKind::Inherits,
-    EdgeKind::Imports,
-];
+/// Conventions recognised, as described to MCP clients.
+pub const CONVENTIONS: &str = "*.test.*, *.spec.*, files under tests/, test/, __tests__/ or \
+Tests/, tests.* / test.* (e.g. Rust `mod tests;` in tests.rs, Django tests.py), test_*.py, \
+*_test.py, *_test.go, *Tests.swift, and symbols inside a Rust `mod tests`; fixtures, testdata, \
+__mocks__ and conftest.py are support, not tests";
 
-/// A test file by its path: `*.test.*`, `*.spec.*`, `__tests__/`, `tests/`, `test/`,
-/// `test_*.py`, `*_test.py`, `*_test.go`, `*Tests.swift`, `Tests/`.
+/// A test file by its path (see `CONVENTIONS`).
 pub fn is_test_file(path: &str) -> bool {
     let mut parts = path.rsplit('/');
     let name = parts.next().unwrap_or("");
     let dirs: Vec<&str> = parts.collect();
+    // Test data and helpers live next to tests but are not tests to run.
+    if name == "conftest.py"
+        || dirs.iter().any(|d| {
+            matches!(
+                *d,
+                "fixtures" | "fixture" | "__fixtures__" | "testdata" | "__mocks__"
+            )
+        })
+    {
+        return false;
+    }
     if dirs
         .iter()
         .any(|d| matches!(*d, "tests" | "test" | "__tests__" | "Tests"))
@@ -33,6 +41,7 @@ pub fn is_test_file(path: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("");
     name.contains(".test.")
         || name.contains(".spec.")
+        || matches!(stem, "tests" | "test")
         || (ext == "py" && (stem.starts_with("test_") || stem.ends_with("_test")))
         || (ext == "go" && stem.ends_with("_test"))
         || (ext == "swift" && stem.ends_with("Tests"))
@@ -59,55 +68,36 @@ fn is_test_node(g: &Graph, i: usize) -> bool {
     false
 }
 
-/// One step towards the target: the next node and the edge used (None: from a symbol up
-/// to its file, which costs nothing).
-type Step = (usize, Option<usize>);
-
 pub fn tests_for(g: &Graph, target: usize, depth: u32, limit: usize, min: Confidence) -> Value {
-    // Seeds: the target and everything it contains.
+    // BFS over dependents from what a change to the target touches (itself, its members,
+    // the methods they override). Symbols are reached through calls and references, files
+    // through imports: a test importing the target's file is not taken as using every
+    // symbol in it.
+    let (mut seeds, overridden) = query::change_seeds(g, target, min);
+    seeds.extend(overridden);
     let mut dist: HashMap<usize, u32> = HashMap::new();
-    let mut next: HashMap<usize, Step> = HashMap::new();
+    // dependent -> (node one step closer to the target, edge)
+    let mut next: HashMap<usize, (usize, usize)> = HashMap::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
-    let mut stack = vec![target];
-    while let Some(s) = stack.pop() {
+    for &(s, _) in &seeds {
         if dist.insert(s, 0).is_none() {
             queue.push_back(s);
-            for &e in &g.out_edges[s] {
-                if g.edges[e].kind == EdgeKind::Contains {
-                    stack.push(g.edges[e].to);
-                }
-            }
         }
     }
-
-    // 0-1 BFS over dependents: a dependency edge costs 1; climbing from a symbol to the
-    // file containing it costs 0 (code importing that file depends on the symbol).
     while let Some(cur) = queue.pop_front() {
         let d = dist[&cur];
-        let file = match g.nodes[cur].kind {
-            SymKind::File | SymKind::External => None,
-            _ => g.file_of(cur),
-        };
-        if let Some(f) = file
-            && dist.get(&f).is_none_or(|&old| old > d)
-        {
-            dist.insert(f, d);
-            next.insert(f, (cur, None));
-            queue.push_front(f);
-        }
         if d >= depth {
             continue;
         }
         for &e in &g.in_edges[cur] {
             let edge = &g.edges[e];
-            if !KINDS.contains(&edge.kind) || edge.confidence < min {
+            if !query::DEPENDENCY_KINDS.contains(&edge.kind) || edge.confidence < min {
                 continue;
             }
-            let from = edge.from;
-            if dist.get(&from).is_none_or(|&old| old > d + 1) {
-                dist.insert(from, d + 1);
-                next.insert(from, (cur, Some(e)));
-                queue.push_back(from);
+            if let std::collections::hash_map::Entry::Vacant(v) = dist.entry(edge.from) {
+                v.insert(d + 1);
+                next.insert(edge.from, (cur, e));
+                queue.push_back(edge.from);
             }
         }
     }
@@ -119,16 +109,14 @@ pub fn tests_for(g: &Graph, target: usize, depth: u32, limit: usize, min: Confid
         symbols: Vec<String>,
     }
     let mut by_file: BTreeMap<&str, Hit> = BTreeMap::new();
-    let target_tests = is_test_node(g, target);
+    let target_is_test = is_test_node(g, target);
     for (&n, &d) in &dist {
-        // The target's own tests (Rust `mod tests` in a target file) are seeds: direct.
-        if n == target
-            || !is_test_node(g, n)
-            || (target_tests && d > 0 && g.nodes[n].file == g.nodes[target].file)
-        {
+        if n == target || !is_test_node(g, n) {
             continue;
         }
-        if d == 0 && (target_tests || g.nodes[n].kind == SymKind::File) {
+        // Seeds are the target itself: count them only as a code target's own tests
+        // (Rust `mod tests` inside a target file), never a test target's own parts.
+        if d == 0 && (target_is_test || g.nodes[n].kind == SymKind::File) {
             continue;
         }
         let file = g.nodes[n].file.as_str();
@@ -138,10 +126,8 @@ pub fn tests_for(g: &Graph, target: usize, depth: u32, limit: usize, min: Confid
             symbols: Vec::new(),
         });
         // The closest node starts the path; at equal distance a symbol over its file.
-        let better = |a: usize, b: usize| {
-            (g.nodes[a].kind == SymKind::File, a) < (g.nodes[b].kind == SymKind::File, b)
-        };
-        if d < hit.distance || (d == hit.distance && better(n, hit.node)) {
+        let rank = |i: usize| (g.nodes[i].kind == SymKind::File, i);
+        if d < hit.distance || (d == hit.distance && rank(n) < rank(hit.node)) {
             hit.distance = d;
             hit.node = n;
         }
@@ -182,30 +168,19 @@ pub fn tests_for(g: &Graph, target: usize, depth: u32, limit: usize, min: Confid
     })
 }
 
-/// `test --calls--> helper --imports--> target`, following the recorded steps; a climb
-/// from a symbol to its file is written ` ⊂ file`.
-fn path_text(g: &Graph, start: usize, next: &HashMap<usize, Step>) -> String {
+/// `test --calls--> helper --imports--> target`, following the recorded steps (labelled
+/// with the confidence when not exact).
+fn path_text(g: &Graph, start: usize, next: &HashMap<usize, (usize, usize)>) -> String {
     let mut text = g.nodes[start].id.clone();
     let mut cur = start;
-    let mut guard = 0;
-    while let Some(&(to, edge)) = next.get(&cur) {
-        match edge {
-            Some(e) => {
-                let edge = &g.edges[e];
-                let kind = match edge.confidence.label() {
-                    Some(l) => format!("{} ({l})", edge.kind.as_str()),
-                    None => edge.kind.as_str().to_string(),
-                };
-                text.push_str(&format!(" --{kind}--> {}", g.nodes[to].id));
-            }
-            // Recorded on the file pointing at the symbol it was reached from.
-            None => text.push_str(&format!(" ⊃ {}", g.nodes[to].id)),
-        }
+    while let Some(&(to, e)) = next.get(&cur) {
+        let edge = &g.edges[e];
+        let kind = match edge.confidence.label() {
+            Some(l) => format!("{} ({l})", edge.kind.as_str()),
+            None => edge.kind.as_str().to_string(),
+        };
+        text.push_str(&format!(" --{kind}--> {}", g.nodes[to].id));
         cur = to;
-        guard += 1;
-        if guard > 64 {
-            break;
-        }
     }
     text
 }
@@ -227,6 +202,8 @@ mod tests {
             "store/store_test.go",
             "Tests/AppTests/ViewModelTests.swift",
             "Sources/App/ViewModelTests.swift",
+            "src/parser/tests.rs",
+            "app/tests.py",
         ] {
             assert!(is_test_file(p), "{p}");
         }
@@ -237,6 +214,10 @@ mod tests {
             "app/attestation.py",
             "store/store.go",
             "src/a.ts",
+            "tests/fixtures/poly/py/app/models.py",
+            "pkg/testdata/input.go",
+            "src/__mocks__/api.ts",
+            "tests/conftest.py",
         ] {
             assert!(!is_test_file(p), "{p}");
         }

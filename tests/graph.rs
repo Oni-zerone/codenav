@@ -1264,6 +1264,84 @@ fn tests_for_finds_direct_and_indirect_tests() {
     );
 }
 
+#[test]
+fn tests_for_review_cases() {
+    let repo = TempRepo::new(
+        "testsfor2",
+        &[
+            // Importing a file is not using every symbol in it.
+            (
+                "src/b.ts",
+                "export function b() {}\nexport function b2() {}\n".into(),
+            ),
+            (
+                "src/b2.test.ts",
+                "import { b2 } from './b';\ntest('b2', () => { b2(); });\n".into(),
+            ),
+            // Tests calling a helper in their own file.
+            (
+                "src/h.test.ts",
+                "function makeUser() { return 1; }\ntest('u', () => { makeUser(); });\n".into(),
+            ),
+            // A test calling through the interface the target implements.
+            (
+                "src/repo.ts",
+                "export interface Repo { fetchAll(): void; }\n".into(),
+            ),
+            (
+                "src/db.ts",
+                "import { Repo } from './repo';\nexport class Db implements Repo { fetchAll() {} }\n"
+                    .into(),
+            ),
+            (
+                "src/repo.test.ts",
+                "import { Repo } from './repo';\nexport function check(r: Repo) { r.fetchAll(); }\n"
+                    .into(),
+            ),
+            // Rust tests in their own file; fixtures are not tests.
+            (
+                "rs/parser.rs",
+                "pub fn parse() {}\n#[cfg(test)]\nmod tests;\n".into(),
+            ),
+            (
+                "rs/parser/tests.rs",
+                "use super::*;\n#[test]\nfn parses() { parse(); }\n".into(),
+            ),
+            (
+                "tests/fixtures/app.ts",
+                "import { b } from '../../src/b';\nb();\n".into(),
+            ),
+        ],
+    );
+    let tests_for = |id: &str| -> Value {
+        let (ok, text) = tool_text_in(&repo.0, "tests_for", json!({ "id": id, "format": "json" }));
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+    let v = tests_for("src/b.ts::b");
+    assert_eq!(
+        v["test_files"], 0,
+        "b2.test.ts only uses b2; fixtures are not tests: {v:#}"
+    );
+    assert_eq!(
+        tests_for("src/b.ts")["test_files"],
+        1,
+        "the file is imported"
+    );
+
+    let v = tests_for("src/h.test.ts::makeUser");
+    assert_eq!(v["direct"][0]["file"], "src/h.test.ts", "{v:#}");
+
+    let v = tests_for("src/db.ts::Db::fetchAll");
+    assert_eq!(
+        v["direct"][0]["file"], "src/repo.test.ts",
+        "through Repo::fetchAll: {v:#}"
+    );
+
+    let v = tests_for("rs/parser.rs::parse");
+    assert_eq!(v["direct"][0]["file"], "rs/parser/tests.rs", "{v:#}");
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
