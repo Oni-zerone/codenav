@@ -147,20 +147,20 @@ impl Server {
         self.refresh_if_stale();
         let g = &self.graph;
         match name {
-            "graph_overview" => Ok(query::overview(g, uint(a, "top", 15))),
+            "graph_overview" => Ok(query::overview(g, uint(a, "top", 15)?)),
             "module_graph" => Ok(query::module_graph(
                 g,
-                uint(a, "depth", 2).max(1),
-                uint(a, "min_weight", 1) as u32,
+                uint(a, "depth", 2)?.max(1),
+                uint(a, "min_weight", 1)? as u32,
             )),
             "explore" => {
-                let mode = match a.get("mode").and_then(Value::as_str).unwrap_or("bfs") {
+                let mode = match opt_str(a, "mode")?.unwrap_or("bfs").to_lowercase().as_str() {
                     "bfs" => explore::Mode::Bfs,
                     "dfs" => explore::Mode::Dfs,
                     m => return Err(anyhow!("mode must be bfs or dfs, got `{m}`")),
                 };
-                let direction = match a.get("direction").and_then(Value::as_str) {
-                    Some(d) => Direction::parse(d)
+                let direction = match opt_str(a, "direction")? {
+                    Some(d) => Direction::parse(&d.to_lowercase())
                         .ok_or_else(|| anyhow!("direction must be in/out/both"))?,
                     // DFS follows dependency chains forward by default.
                     None if mode == explore::Mode::Dfs => Direction::Out,
@@ -169,20 +169,20 @@ impl Server {
                 let kinds = edge_kinds(a)?;
                 let text = explore::explore(
                     g,
-                    a.get("question").and_then(Value::as_str).unwrap_or(""),
-                    &list(a, "seeds"),
+                    opt_str(a, "question")?.unwrap_or(""),
+                    &list(a, "seeds")?,
                     &explore::Options {
                         mode,
-                        depth: uint(a, "depth", 2).clamp(1, 6) as u32,
+                        depth: uint(a, "depth", 2)?.clamp(1, 6) as u32,
                         direction,
                         kinds: &kinds,
-                        token_budget: uint(a, "token_budget", 2000),
+                        token_budget: uint(a, "token_budget", 2000)?.clamp(100, 100_000),
                     },
                 )?;
                 Ok(Value::String(text))
             }
             "search_symbols" => {
-                let kinds = list(a, "kinds")
+                let kinds = list(a, "kinds")?
                     .iter()
                     .map(|k| SymKind::parse(k).ok_or_else(|| anyhow!("unknown kind `{k}`")))
                     .collect::<Result<Vec<_>>>()?;
@@ -191,7 +191,7 @@ impl Server {
                     a.get("query").and_then(Value::as_str).unwrap_or(""),
                     &kinds,
                     a.get("path").and_then(Value::as_str),
-                    uint(a, "limit", 20),
+                    uint(a, "limit", 20)?,
                 ))
             }
             "get_symbol" => {
@@ -217,8 +217,8 @@ impl Server {
                     i,
                     dir,
                     &edge_kinds(a)?,
-                    uint(a, "depth", 1).clamp(1, 5) as u32,
-                    uint(a, "limit", 60),
+                    uint(a, "depth", 1)?.clamp(1, 5) as u32,
+                    uint(a, "limit", 60)?,
                 ))
             }
             "find_paths" => {
@@ -230,8 +230,8 @@ impl Server {
                     to,
                     &edge_kinds(a)?,
                     a.get("directed").and_then(Value::as_bool).unwrap_or(false),
-                    uint(a, "max_depth", 6).clamp(1, 12) as u32,
-                    uint(a, "max_paths", 3).clamp(1, 20),
+                    uint(a, "max_depth", 6)?.clamp(1, 12) as u32,
+                    uint(a, "max_paths", 3)?.clamp(1, 20),
                 ))
             }
             "file_outline" => {
@@ -248,14 +248,14 @@ impl Server {
                 Ok(query::impact(
                     g,
                     i,
-                    uint(a, "depth", 3).clamp(1, 8) as u32,
-                    uint(a, "limit", 200),
+                    uint(a, "depth", 3)?.clamp(1, 8) as u32,
+                    uint(a, "limit", 200)?,
                 ))
             }
             "read_code" => {
                 let file = string(a, "file")?;
-                let start = uint(a, "start_line", 1) as u32;
-                let end = uint(a, "end_line", start as usize + 80) as u32;
+                let start = uint(a, "start_line", 1)? as u32;
+                let end = uint(a, "end_line", start as usize + 80)? as u32;
                 let path = self.root.join(&file).canonicalize()?;
                 anyhow::ensure!(
                     path.starts_with(self.root.canonicalize()?),
@@ -289,27 +289,54 @@ fn string(a: &Value, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing required argument `{key}`"))
 }
 
-fn uint(a: &Value, key: &str, default: usize) -> usize {
-    a.get(key)
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(default)
-}
-
-fn list(a: &Value, key: &str) -> Vec<String> {
+/// An optional non-negative integer argument; a wrong type is an error, not a default.
+fn uint(a: &Value, key: &str, default: usize) -> Result<usize> {
     match a.get(key) {
-        Some(Value::Array(v)) => v
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect(),
-        Some(Value::String(s)) => s.split(',').map(|s| s.trim().to_string()).collect(),
-        _ => Vec::new(),
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| anyhow!("argument `{key}` must be a non-negative integer, got {v}")),
     }
 }
 
+fn opt_str<'a>(a: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match a.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(v) => Err(anyhow!("argument `{key}` must be a string, got {v}")),
+    }
+}
+
+/// A list argument given as a JSON array of strings or a comma-separated string.
+/// Blank entries are dropped.
+fn list(a: &Value, key: &str) -> Result<Vec<String>> {
+    let items: Vec<String> = match a.get(key) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(v)) => v
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("argument `{key}` must contain strings, got {x}"))
+            })
+            .collect::<Result<_>>()?,
+        Some(Value::String(s)) => s.split(',').map(str::to_string).collect(),
+        Some(v) => {
+            return Err(anyhow!(
+                "argument `{key}` must be an array of strings, got {v}"
+            ));
+        }
+    };
+    Ok(items
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
 fn edge_kinds(a: &Value) -> Result<Vec<EdgeKind>> {
-    list(a, "edge_kinds")
+    list(a, "edge_kinds")?
         .iter()
         .map(|k| EdgeKind::parse(k).ok_or_else(|| anyhow!("unknown edge kind `{k}`")))
         .collect()
@@ -347,7 +374,7 @@ fn tool_definitions() -> Value {
                 "depth": { "type": "integer", "description": "1-6, default 2." },
                 "direction": { "type": "string", "enum": ["out", "in", "both"], "description": "Default both (bfs) / out (dfs)." },
                 "edge_kinds": edge_kinds.clone(),
-                "token_budget": { "type": "integer", "description": "Approximate max output tokens, default 2000." }
+                "token_budget": { "type": "integer", "description": "Approximate max output tokens, 100-100000, default 2000." }
             }, "required": ["question"] }
         },
         {

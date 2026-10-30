@@ -46,6 +46,9 @@ pub fn summary(g: &Graph, i: usize) -> Value {
 /// Accepts an exact id, a file path, a qualified suffix (`Graph::load`) or a bare name.
 pub fn resolve(g: &Graph, query: &str) -> Result<usize> {
     let query = query.trim();
+    if query.is_empty() {
+        bail!("empty node reference");
+    }
     if let Some(&i) = g.by_id.get(query).or(g.by_file.get(query)) {
         return Ok(i);
     }

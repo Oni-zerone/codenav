@@ -6,7 +6,7 @@
 //! 3. Nodes are rendered seeds first, then by distance and relevance, each with its
 //!    edges to other rendered nodes, and the text is cut to a token budget.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 
@@ -16,6 +16,13 @@ use crate::query::{self, Direction};
 const CHARS_PER_TOKEN: usize = 3;
 const MAX_SEEDS: usize = 8;
 const MAX_VISITED: usize = 3000;
+const MAX_TERMS: usize = 32;
+/// Edge lines listed under one node; the rest are summarized.
+const MAX_EDGES_PER_NODE: usize = 30;
+/// Room kept for the truncation notice.
+const NOTICE_RESERVE: usize = 260;
+/// Name substrings only count for terms at least this long (`get` ⊄ `budget`).
+const MIN_SUBSTRING_TERM: usize = 4;
 
 /// Words that carry no symbol information (English and Italian).
 const STOP_WORDS: &[&str] = &[
@@ -83,16 +90,35 @@ pub struct Options<'a> {
 
 pub fn explore(g: &Graph, question: &str, seeds: &[String], opts: &Options) -> Result<String> {
     let terms = query_terms(question);
-    let scores = score_nodes(g, &terms);
+    let scores = score_nodes(g, &symbol_terms(&terms));
 
-    let (seeds, notes) = if seeds.is_empty() {
-        (pick_seeds(g, question, &terms, &scores)?, Vec::new())
+    let seeds: Vec<&str> = seeds
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (seeds, mut notes) = if seeds.is_empty() {
+        pick_seeds(g, question, &terms, &scores)?
     } else {
-        explicit_seeds(g, seeds)?
+        explicit_seeds(g, &seeds)?
     };
 
     let visited = traverse(g, &seeds, opts);
+    if visited.capped {
+        notes.push(format!(
+            "traversal stopped at {MAX_VISITED} nodes; reduce depth or restrict edge_kinds/direction"
+        ));
+    }
     Ok(render(g, question, &seeds, &visited, &scores, &notes, opts))
+}
+
+/// Terms that can name a symbol: relation words describe the question, not a target.
+fn symbol_terms(terms: &[String]) -> Vec<String> {
+    terms
+        .iter()
+        .filter(|t| !RELATION_WORDS.contains(&t.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Lowercase terms of the question, without stop words.
@@ -104,6 +130,9 @@ fn query_terms(question: &str) -> Vec<String> {
             continue;
         }
         out.push(w);
+        if out.len() == MAX_TERMS {
+            break;
+        }
     }
     out
 }
@@ -134,12 +163,18 @@ fn name_tokens(name: &str) -> Vec<String> {
     tokens
 }
 
-/// How strongly a term matches a node: by name token, name substring, id/path or doc.
+/// Weight from which a match is on the symbol name itself.
+const NAME_MATCH: f64 = 2.0;
+
+/// How strongly a term matches a node: exact name, name token, name substring,
+/// id/path or doc.
 fn term_weight(term: &str, name: &str, tokens: &[String], id: &str, doc: &str) -> f64 {
-    if name == term || tokens.iter().any(|t| t == term) {
+    if name == term {
+        4.0
+    } else if tokens.iter().any(|t| t == term) {
         3.0
-    } else if name.contains(term) {
-        2.0
+    } else if term.chars().count() >= MIN_SUBSTRING_TERM && name.contains(term) {
+        NAME_MATCH
     } else if id.contains(term) {
         1.0
     } else if doc.contains(term) {
@@ -152,17 +187,28 @@ fn term_weight(term: &str, name: &str, tokens: &[String], id: &str, doc: &str) -
 /// Relevance of every node to the question; per-term weights are kept for seed picking.
 struct Scores {
     total: Vec<f64>,
-    /// (term, best node for that term, unless the term only matches very weakly)
-    best_by_term: Vec<(String, Option<usize>)>,
+    /// Some term matches the node's name (not just its path or doc).
+    name_match: Vec<bool>,
+    /// Best name match for each term, if any.
+    best_by_term: Vec<Option<usize>>,
 }
 
 fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
     let n = g.nodes.len();
     let mut total = vec![0.0; n];
+    let mut name_match = vec![false; n];
     let mut per_term: Vec<Vec<f64>> = vec![vec![0.0; n]; terms.len()];
     for (i, node) in g.nodes.iter().enumerate() {
-        let name = node.name.to_lowercase();
-        let tokens = name_tokens(&node.name);
+        // A file is named by its stem: `api.ts` must not match the term `ts`.
+        let display = if node.kind == SymKind::File {
+            node.name
+                .rsplit_once('.')
+                .map_or(node.name.as_str(), |(stem, _)| stem)
+        } else {
+            node.name.as_str()
+        };
+        let name = display.to_lowercase();
+        let tokens = name_tokens(display);
         let id = node.id.to_lowercase();
         let doc = node.doc.as_deref().unwrap_or("").to_lowercase();
         for (t, term) in terms.iter().enumerate() {
@@ -170,34 +216,37 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
         }
     }
     let mut best_by_term = Vec::new();
-    for (t, term) in terms.iter().enumerate() {
-        let df = per_term[t].iter().filter(|&&w| w > 0.0).count();
+    for weights in &per_term {
+        let df = weights.iter().filter(|&&w| w > 0.0).count();
         if df == 0 {
-            best_by_term.push((term.clone(), None));
+            best_by_term.push(None);
             continue;
         }
         let idf = ((n as f64 + 1.0) / (df as f64 + 1.0)).ln() + 1.0;
         let mut best: Option<(f64, usize)> = None;
         for i in 0..n {
-            let w = per_term[t][i];
+            let w = weights[i];
             if w == 0.0 {
                 continue;
             }
             total[i] += w * idf;
+            if w < NAME_MATCH {
+                continue;
+            }
+            name_match[i] = true;
             let key = w * kind_factor(g.nodes[i].kind) + g.degree(i).min(100) as f64 * 1e-4;
             if best.is_none_or(|(b, _)| key > b) {
                 best = Some((key, i));
             }
         }
-        // A doc-only hit is too weak to anchor a traversal on its own.
-        let best = best.filter(|&(k, _)| k >= 1.0).map(|(_, i)| i);
-        best_by_term.push((term.clone(), best));
+        best_by_term.push(best.map(|(_, i)| i));
     }
     for (i, s) in total.iter_mut().enumerate() {
         *s *= kind_factor(g.nodes[i].kind);
     }
     Scores {
         total,
+        name_match,
         best_by_term,
     }
 }
@@ -211,61 +260,89 @@ fn kind_factor(kind: SymKind) -> f64 {
     }
 }
 
-fn pick_seeds(g: &Graph, question: &str, terms: &[String], scores: &Scores) -> Result<Vec<usize>> {
-    // A question that is exactly the name of several nodes is a lookup, not a search.
-    let q = question.trim();
+fn pick_seeds(
+    g: &Graph,
+    question: &str,
+    terms: &[String],
+    scores: &Scores,
+) -> Result<(Vec<usize>, Vec<String>)> {
+    // A one-word question naming a node exactly is a lookup, not a search.
+    let q = question
+        .trim()
+        .trim_matches(|c: char| !(c.is_alphanumeric() || "_:./".contains(c)));
     if !q.is_empty() && !q.contains(char::is_whitespace) {
-        if let Ok(i) = query::resolve(g, q) {
-            return Ok(vec![i]);
+        if let Some(&i) = g.by_id.get(q).or(g.by_file.get(q)) {
+            return Ok((vec![i], Vec::new()));
         }
         let exact = g.by_name.get(&q.to_lowercase()).map_or(0, Vec::len);
+        if (exact == 1 || (exact == 0 && q.contains("::")))
+            && let Ok(i) = query::resolve(g, q)
+        {
+            return Ok((vec![i], Vec::new()));
+        }
         if exact > 1 {
-            query::resolve(g, q)?; // returns the ambiguity error with candidate ids
+            query::resolve(g, q).map_err(|e| {
+                anyhow::anyhow!(
+                    "{e}\nPass the right one in `seeds`, or ask a more specific question."
+                )
+            })?;
         }
     }
 
+    if symbol_terms(terms).is_empty() {
+        bail!(
+            "the question has no term naming code ({terms:?}); mention a symbol, file or concept, \
+             or pass explicit seeds"
+        );
+    }
     let mut ranked: Vec<usize> = (0..g.nodes.len())
         .filter(|&i| scores.total[i] > 0.0)
         .collect();
+    if ranked.is_empty() {
+        bail!(
+            "no node matches the question terms {terms:?}; try search_symbols or pass explicit seeds"
+        );
+    }
     ranked.sort_by(|&a, &b| {
         scores.total[b]
             .total_cmp(&scores.total[a])
             .then(g.degree(b).cmp(&g.degree(a)))
             .then(a.cmp(&b))
     });
-    let Some(&top) = ranked.first() else {
-        bail!(
-            "no node matches the question terms {terms:?}; try search_symbols or pass explicit seeds"
-        );
-    };
 
-    // Everything close to the best score, then make sure every symbol-like term
-    // is represented by its best match.
-    let mut seeds: Vec<usize> = ranked
+    // Seeds must match on their name; path or doc text alone is only a fallback.
+    let mut notes = Vec::new();
+    let anchored: Vec<usize> = ranked
         .iter()
         .copied()
-        .take_while(|&i| scores.total[i] >= scores.total[top] * 0.6)
+        .filter(|&i| scores.name_match[i])
+        .collect();
+    let pool = if anchored.is_empty() {
+        notes.push("no symbol name matches the question; seeds come from paths/docs".to_string());
+        &ranked
+    } else {
+        &anchored
+    };
+    let top = scores.total[pool[0]];
+    let mut seeds: Vec<usize> = pool
+        .iter()
+        .copied()
+        .take_while(|&i| scores.total[i] >= top * 0.6)
         .take(MAX_SEEDS / 2)
         .collect();
-    let only_relation_words = terms.iter().all(|t| RELATION_WORDS.contains(&t.as_str()));
-    for (term, best) in &scores.best_by_term {
-        if !only_relation_words && RELATION_WORDS.contains(&term.as_str()) {
-            continue;
-        }
-        if let Some(b) = *best
-            && !seeds.contains(&b)
-            && seeds.len() < MAX_SEEDS
-        {
-            seeds.push(b);
+    // Make sure every term naming something is represented by its best match.
+    for &best in scores.best_by_term.iter().flatten() {
+        if !seeds.contains(&best) && seeds.len() < MAX_SEEDS {
+            seeds.push(best);
         }
     }
-    Ok(seeds)
+    Ok((seeds, notes))
 }
 
-fn explicit_seeds(g: &Graph, values: &[String]) -> Result<(Vec<usize>, Vec<String>)> {
+fn explicit_seeds(g: &Graph, values: &[&str]) -> Result<(Vec<usize>, Vec<String>)> {
     let mut seeds = Vec::new();
     let mut notes = Vec::new();
-    for v in values {
+    for &v in values {
         match query::resolve(g, v) {
             Ok(i) if !seeds.contains(&i) => seeds.push(i),
             Ok(_) => {}
@@ -289,12 +366,15 @@ fn first_line(s: &str) -> &str {
 struct Visited {
     order: Vec<usize>,
     dist: HashMap<usize, u32>,
+    /// Stopped at `MAX_VISITED`.
+    capped: bool,
 }
 
 fn traverse(g: &Graph, seeds: &[usize], opts: &Options) -> Visited {
     let mut v = Visited {
         order: Vec::new(),
         dist: HashMap::new(),
+        capped: false,
     };
     for &s in seeds {
         if v.dist.insert(s, 0).is_none() {
@@ -320,7 +400,8 @@ fn traverse(g: &Graph, seeds: &[usize], opts: &Options) -> Visited {
                     continue;
                 }
                 for next in steps(cur) {
-                    if v.order.len() >= MAX_VISITED {
+                    if v.order.len() >= MAX_VISITED && !v.dist.contains_key(&next) {
+                        v.capped = true;
                         return v;
                     }
                     if let std::collections::hash_map::Entry::Vacant(e) = v.dist.entry(next) {
@@ -332,24 +413,26 @@ fn traverse(g: &Graph, seeds: &[usize], opts: &Options) -> Visited {
             }
         }
         Mode::Dfs => {
+            // Depth-first order, but a node reached later through a shorter path gets
+            // its distance lowered and is expanded again, so every node within
+            // `depth` is found with its true distance.
             for &s in seeds {
                 let mut stack = vec![(s, 0u32)];
-                let mut on_path: HashSet<usize> = HashSet::new();
                 while let Some((cur, d)) = stack.pop() {
-                    on_path.insert(cur);
+                    if d > v.dist[&cur] {
+                        continue; // stale entry, a shorter path was found meanwhile
+                    }
                     if d >= opts.depth || !expandable(cur, d) {
                         continue;
                     }
                     let mut nexts = steps(cur);
                     nexts.reverse(); // keep edge order when popping
                     for next in nexts {
-                        if v.order.len() >= MAX_VISITED {
+                        let known = v.dist.get(&next).copied();
+                        if known.is_none() && v.order.len() >= MAX_VISITED {
+                            v.capped = true;
                             return v;
                         }
-                        if on_path.contains(&next) {
-                            continue;
-                        }
-                        let known = v.dist.get(&next).copied();
                         if known.is_none_or(|k| k > d + 1) {
                             if known.is_none() {
                                 v.order.push(next);
@@ -389,9 +472,14 @@ fn render(
     let rank: HashMap<usize, usize> = order.iter().enumerate().map(|(r, &n)| (n, r)).collect();
 
     // Each edge between rendered nodes is listed once, under its higher-ranked endpoint.
-    let mut blocks = Vec::with_capacity(order.len());
+    let mut blocks: Vec<Vec<String>> = Vec::with_capacity(order.len());
     for &n in &order {
-        let mut block = node_line(g, n, visited.dist[&n], seed_rank.contains_key(&n));
+        let mut block = vec![node_line(
+            g,
+            n,
+            visited.dist[&n],
+            seed_rank.contains_key(&n),
+        )];
         let mut edges: Vec<(usize, String)> = Vec::new();
         for (other, e, forward) in query::steps(g, n, Direction::Both, opts.kinds) {
             let Some(&r) = rank.get(&other) else { continue };
@@ -413,9 +501,13 @@ fn render(
             edges.push((r, line));
         }
         edges.sort();
-        for (_, line) in edges {
-            block.push('\n');
-            block.push_str(&line);
+        let total = edges.len();
+        block.extend(edges.into_iter().take(MAX_EDGES_PER_NODE).map(|(_, l)| l));
+        if total > MAX_EDGES_PER_NODE {
+            block.push(format!(
+                "    … and {} more edges (use get_neighbors on this node)",
+                total - MAX_EDGES_PER_NODE
+            ));
         }
         blocks.push(block);
     }
@@ -425,8 +517,12 @@ fn render(
         Mode::Dfs => "DFS",
     };
     let seed_ids: Vec<&str> = seeds.iter().map(|&s| g.nodes[s].id.as_str()).collect();
+    let mut shown_question: String = question.chars().take(200).collect();
+    if shown_question.len() < question.len() {
+        shown_question.push('…');
+    }
     let mut header = format!(
-        "Question: {question}\nTraversal: {mode} depth={} | {} nodes | seeds: {}",
+        "Question: {shown_question}\nTraversal: {mode} depth={} | {} nodes | seeds: {}",
         opts.depth,
         order.len(),
         seed_ids.join(", ")
@@ -435,8 +531,11 @@ fn render(
         let kinds: Vec<&str> = opts.kinds.iter().map(|k| k.as_str()).collect();
         header.push_str(&format!(" | edges: {}", kinds.join(",")));
     }
-    for note in notes {
+    for note in notes.iter().take(5) {
         header.push_str(&format!("\nNote: {note}"));
+    }
+    if notes.len() > 5 {
+        header.push_str(&format!("\nNote: … and {} more notes", notes.len() - 5));
     }
     cut_to_budget(&header, &blocks, opts.token_budget)
 }
@@ -461,33 +560,64 @@ fn node_line(g: &Graph, n: usize, dist: u32, seed: bool) -> String {
     line
 }
 
-/// Keeps whole node blocks within the budget and announces any cut at the top.
-fn cut_to_budget(header: &str, blocks: &[String], token_budget: usize) -> String {
-    let budget = token_budget.max(100) * CHARS_PER_TOKEN;
-    let full: usize = header.len() + blocks.iter().map(|b| b.len() + 2).sum::<usize>();
+/// Keeps whole node blocks within the budget, cutting the last one line by line,
+/// and announces any cut at the top.
+fn cut_to_budget(header: &str, blocks: &[Vec<String>], token_budget: usize) -> String {
+    let budget = token_budget
+        .saturating_mul(CHARS_PER_TOKEN)
+        .saturating_sub(NOTICE_RESERVE)
+        .max(header.len());
+    let block_len = |b: &[String]| b.iter().map(|l| l.len() + 1).sum::<usize>() + 1;
+    let full = header.len() + blocks.iter().map(|b| block_len(b)).sum::<usize>();
+
+    let mut body = String::new();
     let mut used = header.len();
-    let mut kept = 0;
+    let mut whole = 0;
+    let mut partial = false;
     for b in blocks {
-        if used + b.len() + 2 > budget && kept > 0 {
-            break;
+        let len = block_len(b);
+        if used + len <= budget {
+            for (i, line) in b.iter().enumerate() {
+                body.push_str(if i == 0 { "\n\n" } else { "\n" });
+                body.push_str(line);
+            }
+            used += len;
+            whole += 1;
+            continue;
         }
-        used += b.len() + 2;
-        kept += 1;
+        // Fit what we can of this block, so a single huge node cannot blow the budget.
+        let mut lines = 0;
+        for line in b {
+            if used + line.len() + 2 > budget {
+                break;
+            }
+            body.push_str(if lines == 0 { "\n\n" } else { "\n" });
+            body.push_str(line);
+            used += line.len() + 1;
+            lines += 1;
+        }
+        if lines > 0 {
+            body.push_str(&format!("\n    … {} more lines cut", b.len() - lines));
+            partial = true;
+        }
+        break;
     }
-    let mut out = String::with_capacity(used + 200);
+
+    let mut out = String::with_capacity(used + NOTICE_RESERVE);
     out.push_str(header);
-    if kept < blocks.len() {
+    if whole < blocks.len() {
+        let shown = if partial {
+            format!("{whole} of {} nodes in full, 1 partially", blocks.len())
+        } else {
+            format!("{whole} of {} nodes", blocks.len())
+        };
         out.push_str(&format!(
-            "\n[!] TRUNCATED: showing {kept} of {} nodes (~{token_budget}-token budget). \
-             Use token_budget={} to see all, or narrow with edge_kinds, depth or seeds.",
-            blocks.len(),
-            full.div_ceil(CHARS_PER_TOKEN) + 50
+            "\n[!] TRUNCATED: showing {shown} (~{token_budget}-token budget). \
+             token_budget={} would show all; or narrow with edge_kinds, depth or seeds.",
+            (full + NOTICE_RESERVE).div_ceil(CHARS_PER_TOKEN)
         ));
     }
-    for b in &blocks[..kept] {
-        out.push_str("\n\n");
-        out.push_str(b);
-    }
+    out.push_str(&body);
     out
 }
 
@@ -512,16 +642,42 @@ mod tests {
 
     #[test]
     fn budget_cut_keeps_whole_blocks() {
-        let blocks: Vec<String> = (0..50)
-            .map(|i| format!("node {i} {}", "x".repeat(40)))
+        let blocks: Vec<Vec<String>> = (0..50)
+            .map(|i| vec![format!("node {i} {}", "x".repeat(40))])
             .collect();
         let out = cut_to_budget("H", &blocks, 100);
         assert!(out.contains("[!] TRUNCATED"));
-        assert!(out.len() < 100 * CHARS_PER_TOKEN + 300);
+        assert!(out.len() <= 100 * CHARS_PER_TOKEN, "{}", out.len());
         assert!(
             out.lines()
                 .filter(|l| l.starts_with("node"))
                 .all(|l| l.ends_with('x'))
+        );
+    }
+
+    #[test]
+    fn budget_holds_for_one_huge_block() {
+        let mut block = vec!["hub".to_string()];
+        block.extend((0..1500).map(|i| format!("    called_by ← caller_{i}")));
+        let out = cut_to_budget("H", &[block], 100);
+        assert!(out.len() <= 100 * CHARS_PER_TOKEN, "{}", out.len());
+        assert!(
+            out.contains("1 partially") && out.contains("more lines cut"),
+            "{out}"
+        );
+        assert!(!cut_to_budget("H", &[vec!["a".into()]], usize::MAX).contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn exact_name_beats_token_and_short_substrings_do_not_match() {
+        let toks = name_tokens("resolve_imports");
+        assert!(
+            term_weight("resolve", "resolve", &["resolve".into()], "", "")
+                > term_weight("resolve", "resolve_imports", &toks, "", "")
+        );
+        assert_eq!(
+            term_weight("get", "budget", &["budget".into()], "", ""),
+            0.0
         );
     }
 }
