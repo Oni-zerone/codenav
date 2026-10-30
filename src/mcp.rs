@@ -774,7 +774,7 @@ fn base_tool_definitions() -> Value {
         },
         {
             "name": "search_symbols",
-            "description": "Find files, symbols or external packages by name, qualified id fragment or doc text. Returns node ids for the other tools; each result says how it matched (exact, prefix, fragment, doc), and a note warns when no symbol has the name searched.",
+            "description": "Find files, symbols or external packages by name, qualified id fragment or doc text. Returns node ids for the other tools; each result says how it matched (exact: the name or the full/qualified id or path; prefix; fragment of the name; id: only the qualified id or path; doc), and a note warns when no symbol has the name searched.",
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": "Name or fragment, e.g. `UserService`, `auth login`, `Graph::load`." },
                 "kinds": { "type": "array", "items": { "type": "string", "enum": ["file", "external", "module", "class", "struct", "enum", "interface", "type", "function", "method", "constant", "macro"] } },

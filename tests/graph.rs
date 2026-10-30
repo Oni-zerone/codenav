@@ -1556,6 +1556,32 @@ fn search_says_how_results_match() {
     let v = search("lann");
     assert_eq!(v["results"][0]["match"], "fragment", "{v:#}");
 
+    // Qualified ids and paths are exact when they name a node.
+    let v = search("m.py::plan");
+    assert!(v.get("note").is_none(), "{v:#}");
+    assert_eq!(v["results"][0]["id"], "m.py::plan");
+    assert_eq!(v["results"][0]["match"], "exact");
+    assert_eq!(search("m.py")["results"][0]["match"], "exact");
+    // A match only through the file path is labelled as such.
+    let v = search("m");
+    assert!(
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["match"] == "id"),
+        "{v:#}"
+    );
+    // The symbol exists, but the filters leave it out.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "search_symbols",
+        json!({ "query": "plan", "kinds": ["class"], "format": "json" }),
+    );
+    assert!(
+        ok && text.contains("matches the kinds/path filters"),
+        "{text}"
+    );
     let v = search("nothing_like_this");
     assert!(v["note"].as_str().unwrap().ends_with("no matches"), "{v:#}");
     // Several words are not a name: no note.
