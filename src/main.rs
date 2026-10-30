@@ -171,7 +171,7 @@ fn load_or_index(
         index_options(root, requested)
     } else {
         match Graph::load(root) {
-            Ok(g) => {
+            Ok(mut g) => {
                 let opts = IndexOptions {
                     hub_percentile: requested.unwrap_or(g.hub_percentile),
                 };
@@ -183,6 +183,12 @@ fn load_or_index(
                 } else if indexer::is_stale(root, &g) {
                     eprintln!("codenav: index is stale, re-indexing…");
                 } else {
+                    // Same code, maybe a new commit: keep the graph, update its Git state.
+                    if vcs::refresh_state(&mut g, root)
+                        && let Err(e) = g.save(root)
+                    {
+                        eprintln!("codenav: could not save index: {e:#}");
+                    }
                     return Ok((g, opts));
                 }
                 opts

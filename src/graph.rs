@@ -258,6 +258,9 @@ pub struct Graph {
     pub root: String,
     /// Unix timestamp (seconds) of the indexing run.
     pub indexed_at: u64,
+    /// The same in milliseconds (0 in older indexes), for precise staleness checks.
+    #[serde(default)]
+    pub indexed_at_ms: u64,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     /// Structural communities, largest first (see `communities`).

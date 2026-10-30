@@ -135,6 +135,10 @@ impl Server {
             if let Err(e) = self.reindex() {
                 eprintln!("codenav: re-index failed: {e:#}");
             }
+        } else if vcs::refresh_state(&mut self.graph, &self.root)
+            && let Err(e) = self.graph.save(&self.root)
+        {
+            eprintln!("codenav: could not save index: {e:#}");
         }
     }
 
@@ -183,7 +187,8 @@ impl Server {
         match name {
             "graph_overview" => {
                 let mut v = query::overview(g, uint(a, "top", 15)?);
-                v["index"] = vcs::index_state(g, &self.root);
+                // With auto-refresh, stale sources are re-indexed on their own.
+                v["index"] = vcs::index_state(g, &self.root, !self.auto_refresh);
                 Ok(v)
             }
             "get_community" => {

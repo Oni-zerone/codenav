@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::graph::Graph;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
     pub commit: String,
@@ -12,8 +14,25 @@ pub struct Head {
     pub branch: Option<String>,
 }
 
-/// The `.git` directory of the repository containing `root` (a worktree's or
-/// submodule's `.git` file points to it), and its common directory (shared refs).
+/// A `git` command in `root` that never takes optional locks (`.git/index.lock`), so it
+/// cannot make the user's own git commands fail; None when git is missing or fails.
+fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// The `.git` directory of the repository `root` belongs to (a worktree's or submodule's
+/// `.git` file points to it), and its common directory (shared refs). A repository found
+/// in a parent directory counts only if it tracks files under `root`: an unversioned
+/// folder inside, say, a dotfiles repository is not part of it.
 fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut dir = Some(root);
     while let Some(d) = dir {
@@ -28,6 +47,9 @@ fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
             None
         };
         if let Some(git_dir) = git_dir {
+            if d != root && git(root, &["ls-files", "--error-unmatch", "--", "."]).is_none() {
+                return None;
+            }
             let common = fs::read_to_string(git_dir.join("commondir"))
                 .map(|c| git_dir.join(c.trim()))
                 .unwrap_or_else(|_| git_dir.clone());
@@ -42,6 +64,11 @@ fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
 /// branch with no commits yet).
 pub fn head(root: &Path) -> Option<Head> {
     let (git_dir, common) = git_dirs(root)?;
+    head_from_files(&git_dir, &common).or_else(|| head_from_git(root))
+}
+
+/// HEAD from `.git` files: loose and packed refs, detached HEAD.
+fn head_from_files(git_dir: &Path, common: &Path) -> Option<Head> {
     let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
@@ -50,12 +77,12 @@ pub fn head(root: &Path) -> Option<Head> {
             branch: None,
         });
     };
-    let commit = [&git_dir, &common]
+    let commit = [git_dir, common]
         .iter()
         .find_map(|d| fs::read_to_string(d.join(reference)).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| is_sha(s))
-        .or_else(|| packed_ref(&common, reference))?;
+        .or_else(|| packed_ref(common, reference))?;
     Some(Head {
         commit,
         branch: Some(
@@ -65,6 +92,16 @@ pub fn head(root: &Path) -> Option<Head> {
                 .to_string(),
         ),
     })
+}
+
+/// HEAD through the git command, for layouts the files don't cover (e.g. reftable).
+fn head_from_git(root: &Path) -> Option<Head> {
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).trim().to_string();
+    let commit = text(git(root, &["rev-parse", "--verify", "-q", "HEAD"])?);
+    let branch = git(root, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .map(text)
+        .filter(|b| !b.is_empty());
+    is_sha(&commit).then_some(Head { commit, branch })
 }
 
 fn packed_ref(common: &Path, reference: &str) -> Option<String> {
@@ -79,24 +116,67 @@ fn is_sha(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Whether tracked files under `root` have uncommitted (staged or unstaged) changes, via
-/// `git status`; None when Git is not installed or `root` is not in a repository.
-pub fn has_uncommitted_changes(root: &Path) -> Option<bool> {
-    git_dirs(root)?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain", "--untracked-files=no", "--", "."])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    out.status.success().then_some(!out.stdout.is_empty())
+/// Whether the indexed code under `root` differs from HEAD: changes to tracked files
+/// (staged or not), or untracked files the index includes. None without git.
+fn uncommitted_changes(root: &Path, indexed: &dyn Fn(&str) -> bool) -> Option<bool> {
+    let tracked = git(
+        root,
+        &["status", "--porcelain", "--untracked-files=no", "--", "."],
+    )?;
+    if !tracked.is_empty() {
+        return Some(true);
+    }
+    // Paths relative to `root`, like the graph's.
+    let untracked = git(
+        root,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+        ],
+    )?;
+    Some(
+        untracked
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .any(|p| indexed(&String::from_utf8_lossy(p))),
+    )
 }
 
-/// When and from which repository state the graph was built, with warnings when it no
-/// longer matches: HEAD moved, or source files changed since.
-pub fn index_state(g: &crate::graph::Graph, root: &Path) -> serde_json::Value {
+/// Records in `g` the repository state for the code it was built from: HEAD and whether
+/// that code had uncommitted changes. Outside a Git repository the fields are cleared.
+pub fn record_state(g: &mut Graph, root: &Path) {
+    let head = head(root);
+    let dirty = head
+        .is_some()
+        .then(|| uncommitted_changes(root, &|p| g.by_file.contains_key(p)))
+        .flatten();
+    g.git_commit = head.as_ref().map(|h| h.commit.clone());
+    g.git_branch = head.and_then(|h| h.branch);
+    g.git_dirty = dirty;
+}
+
+/// When only the repository state moved (a commit, checkout of the same files, reset
+/// --soft) the graph still matches the code: update its Git fields instead of re-indexing.
+/// Returns whether they changed (so the caller can save the graph).
+pub fn refresh_state(g: &mut Graph, root: &Path) -> bool {
+    let now = head(root);
+    let unchanged = now.as_ref().map(|h| &h.commit) == g.git_commit.as_ref()
+        && now.as_ref().and_then(|h| h.branch.as_ref()) == g.git_branch.as_ref();
+    if unchanged {
+        return false;
+    }
+    record_state(g, root);
+    true
+}
+
+/// When and from which repository state the graph was built. `check_sources` also
+/// looks for source files changed since (a full walk: callers that re-index on their own
+/// skip it), warning that a re-index is needed.
+pub fn index_state(g: &Graph, root: &Path, check_sources: bool) -> serde_json::Value {
     use serde_json::json;
     let mut v = json!({ "built_at_unix": g.indexed_at });
     if let Some(c) = &g.git_commit {
@@ -121,12 +201,8 @@ pub fn index_state(g: &crate::graph::Graph, root: &Path) -> serde_json::Value {
             short(built)
         ));
     }
-    if crate::indexer::is_stale(root, g) {
-        warnings.push(
-            "source files changed since indexing: `serve` re-indexes automatically within \
-             seconds, or call reindex"
-                .to_string(),
-        );
+    if check_sources && crate::indexer::is_stale(root, g) {
+        warnings.push("source files changed since indexing: call reindex".to_string());
     }
     if !warnings.is_empty() {
         v["warnings"] = json!(warnings);
@@ -176,10 +252,10 @@ mod tests {
             commit: A.into(),
             branch: Some("main".into()),
         };
-        assert_eq!(head(&d.0), Some(main.clone()));
-        // From a subdirectory of the repository too.
+        assert_eq!(head(&d.0), Some(main));
+        // A subdirectory only belongs to it with tracked files (none in this fake repo).
         d.write("src/x.rs", "");
-        assert_eq!(head(&d.0.join("src")), Some(main));
+        assert_eq!(head(&d.0.join("src")), None);
 
         d.write(".git/HEAD", "ref: refs/heads/feature/x\n");
         d.write(
@@ -202,6 +278,25 @@ mod tests {
                 branch: None
             })
         );
+    }
+
+    #[test]
+    fn warns_when_head_moved_since_indexing() {
+        let d = Dir::new("warn");
+        d.write(".git/HEAD", "ref: refs/heads/main\n");
+        d.write(".git/refs/heads/main", &format!("{B}\n"));
+        let mut g = Graph::new(&d.0);
+        g.git_commit = Some(A.into());
+        g.git_branch = Some("main".into());
+        let v = index_state(&g, &d.0, false);
+        assert_eq!(
+            v["warnings"],
+            serde_json::json!([
+                "HEAD is now 222222222222 (main) but the graph was built at 111111111111: it may not match the code"
+            ])
+        );
+        g.git_commit = Some(B.into());
+        assert!(index_state(&g, &d.0, false).get("warnings").is_none());
     }
 
     #[test]
