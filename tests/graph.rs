@@ -1774,6 +1774,47 @@ fn text_and_json_formats() {
     );
 }
 
+#[test]
+fn tool_takes_the_path_positionally_or_as_a_flag() {
+    let run = |args: &[&std::ffi::OsStr]| -> (bool, String) {
+        let out = codenav().arg("tool").args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(if out.status.success() {
+                &out.stdout
+            } else {
+                &out.stderr
+            })
+            .into_owned(),
+        )
+    };
+    let f = fixture().as_os_str();
+    let positional = run(&["graph_overview".as_ref(), "{}".as_ref(), f]);
+    let flag = run(&[
+        "graph_overview".as_ref(),
+        "{}".as_ref(),
+        "--path".as_ref(),
+        f,
+    ]);
+    let flag_first = run(&["graph_overview".as_ref(), "--path".as_ref(), f]);
+    assert!(positional.0, "{}", positional.1);
+    assert_eq!(positional, flag);
+    assert_eq!(positional, flag_first);
+    // Both at once is ambiguous.
+    let both = run(&[
+        "graph_overview".as_ref(),
+        "{}".as_ref(),
+        f,
+        "--path".as_ref(),
+        f,
+    ]);
+    assert!(
+        !both.0 && both.1.contains("cannot be used with"),
+        "{}",
+        both.1
+    );
+}
+
 /// Sends JSON-RPC requests to `codenav serve` on the fixture and returns the responses.
 fn mcp_session(requests: &[Value]) -> Vec<Value> {
     let mut child = codenav()

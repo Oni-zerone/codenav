@@ -78,7 +78,7 @@ cargo install --path .
 ```sh
 codenav index [PATH]              # crea/aggiorna PATH/.codenav/graph.cnav
 codenav serve [PATH]              # server MCP su stdio
-codenav tool <nome> '<json>'      # invoca un tool MCP da terminale (debug)
+codenav tool <nome> '<json>' [PATH]  # invoca un tool MCP da terminale (anche --path PATH)
 codenav ast <file>                # albero tree-sitter (per scrivere nuove query)
 ```
 

@@ -58,8 +58,12 @@ enum Command {
         /// Tool arguments as a JSON object.
         #[arg(default_value = "{}")]
         args: String,
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
+        /// Repository (default: current directory), as for `index` and `serve`.
+        #[arg(conflicts_with = "path_flag")]
+        path: Option<PathBuf>,
+        /// Same as the positional PATH (kept for compatibility).
+        #[arg(long = "path", value_name = "PATH", id = "path_flag")]
+        path_flag: Option<PathBuf>,
     },
     /// Print the tree-sitter syntax tree of a file (useful to write extraction queries).
     Ast { file: PathBuf },
@@ -130,7 +134,13 @@ fn main() -> Result<()> {
             let (graph, opts) = load_or_index(&root, fresh, opts.hub_percentile)?;
             mcp::Server::new(root, graph, !no_refresh, opts).run()?;
         }
-        Command::Tool { name, args, path } => {
+        Command::Tool {
+            name,
+            args,
+            path,
+            path_flag,
+        } => {
+            let path = path.or(path_flag).unwrap_or_else(|| PathBuf::from("."));
             let root = canonical_root(&path)?;
             let (graph, opts) = load_or_index(&root, false, None)?;
             let args: serde_json::Value =
