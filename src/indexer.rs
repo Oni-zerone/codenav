@@ -16,6 +16,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{Match as IgnoreMatch, WalkBuilder};
 use rayon::prelude::*;
 
+use crate::communities;
 use crate::extract::{self, FileFacts, RefKind};
 use crate::graph::{Edge, EdgeKind, Graph, INDEX_DIR, Node, SymKind};
 use crate::lang::Lang;
@@ -101,6 +102,7 @@ pub struct IndexStats {
     pub files: usize,
     pub symbols: usize,
     pub edges: usize,
+    pub communities: usize,
     pub errors: Vec<String>,
     pub elapsed: Duration,
     pub by_lang: HashMap<Lang, usize>,
@@ -223,7 +225,27 @@ pub fn is_stale(root: &Path, graph: &Graph) -> bool {
     })
 }
 
+/// Indexing settings that are not read from the repository itself.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexOptions {
+    /// Dependency-degree percentile above which a node is a hub for community detection.
+    pub hub_percentile: f64,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        IndexOptions {
+            hub_percentile: communities::DEFAULT_HUB_PERCENTILE,
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
+    index_with(root, &IndexOptions::default())
+}
+
+pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats)> {
     let started = Instant::now();
     // Timestamp taken before reading so edits made during indexing count as stale.
     let indexed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -249,6 +271,7 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
     let mut graph = Builder::new(root, &facts).build();
     graph.indexed_at = indexed_at;
     graph.build_indexes();
+    communities::detect(&mut graph, opts.hub_percentile);
 
     let mut by_lang = HashMap::new();
     for f in &facts {
@@ -262,6 +285,7 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
             .filter(|n| !matches!(n.kind, SymKind::File | SymKind::External))
             .count(),
         edges: graph.edges.len(),
+        communities: graph.communities.len(),
         errors,
         elapsed: started.elapsed(),
         by_lang,
@@ -348,6 +372,7 @@ impl<'a> Builder<'a> {
                     signature: String::new(),
                     doc: None,
                     parent: None,
+                    community: None,
                 },
                 f.lang,
             );
@@ -381,6 +406,7 @@ impl<'a> Builder<'a> {
                         signature: d.signature.clone(),
                         doc: d.doc.clone(),
                         parent: Some(parent),
+                        community: None,
                     },
                     f.lang,
                 );
@@ -565,6 +591,7 @@ impl<'a> Builder<'a> {
             signature: String::new(),
             doc: None,
             parent: None,
+            community: None,
         });
         self.lang_of_node.push(Lang::Rust); // unused for externals
         self.externals.insert(name.to_string(), n);

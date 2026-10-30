@@ -1,7 +1,8 @@
 // Pure model of `.codenav/graph.cnav` (JSON) and the views drawn by the webview.
 // No `vscode` import here, so it can be unit-tested with plain Node.
 
-export const SUPPORTED_VERSION = 1;
+/** Graph format versions this extension reads (v2 adds communities, ignored here). */
+export const SUPPORTED_VERSIONS = [1, 2];
 
 export type SymKind =
   | 'file' | 'external' | 'module' | 'class' | 'struct' | 'enum'
@@ -158,9 +159,9 @@ export class CodeGraph {
     if (!g || typeof g !== 'object' || !Array.isArray(g.nodes) || !Array.isArray(g.edges)) {
       throw new GraphError('The code graph has no nodes/edges arrays');
     }
-    if (g.version !== SUPPORTED_VERSION) {
+    if (!SUPPORTED_VERSIONS.includes(g.version as number)) {
       throw new GraphError(
-        `Code graph format version ${g.version} is not supported (expected ${SUPPORTED_VERSION}). ` +
+        `Code graph format version ${g.version} is not supported (expected ${SUPPORTED_VERSIONS.join(' or ')}). ` +
           'Re-index with a matching codenav version.',
       );
     }

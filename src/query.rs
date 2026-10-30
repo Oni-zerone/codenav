@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use crate::communities;
 use crate::graph::{EdgeKind, Graph, SymKind};
 
 const MAX_CODE_LINES: usize = 150;
@@ -153,6 +154,9 @@ pub fn symbol_details(g: &Graph, root: &Path, i: usize, include_code: bool) -> V
     }
     if let Some(p) = n.parent {
         v["parent"] = json!(g.nodes[p].id);
+    }
+    if let Some(c) = n.community {
+        v["community"] = community_ref(g, c);
     }
 
     let mut outgoing: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
@@ -741,6 +745,24 @@ pub fn overview(g: &Graph, top: usize) -> Value {
         &[EdgeKind::Imports],
     );
 
+    let members = community_members(g);
+    let communities: Vec<Value> = members
+        .iter()
+        .enumerate()
+        .take(top)
+        .map(|(c, m)| {
+            let mut v = community_ref(g, c as u32);
+            v["size"] = json!(m.len());
+            v["top_members"] = json!(
+                top_members(g, m, 3)
+                    .iter()
+                    .map(|&i| &g.nodes[i].id)
+                    .collect::<Vec<_>>()
+            );
+            v
+        })
+        .collect();
+
     json!({
         "root": g.root,
         "indexed_at_unix": g.indexed_at,
@@ -750,6 +772,143 @@ pub fn overview(g: &Graph, top: usize) -> Value {
         "most_depended_on_symbols": central,
         "most_imported_files": central_files,
         "top_external_dependencies": externals,
-        "hint": "Use module_graph for component-level dependencies, search_symbols to find ids, then get_symbol / get_neighbors / find_paths / impact_analysis.",
+        "community_count": g.communities.len(),
+        "largest_communities": communities,
+        "hint": "Use module_graph for component-level dependencies, get_community for structural clusters, search_symbols to find ids, then get_symbol / get_neighbors / find_paths / impact_analysis.",
     })
+}
+
+fn community_ref(g: &Graph, c: u32) -> Value {
+    let label = g
+        .communities
+        .get(c as usize)
+        .map_or("", |info| info.label.as_str());
+    json!({ "id": c, "label": label })
+}
+
+/// Members of each community, indexed by community id.
+fn community_members(g: &Graph) -> Vec<Vec<usize>> {
+    let mut members = vec![Vec::new(); g.communities.len()];
+    for (i, n) in g.nodes.iter().enumerate() {
+        if let Some(list) = n.community.and_then(|c| members.get_mut(c as usize)) {
+            list.push(i);
+        }
+    }
+    members
+}
+
+/// The `n` most connected members, ties by id.
+fn top_members(g: &Graph, members: &[usize], n: usize) -> Vec<usize> {
+    let mut ranked: Vec<(usize, usize)> = members
+        .iter()
+        .map(|&i| (communities::dependency_degree(g, i), i))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| g.nodes[a.1].id.cmp(&g.nodes[b.1].id))
+    });
+    ranked.into_iter().take(n).map(|(_, i)| i).collect()
+}
+
+/// A structural community: the files it spans, its most connected members and the
+/// communities it depends on or is used by.
+pub fn community(g: &Graph, c: u32, from: Option<usize>, limit: usize) -> Value {
+    let members: Vec<usize> = (0..g.nodes.len())
+        .filter(|&i| g.nodes[i].community == Some(c))
+        .collect();
+
+    let mut files: BTreeMap<&str, usize> = BTreeMap::new();
+    for &i in &members {
+        *files.entry(g.nodes[i].file.as_str()).or_default() += 1;
+    }
+    let mut files: Vec<(&str, usize)> = files.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let file_count = files.len();
+
+    // Edge occurrences to and from other communities. Name-guessed (`ambiguous`) edges
+    // are counted apart: clustering uses them at half weight, but they may be wrong.
+    #[derive(Default)]
+    struct Count {
+        edges: u32,
+        ambiguous: u32,
+    }
+    impl Count {
+        fn add(&mut self, e: &crate::graph::Edge) {
+            if e.ambiguous {
+                self.ambiguous += e.count;
+            } else {
+                self.edges += e.count;
+            }
+        }
+    }
+    let mut depends_on: BTreeMap<u32, Count> = BTreeMap::new();
+    let mut used_by: BTreeMap<u32, Count> = BTreeMap::new();
+    let mut internal = Count::default();
+    for e in &g.edges {
+        if e.kind == EdgeKind::Contains {
+            continue;
+        }
+        let (a, b) = (g.nodes[e.from].community, g.nodes[e.to].community);
+        match (a == Some(c), b == Some(c)) {
+            (true, true) => internal.add(e),
+            (true, false) => {
+                if let Some(b) = b {
+                    depends_on.entry(b).or_default().add(e);
+                }
+            }
+            (false, true) => {
+                if let Some(a) = a {
+                    used_by.entry(a).or_default().add(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    let links = |map: BTreeMap<u32, Count>| -> Vec<Value> {
+        let mut v: Vec<(u32, Count)> = map.into_iter().collect();
+        v.sort_by(|a, b| {
+            (b.1.edges, b.1.ambiguous)
+                .cmp(&(a.1.edges, a.1.ambiguous))
+                .then(a.0.cmp(&b.0))
+        });
+        v.into_iter()
+            .take(10)
+            .map(|(other, n)| {
+                let mut r = community_ref(g, other);
+                r["edges"] = json!(n.edges);
+                if n.ambiguous > 0 {
+                    r["ambiguous_edges"] = json!(n.ambiguous);
+                }
+                r
+            })
+            .collect()
+    };
+
+    let mut v = community_ref(g, c);
+    if let Some(i) = from {
+        v["node"] = json!(g.nodes[i].id);
+    }
+    v["size"] = json!(members.len());
+    v["internal_edges"] = json!(internal.edges);
+    if internal.ambiguous > 0 {
+        v["internal_ambiguous_edges"] = json!(internal.ambiguous);
+    }
+    v["file_count"] = json!(file_count);
+    v["files"] = json!(
+        files
+            .iter()
+            .take(20)
+            .map(|(f, n)| format!("{f} ({n})"))
+            .collect::<Vec<_>>()
+    );
+    v["members"] = json!(
+        top_members(g, &members, limit)
+            .into_iter()
+            .map(|i| json!({ "id": g.nodes[i].id, "kind": g.nodes[i].kind.as_str() }))
+            .collect::<Vec<_>>()
+    );
+    v["truncated"] = json!(members.len() > limit || file_count > 20);
+    v["depends_on"] = json!(links(depends_on));
+    v["used_by"] = json!(links(used_by));
+    v
 }

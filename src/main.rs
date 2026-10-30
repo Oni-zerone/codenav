@@ -1,3 +1,4 @@
+mod communities;
 mod explore;
 mod extract;
 mod graph;
@@ -13,6 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
 use crate::graph::Graph;
+use crate::indexer::IndexOptions;
 use crate::lang::Lang;
 
 /// Index a repository into a code graph and serve it to LLMs over MCP.
@@ -29,6 +31,8 @@ enum Command {
     Index {
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[command(flatten)]
+        opts: IndexArgs,
     },
     /// Run the MCP server on stdio (indexes first if needed).
     Serve {
@@ -40,6 +44,8 @@ enum Command {
         /// Do not re-index automatically when source files change.
         #[arg(long)]
         no_refresh: bool,
+        #[command(flatten)]
+        opts: IndexArgs,
     },
     /// Call one MCP tool from the command line and print its JSON result.
     Tool {
@@ -55,11 +61,40 @@ enum Command {
     Ast { file: PathBuf },
 }
 
+#[derive(clap::Args)]
+struct IndexArgs {
+    /// Nodes whose dependency degree is above this percentile are hubs: their
+    /// dependency edges are ignored when grouping code into communities (0-100;
+    /// default: the saved index's value, else 99).
+    #[arg(long, value_parser = parse_percentile)]
+    hub_percentile: Option<f64>,
+}
+
+/// Explicit settings win; otherwise keep those of the saved index, so a later
+/// re-index (by `serve`, `tool` or a plain `index`) doesn't change the communities.
+fn index_options(root: &Path, requested: Option<f64>) -> IndexOptions {
+    IndexOptions {
+        hub_percentile: requested
+            .or_else(|| Graph::saved_hub_percentile(root))
+            .unwrap_or(communities::DEFAULT_HUB_PERCENTILE),
+    }
+}
+
+fn parse_percentile(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if (0.0..=100.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err("must be between 0 and 100".into())
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Index { path } => {
+        Command::Index { path, opts } => {
             let root = canonical_root(&path)?;
-            let (graph, stats) = indexer::index(&root)?;
+            let opts = index_options(&root, opts.hub_percentile);
+            let (graph, stats) = indexer::index_with(&root, &opts)?;
             let saved = graph.save(&root)?;
             let mut langs: Vec<String> = stats
                 .by_lang
@@ -68,11 +103,12 @@ fn main() -> Result<()> {
                 .collect();
             langs.sort();
             eprintln!(
-                "Indexed {} files ({}) → {} symbols, {} edges in {:.2?}",
+                "Indexed {} files ({}) → {} symbols, {} edges, {} communities in {:.2?}",
                 stats.files,
                 langs.join(", "),
                 stats.symbols,
                 stats.edges,
+                stats.communities,
                 stats.elapsed
             );
             for e in &stats.errors {
@@ -84,17 +120,18 @@ fn main() -> Result<()> {
             path,
             fresh,
             no_refresh,
+            opts,
         } => {
             let root = canonical_root(&path)?;
-            let graph = load_or_index(&root, fresh)?;
-            mcp::Server::new(root, graph, !no_refresh).run()?;
+            let (graph, opts) = load_or_index(&root, fresh, opts.hub_percentile)?;
+            mcp::Server::new(root, graph, !no_refresh, opts).run()?;
         }
         Command::Tool { name, args, path } => {
             let root = canonical_root(&path)?;
-            let graph = load_or_index(&root, false)?;
+            let (graph, opts) = load_or_index(&root, false, None)?;
             let args: serde_json::Value =
                 serde_json::from_str(&args).context("arguments must be a JSON object")?;
-            let mut server = mcp::Server::new(root, graph, false);
+            let mut server = mcp::Server::new(root, graph, false, opts);
             let result = server.call_tool(&name, &args)?;
             println!("{result}");
         }
@@ -117,22 +154,50 @@ fn canonical_root(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot open {}", path.display()))
 }
 
-/// Reuses the saved graph when it is up to date, otherwise indexes and saves.
-fn load_or_index(root: &Path, force: bool) -> Result<Graph> {
-    if !force {
-        match Graph::load(root) {
-            Ok(g) if !indexer::is_stale(root, &g) => return Ok(g),
-            Ok(_) => eprintln!("codenav: index is stale, re-indexing…"),
-            Err(_) => eprintln!("codenav: no index found, indexing {}…", root.display()),
+/// Reuses the saved graph when it is up to date and was built with the requested
+/// settings, otherwise indexes and saves. Returns the settings in effect.
+fn load_or_index(
+    root: &Path,
+    force: bool,
+    requested: Option<f64>,
+) -> Result<(Graph, IndexOptions)> {
+    let index_path = Graph::index_path(root);
+    let opts = if force || !index_path.exists() {
+        if !force {
+            eprintln!("codenav: no index found, indexing {}…", root.display());
         }
-    }
-    let (graph, stats) = indexer::index(root)?;
+        index_options(root, requested)
+    } else {
+        match Graph::load(root) {
+            Ok(g) => {
+                let opts = IndexOptions {
+                    hub_percentile: requested.unwrap_or(g.hub_percentile),
+                };
+                if opts.hub_percentile != g.hub_percentile {
+                    eprintln!(
+                        "codenav: hub percentile changed ({} → {}), re-indexing…",
+                        g.hub_percentile, opts.hub_percentile
+                    );
+                } else if indexer::is_stale(root, &g) {
+                    eprintln!("codenav: index is stale, re-indexing…");
+                } else {
+                    return Ok((g, opts));
+                }
+                opts
+            }
+            Err(e) => {
+                eprintln!("codenav: cannot use the saved index ({e:#}), re-indexing…");
+                index_options(root, requested)
+            }
+        }
+    };
+    let (graph, stats) = indexer::index_with(root, &opts)?;
     eprintln!(
-        "codenav: {} files, {} symbols, {} edges ({:.2?})",
-        stats.files, stats.symbols, stats.edges, stats.elapsed
+        "codenav: {} files, {} symbols, {} edges, {} communities ({:.2?})",
+        stats.files, stats.symbols, stats.edges, stats.communities, stats.elapsed
     );
     if let Err(e) = graph.save(root) {
         eprintln!("codenav: could not save index: {e:#}");
     }
-    Ok(graph)
+    Ok((graph, opts))
 }

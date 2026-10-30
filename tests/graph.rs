@@ -253,6 +253,185 @@ fn impact_follows_overrides_across_files_and_levels() {
     assert!(v.get("overridden_members").is_none(), "{v:#}");
 }
 
+/// Community of every non-external node in the fixture, by node id.
+fn fixture_communities() -> (Value, Vec<(String, u64)>) {
+    let out = codenav().arg("index").arg(fixture()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let g: Value =
+        serde_json::from_slice(&std::fs::read(fixture().join(".codenav/graph.cnav")).unwrap())
+            .unwrap();
+    let mut nodes = Vec::new();
+    for n in g["nodes"].as_array().unwrap() {
+        match n["community"].as_u64() {
+            Some(c) => nodes.push((n["id"].as_str().unwrap().to_string(), c)),
+            None => assert_eq!(n["kind"], "external", "{n}"),
+        }
+    }
+    (g, nodes)
+}
+
+#[test]
+fn communities_separate_the_fixture_apps() {
+    let (g, nodes) = fixture_communities();
+    let communities = g["communities"].as_array().unwrap();
+    let mut app_of = std::collections::HashMap::new();
+    for (id, c) in &nodes {
+        let app = id.split('/').next().unwrap();
+        let prev = app_of.entry(*c).or_insert(app);
+        assert_eq!(*prev, app, "community {c} mixes {prev} and {app}");
+    }
+    for app in ["py", "web", "goapp", "ios"] {
+        assert!(app_of.values().any(|a| *a == app), "{app} has no community");
+    }
+    // Ids are dense, largest first, and sizes match the nodes.
+    for (c, info) in communities.iter().enumerate() {
+        let size = nodes.iter().filter(|(_, n)| *n == c as u64).count();
+        assert_eq!(info["size"], json!(size), "{info}");
+        assert!(!info["label"].as_str().unwrap().is_empty());
+    }
+    let sizes: Vec<u64> = communities
+        .iter()
+        .map(|c| c["size"].as_u64().unwrap())
+        .collect();
+    assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
+
+    // Deterministic: re-indexing gives the same assignment.
+    let (_, again) = fixture_communities();
+    assert_eq!(nodes, again);
+}
+
+#[test]
+fn community_tools() {
+    let ios = "ios/Sources/App/Model.swift::ItemStore";
+    let c = tool("get_community", json!({ "id": ios }));
+    assert_eq!(c["node"], ios, "{c:#}");
+    let files = c["files"].to_string();
+    assert!(files.contains("ios/Sources/App/Model.swift"), "{c:#}");
+    assert!(!files.contains("py/"), "{c:#}");
+    let members = c["members"].to_string();
+    assert!(members.contains(ios), "{c:#}");
+
+    // Same community by number, and from get_symbol / graph_overview.
+    let id = c["id"].clone();
+    let by_number = tool("get_community", json!({ "community": id }));
+    assert_eq!(by_number["label"], c["label"]);
+    assert!(by_number.get("node").is_none());
+    let sym = tool("get_symbol", json!({ "id": ios, "include_code": false }));
+    assert_eq!(sym["community"]["id"], id, "{sym:#}");
+    assert_eq!(sym["community"]["label"], c["label"]);
+    let overview = tool("graph_overview", json!({}));
+    let largest = overview["largest_communities"].as_array().unwrap();
+    assert_eq!(
+        overview["community_count"],
+        json!(largest.len()),
+        "{overview:#}"
+    );
+    assert!(
+        largest
+            .iter()
+            .any(|l| l["id"] == id && l["label"] == c["label"])
+    );
+
+    // Limit, and the error paths.
+    let small = tool("get_community", json!({ "id": ios, "limit": 1 }));
+    assert_eq!(small["members"].as_array().unwrap().len(), 1);
+    assert_eq!(small["truncated"], true);
+    for (args, expected) in [
+        (json!({ "community": 999 }), "no community 999"),
+        (json!({}), "pass `id`"),
+        (json!({ "id": "ext:Foundation" }), "has no community"),
+    ] {
+        let (ok, text) = tool_text("get_community", args);
+        assert!(!ok && text.contains(expected), "{text}");
+    }
+}
+
+#[test]
+fn hub_percentile_is_kept_across_reindexing() {
+    let repo = TempRepo::new(
+        "hubpct",
+        &[("a.py", "def f():\n    g()\n\ndef g():\n    pass\n".into())],
+    );
+    let saved = || -> Value {
+        let g: Value =
+            serde_json::from_slice(&std::fs::read(repo.0.join(".codenav/graph.cnav")).unwrap())
+                .unwrap();
+        g["hub_percentile"].clone()
+    };
+    let run = |args: &[&str]| -> String {
+        let out = codenav()
+            .args(args)
+            .arg("--path")
+            .arg(&repo.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let index = |extra: &[&str]| {
+        let out = codenav()
+            .arg("index")
+            .args(extra)
+            .arg(&repo.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    index(&["--hub-percentile", "90"]);
+    assert_eq!(saved(), json!(90.0));
+    // A plain `index` keeps the saved value.
+    index(&[]);
+    assert_eq!(saved(), json!(90.0));
+    // `tool` re-indexing a stale graph keeps it too.
+    std::fs::write(repo.0.join("b.py"), "def h():\n    pass\n").unwrap();
+    let log = run(&["tool", "graph_overview"]);
+    assert!(log.contains("stale"), "{log}");
+    assert_eq!(saved(), json!(90.0));
+    // An explicit value replaces it.
+    index(&["--hub-percentile", "100"]);
+    assert_eq!(saved(), json!(100.0));
+    // `serve` with a different value re-indexes instead of reusing the fresh graph.
+    let out = codenav()
+        .args(["serve", "--hub-percentile", "80"])
+        .arg(&repo.0)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && log.contains("hub percentile changed (100 → 80)"),
+        "{log}"
+    );
+    assert_eq!(saved(), json!(80.0));
+
+    // An index in an old format is reported as such, not as missing.
+    std::fs::write(
+        repo.0.join(".codenav/graph.cnav"),
+        r#"{"version":1,"root":"","indexed_at":0,"nodes":[],"edges":[]}"#,
+    )
+    .unwrap();
+    let log = run(&["tool", "graph_overview"]);
+    assert!(
+        log.contains("outdated") && !log.contains("no index found"),
+        "{log}"
+    );
+    // The saved percentile of an outdated index is not trusted: back to the default.
+    assert_eq!(saved(), json!(99.0));
+}
+
 #[test]
 fn explore_question_returns_relevant_subgraph() {
     let (ok, text) = tool_text(
@@ -484,6 +663,10 @@ fn every_structured_tool_respects_token_budget() {
         ("file_outline", json!({ "path": "src/indexer.rs" })),
         ("impact_analysis", json!({ "id": "src/graph.rs::Graph" })),
         ("explore", json!({ "question": "how is the graph built" })),
+        (
+            "get_community",
+            json!({ "id": "src/graph.rs::Graph", "limit": 200 }),
+        ),
     ];
     let mut truncated = 0;
     for (name, mut args) in calls {
