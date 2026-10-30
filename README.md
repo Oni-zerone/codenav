@@ -124,7 +124,9 @@ numeri.
 Gli archi di dipendenza degli *hub* (i nodi più collegati, sopra il 99° percentile) non contano,
 così le utility usate ovunque non uniscono parti che non c'entrano. La soglia si cambia con
 `codenav index --hub-percentile N` (o `serve --hub-percentile N`); `100` disattiva l'esclusione.
-I pacchetti esterni non hanno community, e gli archi `ambiguous` pesano la metà.
+Il valore viene salvato nell'indice e riusato dai re-index successivi (anche quelli automatici di
+`serve`) finché non se ne passa un altro. I pacchetti esterni non hanno community, e gli archi
+`ambiguous` pesano la metà; `get_community` li conta a parte (`ambiguous_edges`).
 
 Dove serve un id si può passare anche un nome univoco (`Graph::load`, `UserService`) o un path:
 se è ambiguo il tool risponde con la lista degli id candidati.

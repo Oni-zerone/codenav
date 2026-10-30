@@ -351,6 +351,88 @@ fn community_tools() {
 }
 
 #[test]
+fn hub_percentile_is_kept_across_reindexing() {
+    let repo = TempRepo::new(
+        "hubpct",
+        &[("a.py", "def f():\n    g()\n\ndef g():\n    pass\n".into())],
+    );
+    let saved = || -> Value {
+        let g: Value =
+            serde_json::from_slice(&std::fs::read(repo.0.join(".codenav/graph.cnav")).unwrap())
+                .unwrap();
+        g["hub_percentile"].clone()
+    };
+    let run = |args: &[&str]| -> String {
+        let out = codenav()
+            .args(args)
+            .arg("--path")
+            .arg(&repo.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let index = |extra: &[&str]| {
+        let out = codenav()
+            .arg("index")
+            .args(extra)
+            .arg(&repo.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    index(&["--hub-percentile", "90"]);
+    assert_eq!(saved(), json!(90.0));
+    // A plain `index` keeps the saved value.
+    index(&[]);
+    assert_eq!(saved(), json!(90.0));
+    // `tool` re-indexing a stale graph keeps it too.
+    std::fs::write(repo.0.join("b.py"), "def h():\n    pass\n").unwrap();
+    let log = run(&["tool", "graph_overview"]);
+    assert!(log.contains("stale"), "{log}");
+    assert_eq!(saved(), json!(90.0));
+    // An explicit value replaces it.
+    index(&["--hub-percentile", "100"]);
+    assert_eq!(saved(), json!(100.0));
+    // `serve` with a different value re-indexes instead of reusing the fresh graph.
+    let out = codenav()
+        .args(["serve", "--hub-percentile", "80"])
+        .arg(&repo.0)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && log.contains("hub percentile changed (100 → 80)"),
+        "{log}"
+    );
+    assert_eq!(saved(), json!(80.0));
+
+    // An index in an old format is reported as such, not as missing.
+    std::fs::write(
+        repo.0.join(".codenav/graph.cnav"),
+        r#"{"version":1,"root":"","indexed_at":0,"nodes":[],"edges":[]}"#,
+    )
+    .unwrap();
+    let log = run(&["tool", "graph_overview"]);
+    assert!(
+        log.contains("outdated") && !log.contains("no index found"),
+        "{log}"
+    );
+    // The saved percentile of an outdated index is not trusted: back to the default.
+    assert_eq!(saved(), json!(99.0));
+}
+
+#[test]
 fn explore_question_returns_relevant_subgraph() {
     let (ok, text) = tool_text(
         "explore",

@@ -196,6 +196,9 @@ pub struct Graph {
     /// Structural communities, largest first (see `communities`).
     #[serde(default)]
     pub communities: Vec<Community>,
+    /// Hub percentile the communities were computed with.
+    #[serde(default = "default_hub_percentile")]
+    pub hub_percentile: f64,
 
     #[serde(skip)]
     pub out_edges: Vec<Vec<usize>>,
@@ -209,7 +212,24 @@ pub struct Graph {
     pub by_file: HashMap<String, usize>,
 }
 
+fn default_hub_percentile() -> f64 {
+    crate::communities::DEFAULT_HUB_PERCENTILE
+}
+
 impl Graph {
+    /// Hub percentile of the saved index, without loading the whole graph.
+    pub fn saved_hub_percentile(root: &Path) -> Option<f64> {
+        #[derive(Deserialize)]
+        struct Header {
+            version: u32,
+            #[serde(default = "default_hub_percentile")]
+            hub_percentile: f64,
+        }
+        let data = fs::read(Self::index_path(root)).ok()?;
+        let h: Header = serde_json::from_slice(&data).ok()?;
+        (h.version == FORMAT_VERSION).then_some(h.hub_percentile)
+    }
+
     pub fn new(root: &Path) -> Graph {
         Graph {
             version: FORMAT_VERSION,
@@ -218,6 +238,7 @@ impl Graph {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            hub_percentile: default_hub_percentile(),
             ..Default::default()
         }
     }

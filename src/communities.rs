@@ -42,7 +42,15 @@ pub fn detect(g: &mut Graph, hub_percentile: f64) {
         .iter()
         .map(|n| n.kind != SymKind::External)
         .collect();
-    let dep_degree = dependency_degree(g, &active);
+    let dep_degree: Vec<usize> = (0..n)
+        .map(|i| {
+            if active[i] {
+                dependency_degree(g, i)
+            } else {
+                0
+            }
+        })
+        .collect();
     let hub_limit = hub_threshold(&dep_degree, &active, hub_percentile);
 
     // Compact ids for active nodes.
@@ -89,18 +97,23 @@ pub fn detect(g: &mut Graph, hub_percentile: f64) {
         }
     }
     g.communities = label_communities(g, &groups, &dep_degree);
+    g.hub_percentile = hub_percentile;
 }
 
-/// Distinct dependency (non-`contains`) edges per node, between active nodes.
-fn dependency_degree(g: &Graph, active: &[bool]) -> Vec<usize> {
-    let mut deg = vec![0; g.nodes.len()];
-    for e in &g.edges {
-        if e.kind != EdgeKind::Contains && e.from != e.to && active[e.from] && active[e.to] {
-            deg[e.from] += 1;
-            deg[e.to] += 1;
-        }
-    }
-    deg
+/// Dependency degree: distinct nodes linked to `i` by non-`contains` edges, ignoring
+/// external packages. Used for hubs, labels and "most connected" rankings.
+pub fn dependency_degree(g: &Graph, i: usize) -> usize {
+    let mut others: Vec<usize> = g.out_edges[i]
+        .iter()
+        .chain(&g.in_edges[i])
+        .map(|&e| &g.edges[e])
+        .filter(|e| e.kind != EdgeKind::Contains)
+        .map(|e| if e.from == i { e.to } else { e.from })
+        .filter(|&o| o != i && g.nodes[o].kind != SymKind::External)
+        .collect();
+    others.sort_unstable();
+    others.dedup();
+    others.len()
 }
 
 /// Degree above which a node is a hub.
@@ -176,6 +189,10 @@ fn louvain(n: usize, edges: &[(usize, usize, f64)]) -> Vec<usize> {
                 index[c] = count;
                 count += 1;
             }
+        }
+        if count == graph.len() {
+            // Nodes only swapped places: aggregating would rebuild the same graph.
+            break;
         }
         for m in &mut membership {
             *m = index[comm[*m]];

@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
+use crate::communities;
 use crate::graph::{EdgeKind, Graph, SymKind};
 
 const MAX_CODE_LINES: usize = 150;
@@ -796,20 +797,11 @@ fn community_members(g: &Graph) -> Vec<Vec<usize>> {
     members
 }
 
-/// Dependency (non-`contains`) edges of a node.
-fn dependency_degree(g: &Graph, i: usize) -> usize {
-    g.out_edges[i]
-        .iter()
-        .chain(&g.in_edges[i])
-        .filter(|&&e| g.edges[e].kind != EdgeKind::Contains)
-        .count()
-}
-
 /// The `n` most connected members, ties by id.
 fn top_members(g: &Graph, members: &[usize], n: usize) -> Vec<usize> {
     let mut ranked: Vec<(usize, usize)> = members
         .iter()
-        .map(|&i| (dependency_degree(g, i), i))
+        .map(|&i| (communities::dependency_degree(g, i), i))
         .collect();
     ranked.sort_by(|a, b| {
         b.0.cmp(&a.0)
@@ -833,38 +825,60 @@ pub fn community(g: &Graph, c: u32, from: Option<usize>, limit: usize) -> Value 
     files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     let file_count = files.len();
 
-    // Edge occurrences to and from other communities; name-guessed edges are left out.
-    let mut depends_on: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut used_by: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut internal = 0u32;
+    // Edge occurrences to and from other communities. Name-guessed (`ambiguous`) edges
+    // are counted apart: clustering uses them at half weight, but they may be wrong.
+    #[derive(Default)]
+    struct Count {
+        edges: u32,
+        ambiguous: u32,
+    }
+    impl Count {
+        fn add(&mut self, e: &crate::graph::Edge) {
+            if e.ambiguous {
+                self.ambiguous += e.count;
+            } else {
+                self.edges += e.count;
+            }
+        }
+    }
+    let mut depends_on: BTreeMap<u32, Count> = BTreeMap::new();
+    let mut used_by: BTreeMap<u32, Count> = BTreeMap::new();
+    let mut internal = Count::default();
     for e in &g.edges {
-        if e.kind == EdgeKind::Contains || e.ambiguous {
+        if e.kind == EdgeKind::Contains {
             continue;
         }
         let (a, b) = (g.nodes[e.from].community, g.nodes[e.to].community);
         match (a == Some(c), b == Some(c)) {
-            (true, true) => internal += e.count,
+            (true, true) => internal.add(e),
             (true, false) => {
                 if let Some(b) = b {
-                    *depends_on.entry(b).or_default() += e.count;
+                    depends_on.entry(b).or_default().add(e);
                 }
             }
             (false, true) => {
                 if let Some(a) = a {
-                    *used_by.entry(a).or_default() += e.count;
+                    used_by.entry(a).or_default().add(e);
                 }
             }
             _ => {}
         }
     }
-    let links = |map: BTreeMap<u32, u32>| -> Vec<Value> {
-        let mut v: Vec<(u32, u32)> = map.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let links = |map: BTreeMap<u32, Count>| -> Vec<Value> {
+        let mut v: Vec<(u32, Count)> = map.into_iter().collect();
+        v.sort_by(|a, b| {
+            (b.1.edges, b.1.ambiguous)
+                .cmp(&(a.1.edges, a.1.ambiguous))
+                .then(a.0.cmp(&b.0))
+        });
         v.into_iter()
             .take(10)
-            .map(|(other, edges)| {
+            .map(|(other, n)| {
                 let mut r = community_ref(g, other);
-                r["edges"] = json!(edges);
+                r["edges"] = json!(n.edges);
+                if n.ambiguous > 0 {
+                    r["ambiguous_edges"] = json!(n.ambiguous);
+                }
                 r
             })
             .collect()
@@ -875,7 +889,10 @@ pub fn community(g: &Graph, c: u32, from: Option<usize>, limit: usize) -> Value 
         v["node"] = json!(g.nodes[i].id);
     }
     v["size"] = json!(members.len());
-    v["internal_edges"] = json!(internal);
+    v["internal_edges"] = json!(internal.edges);
+    if internal.ambiguous > 0 {
+        v["internal_ambiguous_edges"] = json!(internal.ambiguous);
+    }
     v["file_count"] = json!(file_count);
     v["files"] = json!(
         files
