@@ -8,10 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use ignore::WalkBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{Match as IgnoreMatch, WalkBuilder};
 use rayon::prelude::*;
 
 use crate::extract::{self, FileFacts, RefKind};
@@ -111,14 +113,16 @@ pub struct SourceFile {
 }
 
 pub fn discover(root: &Path) -> Vec<SourceFile> {
+    let excludes = CodenavIgnore::new(root);
     let mut files: Vec<SourceFile> = WalkBuilder::new(root)
         .require_git(false)
-        .add_custom_ignore_filename(IGNORE_FILE)
-        .filter_entry(|e| {
-            !(e.file_type().is_some_and(|t| t.is_dir())
+        .filter_entry(move |e| {
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            let skipped_dir = is_dir
                 && e.file_name()
                     .to_str()
-                    .is_some_and(|n| SKIP_DIRS.contains(&n)))
+                    .is_some_and(|n| SKIP_DIRS.contains(&n));
+            !skipped_dir && !excludes.is_excluded(e.path(), is_dir)
         })
         .build()
         .filter_map(|e| e.ok())
@@ -136,6 +140,72 @@ pub fn discover(root: &Path) -> Vec<SourceFile> {
         .collect();
     files.sort_by(|a, b| a.rel.cmp(&b.rel));
     files
+}
+
+/// `.codenavignore` rules, applied on top of the walker's own filters (`.gitignore`,
+/// hidden files, `SKIP_DIRS`). They can only narrow the index: a `!pattern` only makes
+/// an exception to an earlier `.codenavignore` rule and never re-includes a path the
+/// walker already excludes. Only files at the root and below are read, so indexing
+/// an excluded directory directly works whatever the pattern in its parent.
+struct CodenavIgnore {
+    root: PathBuf,
+    /// directory -> its parsed `.codenavignore`, if any
+    cache: Mutex<HashMap<PathBuf, Option<Arc<Gitignore>>>>,
+}
+
+impl CodenavIgnore {
+    fn new(root: &Path) -> CodenavIgnore {
+        CodenavIgnore {
+            root: root.to_path_buf(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn matcher(&self, dir: &Path) -> Option<Arc<Gitignore>> {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                let file = dir.join(IGNORE_FILE);
+                if !file.is_file() {
+                    return None;
+                }
+                let mut builder = GitignoreBuilder::new(dir);
+                // Like git's core.ignorecase default on case-insensitive filesystems.
+                let _ = builder.case_insensitive(cfg!(any(target_os = "macos", windows)));
+                if let Some(err) = builder.add(&file) {
+                    eprintln!("codenav: {}: {err}", file.display());
+                }
+                builder.build().ok().map(Arc::new)
+            })
+            .clone()
+    }
+
+    /// Deeper `.codenavignore` files take precedence, as with `.gitignore`.
+    fn is_excluded(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let parents: Vec<_> = rel
+            .parent()
+            .map(|p| p.components().collect())
+            .unwrap_or_default();
+        let mut dir = self.root.clone();
+        let mut excluded = false;
+        for i in 0..=parents.len() {
+            if i > 0 {
+                dir.push(parents[i - 1]);
+            }
+            if let Some(m) = self.matcher(&dir) {
+                match m.matched(path, is_dir) {
+                    IgnoreMatch::Ignore(_) => excluded = true,
+                    IgnoreMatch::Whitelist(_) => excluded = false,
+                    IgnoreMatch::None => {}
+                }
+            }
+        }
+        excluded
+    }
 }
 
 /// True when some source file changed after the graph was built (or files were added/removed).
@@ -1070,6 +1140,48 @@ mod tests {
             .map(|f| f.rel)
             .collect();
         assert_eq!(gen_files, vec!["b.py"]);
+    }
+
+    #[test]
+    fn codenavignore_only_narrows_and_stays_inside_the_root() {
+        let repo = TempRepo::new(
+            "narrow",
+            &[
+                // The "only index Python" idiom must not re-include ignored paths.
+                ("repo/.codenavignore", "*\n!*/\n!*.py\n"),
+                ("repo/.gitignore", "secret.py\nenv/\n"),
+                ("repo/a.py", ""),
+                ("repo/notes.txt", ""),
+                ("repo/secret.py", ""),
+                ("repo/env/e.py", ""),
+                ("repo/.venv/v.py", ""),
+                ("repo/gen/b.py", ""),
+                // Rules above the root are not read.
+                (".codenavignore", "repo/\n*.py\n"),
+                // `dir/**` in a parent file must not hide the directory indexed directly.
+                ("repo/sub/.codenavignore", "inner/**\n"),
+                ("repo/sub/inner/c.py", ""),
+            ],
+        );
+        let root = repo.0.join("repo");
+        let files: Vec<String> = discover(&root).into_iter().map(|f| f.rel).collect();
+        assert_eq!(files, vec!["a.py", "gen/b.py"]);
+        let inner: Vec<String> = discover(&root.join("sub/inner"))
+            .into_iter()
+            .map(|f| f.rel)
+            .collect();
+        assert_eq!(inner, vec!["c.py"]);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn codenavignore_is_case_insensitive_like_git_on_this_platform() {
+        let repo = TempRepo::new(
+            "case",
+            &[(".codenavignore", "gen/\n"), ("Gen/g.py", ""), ("a.py", "")],
+        );
+        let files: Vec<String> = discover(&repo.0).into_iter().map(|f| f.rel).collect();
+        assert_eq!(files, vec!["a.py"]);
     }
 
     #[test]

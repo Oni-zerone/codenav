@@ -71,7 +71,11 @@ tests/fixtures/
 **/*.generated.ts
 ```
 
-Una cartella esclusa si può comunque indicizzare passandola direttamente come root.
+Le regole possono solo **restringere** l'indice: un `!pattern` crea un'eccezione alle regole di
+`.codenavignore`, ma non reinclude file esclusi da `.gitignore`, cartelle nascoste o cartelle
+escluse di default. Vengono letti solo i `.codenavignore` della root e delle sue sottocartelle,
+quindi una cartella esclusa si può sempre indicizzare passandola direttamente come root. Su macOS e
+Windows i pattern non distinguono maiuscole e minuscole, come fa git.
 
 L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, quindi non finisce
 nel versionamento). `serve` riusa l'indice se è aggiornato e, mentre gira, re-indicizza da solo
