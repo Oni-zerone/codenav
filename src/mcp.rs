@@ -14,6 +14,7 @@ use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
 use crate::output;
 use crate::query::{self, Direction, EdgeFilter};
+use crate::tests_for;
 use crate::vcs;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -329,6 +330,21 @@ impl Server {
                     min_confidence(a)?,
                 ))
             }
+            "tests_for" => {
+                let i = query::resolve(g, &string(a, "id")?)?;
+                // Guesses among same-named candidates would list unrelated tests.
+                let min = match opt_str(a, "min_confidence")? {
+                    Some(c) => parse_confidence(c)?,
+                    None => Confidence::Inferred,
+                };
+                Ok(tests_for::tests_for(
+                    g,
+                    i,
+                    uint(a, "depth", 4)?.clamp(1, 8) as u32,
+                    uint(a, "limit", 50)?.max(1),
+                    min,
+                ))
+            }
             "find_cycles" => {
                 let level = match opt_str(a, "level")?.unwrap_or("file") {
                     "file" => cycles::Level::File,
@@ -418,6 +434,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "get_community" => "lower limit",
         "audit_edges" => "narrow with path or edge_kinds, or lower limit",
         "find_cycles" => "lower limit or max_length",
+        "tests_for" => "lower depth or limit, or raise min_confidence",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -535,6 +552,17 @@ fn tool_definitions() -> Value {
     tools
 }
 
+fn tests_for_description() -> String {
+    format!(
+        "Tests to run after changing a symbol or file: tests that depend on it (or on its \
+         members, or on the interface methods they implement), split into direct (the test \
+         calls, references or imports it) and indirect (through other code, with distance and \
+         the shortest path), closest first. Tests are recognised by path only: {}. No matching \
+         by name similarity; edges at least inferred by default.",
+        tests_for::CONVENTIONS
+    )
+}
+
 fn base_tool_definitions() -> Value {
     let edge_kinds = json!({
         "type": "array",
@@ -626,6 +654,16 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "tests_for",
+            "description": tests_for_description(),
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "Symbol or file (id, unique name or path)." },
+                "depth": { "type": "integer", "description": "Max dependency hops from a test to the target (1-8, default 4)." },
+                "min_confidence": { "type": "string", "enum": ["exact", "inferred", "ambiguous"], "description": "Least confidence of the edges followed (default inferred; ambiguous adds tests reached through name guesses)." },
+                "limit": { "type": "integer", "description": "Test files listed (default 50)." }
+            }, "required": ["id"] }
         },
         {
             "name": "find_cycles",

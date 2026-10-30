@@ -127,6 +127,7 @@ aggiornamento automatico quando l'indice cambia.
 | `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`) |
 | `graph_overview` | Stato dell'indice (commit e branch Git da cui è stato costruito, modifiche non committate, avvisi se HEAD è cambiato o i sorgenti sono stati modificati), linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali, community più grandi |
 | `module_graph` | Architettura: dipendenze aggregate tra directory/componenti |
+| `tests_for` | Test da eseguire dopo una modifica: file di test (per convenzione di percorso, mai per somiglianza di nome) che dipendono dal simbolo o file, diretti e indiretti con distanza e percorso |
 | `find_cycles` | Cicli di dipendenze tra file o moduli: componenti fortemente connesse e cicli più corti (default: import, archi almeno `inferred`) |
 | `get_community` | Community strutturale di un nodo (o per numero): file, membri più collegati, community da cui dipende e che la usano |
 | `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path |
