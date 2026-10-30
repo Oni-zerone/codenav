@@ -181,29 +181,34 @@ fn name_tokens(name: &str) -> Vec<String> {
 /// Weight from which a match is on the symbol name itself.
 const NAME_MATCH: f64 = 2.0;
 
-/// How strongly a term matches a node: exact name, name token, name substring,
-/// id/path or doc.
 /// A term matching a whole word of the doc comment.
 const DOC_WORD: f64 = 1.5;
 
-/// Two forms of one word: equal, or sharing their first 5 letters (`propagated` /
-/// `propagate`, `schede` / `scheda`).
+/// Two forms of one word: equal, or at least 5 letters long and alike up to the last
+/// letter of the shorter (`propagate` / `propagated`, `schede` / `scheda`), but not words
+/// that merely start alike (`context` / `content`, `interval` / `internal`).
 fn same_word(a: &str, b: &str) -> bool {
-    const STEM: usize = 5;
-    a == b || {
-        let (mut x, mut y) = (a.chars(), b.chars());
-        a.chars().count() >= STEM
-            && b.chars().count() >= STEM
-            && (0..STEM).all(|_| x.next() == y.next())
+    if a == b {
+        return true;
     }
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    let shorter = la.min(lb);
+    if shorter < 5 {
+        return false;
+    }
+    let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    common >= shorter - 1
 }
 
+/// How strongly a term matches a node, best first: exact name (4), name token (3), part of
+/// the name or another form of a name token (2), a whole word of the doc (1.5), the
+/// id/path or another form of a doc word (1), a substring of the doc (0.5).
 fn term_weight(
     term: &str,
     name: &str,
     tokens: &[String],
     id: &str,
-    doc_words: &[String],
+    doc_words: &[&str],
     doc: &str,
 ) -> f64 {
     if name == term {
@@ -214,7 +219,7 @@ fn term_weight(
         || tokens.iter().any(|t| same_word(t, term))
     {
         NAME_MATCH
-    } else if doc_words.iter().any(|w| w == term) {
+    } else if doc_words.contains(&term) {
         DOC_WORD
     } else if id.contains(term) || doc_words.iter().any(|w| same_word(w, term)) {
         // A path, or another form of the word in the doc: weaker hints.
@@ -242,6 +247,8 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
     let mut total = vec![0.0; n];
     let mut name_match = vec![false; n];
     let mut per_term: Vec<Vec<f64>> = vec![vec![0.0; n]; terms.len()];
+    // Terms (indices into `terms`) each node matches by name or by a word of its doc.
+    let mut strong_terms: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, node) in g.nodes.iter().enumerate() {
         // A file is named by its stem: `api.ts` must not match the term `ts`.
         let display = if node.kind == SymKind::File {
@@ -255,18 +262,14 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
         let tokens = name_tokens(display);
         let id = node.id.to_lowercase();
         let doc = node.doc.as_deref().unwrap_or("").to_lowercase();
-        let doc_words: Vec<String> = doc
+        // Words of at least two characters, as for the question's terms.
+        let doc_words: Vec<&str> = doc
             .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() >= 2)
-            .map(str::to_string)
+            .filter(|w| w.chars().count() >= 2)
             .collect();
         for (t, term) in terms.iter().enumerate() {
-            per_term[t][i] = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
-        }
-    }
-    let mut strong_terms: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (t, weights) in per_term.iter().enumerate() {
-        for (i, &w) in weights.iter().enumerate() {
+            let w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            per_term[t][i] = w;
             if w >= DOC_WORD {
                 strong_terms[i].push(t);
             }
@@ -371,8 +374,18 @@ fn pick_seeds(
     // Seeds must match on their name, or on words of their doc for at least two terms (or
     // the only one); a path or a doc substring alone is only a fallback.
     let mut notes = Vec::new();
+    // Scores (and `strong_terms`) index the symbol terms, not the raw ones.
     let symbol_terms = symbol_terms(terms);
-    let doc_quorum = symbol_terms.len().min(2);
+    // Doc words anchor a node when they match two terms; for a one-term question, only if
+    // no name matches at all.
+    let any_name = ranked.iter().any(|&i| scores.name_match[i]);
+    let doc_quorum = if symbol_terms.len() >= 2 {
+        2
+    } else if any_name {
+        usize::MAX
+    } else {
+        1
+    };
     let anchored: Vec<usize> = ranked
         .iter()
         .copied()
@@ -402,15 +415,13 @@ fn pick_seeds(
         .iter()
         .flat_map(|&s| scores.strong_terms[s].iter().copied())
         .collect();
-    let all_terms: Vec<usize> = (0..terms.len())
-        .filter(|&t| !RELATION_WORDS.contains(&terms[t].as_str()))
-        .collect();
-    let covered_terms = all_terms.iter().filter(|t| covered.contains(t)).count();
-    if anchored.is_empty() || covered_terms * 2 < all_terms.len() {
-        let missing: Vec<&str> = all_terms
-            .iter()
+    let covered_terms = (0..symbol_terms.len())
+        .filter(|t| covered.contains(t))
+        .count();
+    if anchored.is_empty() || covered_terms * 2 < symbol_terms.len() {
+        let missing: Vec<&str> = (0..symbol_terms.len())
             .filter(|t| !covered.contains(t))
-            .map(|&t| terms[t].as_str())
+            .map(|t| symbol_terms[t].as_str())
             .collect();
         notes.insert(
             0,
@@ -418,7 +429,7 @@ fn pick_seeds(
                 "low_confidence: true: only {covered_terms} of {} terms match code names or docs \
                  (unmatched: {}); the starting points may be unrelated. Try search_symbols, \
                  other words, or explicit seeds",
-                all_terms.len(),
+                symbol_terms.len(),
                 missing.join(", ")
             ),
         );
@@ -667,6 +678,27 @@ fn node_line(g: &Graph, n: usize, dist: u32, seed: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_forms() {
+        for (a, b) in [
+            ("propagate", "propagated"),
+            ("propaga", "propagated"),
+            ("schede", "scheda"),
+            ("atleti", "atleta"),
+            ("plans", "plans"),
+        ] {
+            assert!(same_word(a, b), "{a} ~ {b}");
+        }
+        for (a, b) in [
+            ("context", "content"),
+            ("interval", "internal"),
+            ("construct", "constant"),
+            ("plan", "plans"),
+        ] {
+            assert!(!same_word(a, b), "{a} !~ {b}");
+        }
+    }
 
     #[test]
     fn tokenizes_names() {

@@ -1867,6 +1867,44 @@ fn explore_seeds_use_docs_and_word_variants() {
     );
 }
 
+#[test]
+fn explore_seed_review_cases() {
+    let repo = TempRepo::new(
+        "exploreseeds2",
+        &[(
+            "src/a.ts",
+            "export function parseConfig(text: string) { return text; }\n\
+             export function load() { return parseConfig(''); }\n\
+             export class Store {\n  /** Deletes a user. */\n  remove() {}\n}\n\
+             export function audit() {\n  // TODO: remove legacy auth hack\n  return 1;\n}\n\
+             /** Max retries */\nexport const MAX = 3, handler = () => 0;\n"
+                .into(),
+        )],
+    );
+    // A relation word does not count as an unmatched term.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "what uses parseConfig" }),
+    );
+    assert!(ok && !text.contains("low_confidence"), "{text}");
+
+    let doc = |id: &str| symbol_in(&repo, id)["doc"].clone();
+    assert_eq!(doc("src/a.ts::Store::remove"), "Deletes a user.");
+    assert!(
+        doc("src/a.ts::Store").is_null(),
+        "a class does not take its member's doc"
+    );
+    assert!(
+        doc("src/a.ts::audit").is_null(),
+        "a TODO is not a description"
+    );
+    assert!(
+        doc("src/a.ts::handler").is_null(),
+        "the comment belongs to the whole statement"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {

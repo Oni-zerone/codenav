@@ -432,12 +432,12 @@ fn signature_of(node: Node, source: &[u8]) -> String {
 /// or the docstring for Python definitions.
 fn doc_of(node: Node, source: &[u8]) -> Option<String> {
     // Comments sit before the whole statement: `/** doc */ export const f = () => {}`.
+    // A declaration with several declarators keeps its comment to itself.
     let mut anchor = node;
-    while let Some(p) = anchor.parent().filter(|p| {
-        matches!(
-            p.kind(),
-            "export_statement" | "lexical_declaration" | "variable_declaration"
-        )
+    while let Some(p) = anchor.parent().filter(|p| match p.kind() {
+        "export_statement" => true,
+        "lexical_declaration" | "variable_declaration" => p.named_child_count() == 1,
+        _ => false,
     }) {
         anchor = p;
     }
@@ -477,8 +477,13 @@ fn doc_of(node: Node, source: &[u8]) -> Option<String> {
                 .to_string();
         }
     }
-    if doc.is_empty() {
-        // Comments opening the body (`fn f() { // does X`), for code documented inside.
+    // Comments opening a function's body (`fn f() { // does X`), for code documented
+    // inside; for a class or trait they would be its first member's doc.
+    let function_like = {
+        let k = node.kind();
+        k.contains("function") || k.contains("method") || k == "variable_declarator"
+    };
+    if doc.is_empty() && function_like {
         let body = node.child_by_field_name("body").or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|v| v.child_by_field_name("body"))
@@ -490,11 +495,23 @@ fn doc_of(node: Node, source: &[u8]) -> Option<String> {
                 .take_while(|c| c.kind().contains("comment"))
                 .take(6)
                 .map(|c| clean_comment(c.utf8_text(source).unwrap_or("")))
+                .filter(|c| !is_directive(c))
                 .collect();
             doc = leading.join(" ").trim().to_string();
         }
     }
     (!doc.is_empty()).then(|| truncate(doc, 300))
+}
+
+/// Tool directives and notes (`TODO`, `eslint-disable`, `noqa`…), not descriptions.
+fn is_directive(comment: &str) -> bool {
+    let c = comment.trim_start().to_lowercase();
+    [
+        "todo", "fixme", "hack", "xxx", "eslint", "prettier", "@ts-", "noqa", "pylint", "nolint",
+        "type:", "clippy", "istanbul", "c8 ", "biome-",
+    ]
+    .iter()
+    .any(|p| c.starts_with(p))
 }
 
 fn clean_comment(t: &str) -> String {
