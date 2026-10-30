@@ -322,6 +322,12 @@ pub struct Graph {
     /// `ANALYSIS_VERSION` of the indexer that built the graph (0: before it existed).
     #[serde(default)]
     pub analysis: u32,
+    /// Packages the repository declares (npm workspaces, crates).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<crate::packages::PackageRef>,
+    /// Package manifests found when indexing (a new or removed one makes it stale).
+    #[serde(default)]
+    pub manifest_files: usize,
     /// Hub percentile the communities were computed with.
     #[serde(default = "default_hub_percentile")]
     pub hub_percentile: f64,
@@ -359,6 +365,22 @@ impl Graph {
         let data = fs::read(Self::index_path(root)).ok()?;
         let h: Header = serde_json::from_slice(&data).ok()?;
         (h.version == FORMAT_VERSION).then_some(h.hub_percentile)
+    }
+
+    /// Packages recorded in the saved index, without building its lookup indexes.
+    pub fn saved_packages(root: &Path) -> Vec<crate::packages::PackageRef> {
+        #[derive(Deserialize)]
+        struct Header {
+            version: u32,
+            #[serde(default)]
+            packages: Vec<crate::packages::PackageRef>,
+        }
+        fs::read(Self::index_path(root))
+            .ok()
+            .and_then(|d| serde_json::from_slice::<Header>(&d).ok())
+            .filter(|h| h.version == FORMAT_VERSION)
+            .map(|h| h.packages)
+            .unwrap_or_default()
     }
 
     pub fn new(root: &Path) -> Graph {
