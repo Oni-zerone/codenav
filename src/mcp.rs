@@ -2,7 +2,7 @@
 //! graph as tools. Logs go to stderr: stdout is reserved for protocol messages.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -32,16 +32,52 @@ Call resolution is name-based, so each edge has a confidence: exact (same file, 
 self/type qualifier), inferred (found by proximity or unique in the repository) or ambiguous (one of \
 several same-named candidates: may be a false positive, verify with read_code). Only non-exact edges \
 are labelled. Pass min_confidence to get_neighbors, find_paths, impact_analysis or explore to follow \
-only surer edges; audit_edges lists the guesses.";
+only surer edges; audit_edges lists the guesses. \
+When several repositories are served, pass `project` (a name from list_projects) to any tool; \
+without it, tools answer about the first one.";
 
-pub struct Server {
+/// Graphs kept in memory at once by default (least recently used are dropped).
+pub const DEFAULT_MAX_LOADED: usize = 4;
+
+/// One repository's loaded state: the active project's is `Server::cur`, the others'
+/// are parked in their `Project`.
+struct State {
     root: PathBuf,
     graph: Graph,
-    last_stale_check: Instant,
-    auto_refresh: bool,
     index_options: IndexOptions,
     /// insights for (graph build time in ms, top): costly, changes only on reindex.
     insights_cache: Option<((u64, usize), Value)>,
+    last_stale_check: Instant,
+}
+
+/// A served repository.
+struct Project {
+    name: String,
+    root: PathBuf,
+    /// Its state while another project is active; None when not loaded (or dropped).
+    parked: Option<State>,
+    last_used: u64,
+}
+
+/// How graphs are loaded: `--fresh` and `--hub-percentile` apply to every repository.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions {
+    pub fresh: bool,
+    pub hub_percentile: Option<f64>,
+}
+
+pub struct Server {
+    /// The active project.
+    cur: State,
+    auto_refresh: bool,
+    /// Served repositories; the first is the default, `active` the one in `cur`.
+    projects: Vec<Project>,
+    active: usize,
+    /// Open repositories by path on demand, not only the ones given at startup.
+    any_project: bool,
+    max_loaded: usize,
+    load_options: LoadOptions,
+    clock: u64,
 }
 
 impl Server {
@@ -51,14 +87,175 @@ impl Server {
         auto_refresh: bool,
         index_options: IndexOptions,
     ) -> Self {
+        let projects = vec![Project {
+            name: project_name(&root, &[]),
+            root: root.clone(),
+            parked: None,
+            last_used: 0,
+        }];
         Server {
+            cur: State {
+                root,
+                graph,
+                index_options,
+                insights_cache: None,
+                last_stale_check: Instant::now(),
+            },
+            auto_refresh,
+            projects,
+            active: 0,
+            any_project: false,
+            max_loaded: DEFAULT_MAX_LOADED,
+            load_options: LoadOptions::default(),
+            clock: 0,
+        }
+    }
+
+    /// Serves another repository too; its graph is loaded on first use.
+    pub fn add_project(&mut self, root: PathBuf) {
+        if self.projects.iter().any(|p| p.root == root) {
+            return;
+        }
+        let names: Vec<&str> = self.projects.iter().map(|p| p.name.as_str()).collect();
+        let name = project_name(&root, &names);
+        self.projects.push(Project {
+            name,
+            root,
+            parked: None,
+            last_used: 0,
+        });
+    }
+
+    /// Lets `project` name any repository by path, not only the served ones.
+    pub fn allow_any_project(&mut self, yes: bool) {
+        self.any_project = yes;
+    }
+
+    pub fn set_max_loaded(&mut self, n: usize) {
+        self.max_loaded = n.max(1);
+    }
+
+    /// Applies `--fresh` / `--hub-percentile` to the repositories loaded later.
+    pub fn set_load_options(&mut self, opts: LoadOptions) {
+        self.load_options = opts;
+    }
+
+    /// Makes the project named by the `project` argument (default: the first) active.
+    fn select_project(&mut self, a: &Value) -> Result<()> {
+        let idx = match opt_str(a, "project")? {
+            None => 0,
+            Some(p) => self.find_project(p)?,
+        };
+        self.switch_to(idx)
+    }
+
+    /// A served project by name or absolute path; with `--any-project`, a repository at an
+    /// absolute path is added once its graph loads.
+    fn find_project(&mut self, p: &str) -> Result<usize> {
+        if let Some(i) = self.projects.iter().position(|x| x.name == p) {
+            return Ok(i);
+        }
+        let names = || {
+            let n: Vec<&str> = self.projects.iter().map(|x| x.name.as_str()).collect();
+            n.join(", ")
+        };
+        // Relative paths would depend on where the client started the server.
+        if !Path::new(p).is_absolute() {
+            return Err(anyhow!(
+                "unknown project `{p}`; pass a name ({}) or an absolute path",
+                names()
+            ));
+        }
+        let path = std::fs::canonicalize(p).ok();
+        if let Some(i) = path
+            .as_ref()
+            .and_then(|c| self.projects.iter().position(|x| &x.root == c))
+        {
+            return Ok(i);
+        }
+        if !self.any_project {
+            return Err(anyhow!(
+                "unknown project `{p}`; served: {} (start the server with --any-project to \
+                 open other repositories by path)",
+                names()
+            ));
+        }
+        // Only repositories: never index a whole home directory or filesystem.
+        let root = path
+            .filter(|c| c.join(".git").exists() || Graph::index_path(c).exists())
+            .ok_or_else(|| anyhow!("`{p}` is not a repository (no .git and no codenav index)"))?;
+        let state = self.load(root.clone())?;
+        let taken: Vec<&str> = self.projects.iter().map(|x| x.name.as_str()).collect();
+        let name = project_name(&root, &taken);
+        self.projects.push(Project {
+            name,
+            root,
+            parked: Some(state),
+            last_used: 0,
+        });
+        Ok(self.projects.len() - 1)
+    }
+
+    fn load(&self, root: PathBuf) -> Result<State> {
+        let opts = self.load_options;
+        let (graph, index_options) =
+            indexer::load_or_index(&root, opts.fresh, opts.hub_percentile)?;
+        Ok(State {
             root,
             graph,
-            last_stale_check: Instant::now(),
-            auto_refresh,
             index_options,
             insights_cache: None,
+            last_stale_check: Instant::now(),
+        })
+    }
+
+    /// Parks the active project and activates `idx`, loading its graph if needed. Graphs
+    /// beyond `max_loaded` are dropped, least recently used first, before a new one loads
+    /// (while it loads, the previously active one is still held).
+    fn switch_to(&mut self, idx: usize) -> Result<()> {
+        self.clock += 1;
+        self.projects[idx].last_used = self.clock;
+        if idx == self.active {
+            return Ok(());
         }
+        let loading = self.projects[idx].parked.is_none();
+        // After the switch: the parked ones, plus the old active (parked), plus the new.
+        let budget = self.max_loaded.saturating_sub(if loading { 1 } else { 0 });
+        while 1 + self.projects.iter().filter(|p| p.parked.is_some()).count() > budget.max(1) {
+            let Some(lru) = (0..self.projects.len())
+                .filter(|&i| i != idx && self.projects[i].parked.is_some())
+                .min_by_key(|&i| self.projects[i].last_used)
+            else {
+                break;
+            };
+            self.projects[lru].parked = None;
+        }
+        let next = match self.projects[idx].parked.take() {
+            Some(state) => state,
+            None => self.load(self.projects[idx].root.clone())?,
+        };
+        let old = std::mem::replace(&mut self.cur, next);
+        let keep_old =
+            1 + self.projects.iter().filter(|p| p.parked.is_some()).count() < self.max_loaded;
+        self.projects[self.active].parked = keep_old.then_some(old);
+        self.active = idx;
+        Ok(())
+    }
+
+    fn list_projects(&self) -> Value {
+        json!(
+            self.projects
+                .iter()
+                .enumerate()
+                .map(|(i, p)| json!({
+                    "name": p.name,
+                    "root": p.root.display().to_string(),
+                    "default": i == 0,
+                    "active": i == self.active,
+                    "loaded": i == self.active || p.parked.is_some(),
+                }))
+                .collect::<Vec<_>>()
+        )
     }
 
     pub fn run(mut self) -> Result<()> {
@@ -173,28 +370,28 @@ impl Server {
     }
 
     fn refresh_if_stale(&mut self) {
-        if !self.auto_refresh || self.last_stale_check.elapsed() < STALE_CHECK_INTERVAL {
+        if !self.auto_refresh || self.cur.last_stale_check.elapsed() < STALE_CHECK_INTERVAL {
             return;
         }
-        self.last_stale_check = Instant::now();
-        if indexer::is_stale(&self.root, &self.graph) {
+        self.cur.last_stale_check = Instant::now();
+        if indexer::is_stale(&self.cur.root, &self.cur.graph) {
             eprintln!("codenav: sources changed, re-indexing…");
             if let Err(e) = self.reindex() {
                 eprintln!("codenav: re-index failed: {e:#}");
             }
-        } else if vcs::refresh_state(&mut self.graph, &self.root)
-            && let Err(e) = self.graph.save(&self.root)
+        } else if vcs::refresh_state(&mut self.cur.graph, &self.cur.root)
+            && let Err(e) = self.cur.graph.save(&self.cur.root)
         {
             eprintln!("codenav: could not save index: {e:#}");
         }
     }
 
     fn reindex(&mut self) -> Result<Value> {
-        let (graph, stats) = indexer::index_with(&self.root, &self.index_options)?;
-        if let Err(e) = graph.save(&self.root) {
+        let (graph, stats) = indexer::index_with(&self.cur.root, &self.cur.index_options)?;
+        if let Err(e) = graph.save(&self.cur.root) {
             eprintln!("codenav: could not save index: {e:#}");
         }
-        self.graph = graph;
+        self.cur.graph = graph;
         Ok(json!({
             "files": stats.files,
             "symbols": stats.symbols,
@@ -213,6 +410,10 @@ impl Server {
 
     /// A tool's answer as text (or JSON); `hint` says how to get a smaller one when cut.
     fn render_tool(&mut self, name: &str, a: &Value, hint: &str) -> Result<String> {
+        // Listing projects must not switch to (and maybe load) the default one.
+        if name != "list_projects" {
+            self.select_project(a)?;
+        }
         let format = opt_str(a, "format")?.unwrap_or("text").to_lowercase();
         anyhow::ensure!(
             format == "text" || format == "json",
@@ -231,32 +432,38 @@ impl Server {
 
     fn run_tool(&mut self, name: &str, a: &Value) -> Result<Value> {
         if name == "reindex" {
-            self.last_stale_check = Instant::now();
+            self.cur.last_stale_check = Instant::now();
             return self.reindex();
+        }
+        if name == "list_projects" {
+            return Ok(json!({ "projects": self.list_projects() }));
         }
         self.refresh_if_stale();
         // diff_impact matches diff lines to the graph's: it must reflect the current files.
-        if name == "diff_impact" && indexer::is_stale(&self.root, &self.graph) {
-            self.last_stale_check = Instant::now();
+        if name == "diff_impact" && indexer::is_stale(&self.cur.root, &self.cur.graph) {
+            self.cur.last_stale_check = Instant::now();
             self.reindex()?;
         }
         if name == "insights" {
-            let key = (self.graph.indexed_at_ms, uint(a, "top", 10)?.clamp(1, 50));
-            if let Some((k, v)) = &self.insights_cache
+            let key = (
+                self.cur.graph.indexed_at_ms,
+                uint(a, "top", 10)?.clamp(1, 50),
+            );
+            if let Some((k, v)) = &self.cur.insights_cache
                 && *k == key
             {
                 return Ok(v.clone());
             }
-            let v = insights::insights(&self.graph, key.1);
-            self.insights_cache = Some((key, v.clone()));
+            let v = insights::insights(&self.cur.graph, key.1);
+            self.cur.insights_cache = Some((key, v.clone()));
             return Ok(v);
         }
-        let g = &self.graph;
+        let g = &self.cur.graph;
         match name {
             "graph_overview" => {
                 let mut v = query::overview(g, uint(a, "top", 15)?);
                 // With auto-refresh, stale sources are re-indexed on their own.
-                v["index"] = vcs::index_state(g, &self.root, !self.auto_refresh);
+                v["index"] = vcs::index_state(g, &self.cur.root, !self.auto_refresh);
                 Ok(v)
             }
             "get_community" => {
@@ -338,7 +545,7 @@ impl Server {
             "get_symbol" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 let code = opt_bool(a, "include_code")?.unwrap_or(true);
-                Ok(query::symbol_details(g, &self.root, i, code))
+                Ok(query::symbol_details(g, &self.cur.root, i, code))
             }
             "get_neighbors" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
@@ -409,7 +616,7 @@ impl Server {
                 };
                 diff_impact::diff_impact(
                     g,
-                    &self.root,
+                    &self.cur.root,
                     &source,
                     uint(a, "depth", 3)?.clamp(1, 8) as u32,
                     uint(a, "limit", 200)?.max(1),
@@ -482,12 +689,12 @@ impl Server {
                 let file = string(a, "file")?;
                 let start = uint(a, "start_line", 1)? as u32;
                 let end = uint(a, "end_line", start as usize + 80)? as u32;
-                let path = self.root.join(&file).canonicalize()?;
+                let path = self.cur.root.join(&file).canonicalize()?;
                 anyhow::ensure!(
-                    path.starts_with(self.root.canonicalize()?),
+                    path.starts_with(self.cur.root.canonicalize()?),
                     "path outside repository"
                 );
-                let code = query::read_lines(&self.root, &file, start, end)
+                let code = query::read_lines(&self.cur.root, &file, start, end)
                     .ok_or_else(|| anyhow!("cannot read {file}"))?;
                 let lines: Vec<Vec<String>> = code.lines().map(|l| vec![l.to_string()]).collect();
                 Ok(Value::String(output::fit_blocks(
@@ -631,6 +838,26 @@ fn architecture_review(focus: Option<&str>) -> Value {
     })
 }
 
+/// A short unique name for a repository: its directory name, or more of its path when
+/// that is taken.
+fn project_name(root: &Path, taken: &[&str]) -> String {
+    // Directory names only: no root or drive prefix (`/`, `C:`, `\`).
+    let parts: Vec<String> = root
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    for n in 1..=parts.len() {
+        let name = parts[parts.len() - n..].join("/");
+        if !taken.contains(&name.as_str()) {
+            return name;
+        }
+    }
+    root.display().to_string()
+}
+
 fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
@@ -720,12 +947,16 @@ fn tool_definitions() -> Value {
     let mut tools = base_tool_definitions();
     let budget = json!({ "type": "integer", "description": "Approximate max output tokens, 200-100000, default 2000. Output beyond it is cut with a notice at the top." });
     let format = json!({ "type": "string", "enum": ["text", "json"], "description": "text (default): compact, cut to token_budget. json: the full structured result, no budget." });
+    let project = json!({ "type": "string", "description": "Repository to answer about, by name (see list_projects) or path; default: the first served." });
     let min_confidence = json!({ "type": "string", "enum": ["exact", "inferred", "ambiguous"], "description": "Follow only edges at least this sure: exact, inferred (exact + inferred) or ambiguous (all, default)." });
     for tool in tools.as_array_mut().into_iter().flatten() {
         let name = tool["name"].as_str().unwrap_or("").to_string();
         let Some(props) = tool["inputSchema"]["properties"].as_object_mut() else {
             continue;
         };
+        if name != "list_projects" {
+            props.insert("project".into(), project.clone());
+        }
         if name == "reindex" {
             continue;
         }
@@ -845,6 +1076,11 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "list_projects",
+            "description": "Repositories this server answers about: name (pass it as `project` to any tool), root, which is the default, active and loaded.",
+            "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "diff_impact",

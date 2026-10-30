@@ -78,7 +78,7 @@ cargo install --path .
 
 ```sh
 codenav index [PATH]              # crea/aggiorna PATH/.codenav/graph.cnav
-codenav serve [PATH]              # server MCP su stdio
+codenav serve [PATH]...           # server MCP su stdio (più repository: il primo è il default)
 codenav tool <nome> '<json>' [PATH]  # invoca un tool MCP da terminale (anche --path PATH)
 codenav ast <file>                # albero tree-sitter (per scrivere nuove query)
 ```
@@ -142,6 +142,7 @@ aggiornamento automatico quando l'indice cambia.
 | `audit_edges` | Verifica del resolver: archi per tipo e confidenza, poi quelli di un livello (default `ambiguous`) con file e riga |
 | `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base) |
 | `read_code` | Legge un intervallo di righe di un file del repo |
+| `list_projects` | Repository serviti (nome da passare come `project` a ogni tool), quale è il default e quali sono caricati |
 | `reindex` | Ricostruisce il grafo |
 
 Tutti i tool che restituiscono dati strutturati rispondono di default in **testo compatto**
@@ -149,6 +150,16 @@ Tutti i tool che restituiscono dati strutturati rispondono di default in **testo
 100000). Se l'output viene tagliato, la prima riga lo dice e indica il `token_budget` necessario
 per vedere tutto, più un suggerimento per restringere la richiesta. Con `format: "json"` si ottiene
 invece il risultato JSON completo, senza budget.
+
+### Più repository
+
+`codenav serve repo-a repo-b …` serve più repository da un solo server: ogni tool accetta
+`project` (il nome mostrato da `list_projects`, o il path), e senza `project` risponde sul primo.
+I grafi si caricano al primo uso; al massimo `--max-loaded` (default 4) restano in memoria, i meno
+usati di recente vengono scaricati e ricaricati dal loro indice quando servono. Con
+`--any-project` i tool possono aprire anche altri repository indicandone il path assoluto (solo
+cartelle con `.git` o con un indice codenav). `--fresh` e `--hub-percentile` valgono per tutti i
+repository.
 
 ### Risorse e prompt MCP
 

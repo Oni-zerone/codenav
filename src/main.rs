@@ -18,8 +18,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
-use crate::graph::Graph;
-use crate::indexer::IndexOptions;
 use crate::lang::Lang;
 
 /// Index a repository into a code graph and serve it to LLMs over MCP.
@@ -41,8 +39,19 @@ enum Command {
     },
     /// Run the MCP server on stdio (indexes first if needed).
     Serve {
+        /// Repositories to serve; the first is the default for tools called without
+        /// `project`, the others are loaded on first use.
         #[arg(default_value = ".")]
-        path: PathBuf,
+        paths: Vec<PathBuf>,
+        /// Let tools open any repository by path (`project`), not only the ones served.
+        #[arg(long)]
+        any_project: bool,
+        /// Graphs kept in memory at once; the least recently used are dropped (reloaded
+        /// from their index when needed). While switching to an unloaded repository, the
+        /// previously active graph is held until the new one is loaded.
+        #[arg(long, default_value_t = mcp::DEFAULT_MAX_LOADED as u16,
+              value_parser = clap::value_parser!(u16).range(1..))]
+        max_loaded: u16,
         /// Always re-index on startup instead of reusing a fresh cached graph.
         #[arg(long)]
         fresh: bool,
@@ -79,16 +88,6 @@ struct IndexArgs {
     hub_percentile: Option<f64>,
 }
 
-/// Explicit settings win; otherwise keep those of the saved index, so a later
-/// re-index (by `serve`, `tool` or a plain `index`) doesn't change the communities.
-fn index_options(root: &Path, requested: Option<f64>) -> IndexOptions {
-    IndexOptions {
-        hub_percentile: requested
-            .or_else(|| Graph::saved_hub_percentile(root))
-            .unwrap_or(communities::DEFAULT_HUB_PERCENTILE),
-    }
-}
-
 fn parse_percentile(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
     if (0.0..=100.0).contains(&v) {
@@ -102,7 +101,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Index { path, opts } => {
             let root = canonical_root(&path)?;
-            let opts = index_options(&root, opts.hub_percentile);
+            let opts = indexer::index_options(&root, opts.hub_percentile);
             let (graph, stats) = indexer::index_with(&root, &opts)?;
             let saved = graph.save(&root)?;
             let mut langs: Vec<String> = stats
@@ -126,14 +125,30 @@ fn main() -> Result<()> {
             eprintln!("Saved to {}", saved.display());
         }
         Command::Serve {
-            path,
+            paths,
+            any_project,
+            max_loaded,
             fresh,
             no_refresh,
             opts,
         } => {
-            let root = canonical_root(&path)?;
-            let (graph, opts) = load_or_index(&root, fresh, opts.hub_percentile)?;
-            mcp::Server::new(root, graph, !no_refresh, opts).run()?;
+            let roots: Vec<PathBuf> = paths
+                .iter()
+                .map(|p| canonical_root(p))
+                .collect::<Result<_>>()?;
+            let load = mcp::LoadOptions {
+                fresh,
+                hub_percentile: opts.hub_percentile,
+            };
+            let (graph, opts) = indexer::load_or_index(&roots[0], fresh, opts.hub_percentile)?;
+            let mut server = mcp::Server::new(roots[0].clone(), graph, !no_refresh, opts);
+            server.set_load_options(load);
+            for root in &roots[1..] {
+                server.add_project(root.clone());
+            }
+            server.allow_any_project(any_project);
+            server.set_max_loaded(usize::from(max_loaded));
+            server.run()?;
         }
         Command::Tool {
             name,
@@ -148,7 +163,7 @@ fn main() -> Result<()> {
                 .filter(serde_json::Value::is_object)
                 .ok_or_else(|| anyhow!("arguments must be a JSON object, got `{args}`"))?;
             let root = canonical_root(&path)?;
-            let (graph, opts) = load_or_index(&root, false, None)?;
+            let (graph, opts) = indexer::load_or_index(&root, false, None)?;
             let mut server = mcp::Server::new(root, graph, false, opts);
             let result = server.call_tool(&name, &args)?;
             println!("{result}");
@@ -182,58 +197,4 @@ fn tool_args_and_path(args: Option<String>, path: Option<PathBuf>) -> (String, P
 fn canonical_root(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
         .with_context(|| format!("cannot open {}", path.display()))
-}
-
-/// Reuses the saved graph when it is up to date and was built with the requested
-/// settings, otherwise indexes and saves. Returns the settings in effect.
-fn load_or_index(
-    root: &Path,
-    force: bool,
-    requested: Option<f64>,
-) -> Result<(Graph, IndexOptions)> {
-    let index_path = Graph::index_path(root);
-    let opts = if force || !index_path.exists() {
-        if !force {
-            eprintln!("codenav: no index found, indexing {}…", root.display());
-        }
-        index_options(root, requested)
-    } else {
-        match Graph::load(root) {
-            Ok(mut g) => {
-                let opts = IndexOptions {
-                    hub_percentile: requested.unwrap_or(g.hub_percentile),
-                };
-                if opts.hub_percentile != g.hub_percentile {
-                    eprintln!(
-                        "codenav: hub percentile changed ({} → {}), re-indexing…",
-                        g.hub_percentile, opts.hub_percentile
-                    );
-                } else if indexer::is_stale(root, &g) {
-                    eprintln!("codenav: index is stale, re-indexing…");
-                } else {
-                    // Same code, maybe a new commit: keep the graph, update its Git state.
-                    if vcs::refresh_state(&mut g, root)
-                        && let Err(e) = g.save(root)
-                    {
-                        eprintln!("codenav: could not save index: {e:#}");
-                    }
-                    return Ok((g, opts));
-                }
-                opts
-            }
-            Err(e) => {
-                eprintln!("codenav: cannot use the saved index ({e:#}), re-indexing…");
-                index_options(root, requested)
-            }
-        }
-    };
-    let (graph, stats) = indexer::index_with(root, &opts)?;
-    eprintln!(
-        "codenav: {} files, {} symbols, {} edges, {} communities ({:.2?})",
-        stats.files, stats.symbols, stats.edges, stats.communities, stats.elapsed
-    );
-    if let Err(e) = graph.save(root) {
-        eprintln!("codenav: could not save index: {e:#}");
-    }
-    Ok((graph, opts))
 }
