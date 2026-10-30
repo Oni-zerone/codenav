@@ -59,6 +59,24 @@ codenav tool find_paths '{"from":"Server::run","to":"extract","directed":true}'
 codenav tool module_graph '{"depth":2}'
 ```
 
+### Escludere percorsi: `.codenavignore`
+
+Oltre a `.gitignore` e alle cartelle escluse di default (`node_modules`, `target`, `vendor`,
+`Pods`, `build`, `dist`…), codenav legge i file `.codenavignore`, che hanno la stessa sintassi di
+`.gitignore`. Un file nella root vale per tutto il repo, uno in una sottocartella vale solo lì.
+Serve per escludere fixture di test, codice generato o vendorizzato che non si vuole nel grafo:
+
+```gitignore
+tests/fixtures/
+**/*.generated.ts
+```
+
+Le regole possono solo **restringere** l'indice: un `!pattern` crea un'eccezione alle regole di
+`.codenavignore`, ma non reinclude file esclusi da `.gitignore`, cartelle nascoste o cartelle
+escluse di default. Vengono letti solo i `.codenavignore` della root e delle sue sottocartelle,
+quindi una cartella esclusa si può sempre indicizzare passandola direttamente come root. Su macOS e
+Windows i pattern non distinguono maiuscole e minuscole, come fa git.
+
 L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, quindi non finisce
 nel versionamento). `serve` riusa l'indice se è aggiornato e, mentre gira, re-indicizza da solo
 quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`).
