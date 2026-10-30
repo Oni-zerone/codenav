@@ -236,6 +236,70 @@ pub fn is_stale(root: &Path, graph: &Graph) -> bool {
     })
 }
 
+/// Explicit settings win; otherwise keep those of the saved index, so a later
+/// re-index (by `serve`, `tool` or a plain `index`) doesn't change the communities.
+pub fn index_options(root: &Path, requested: Option<f64>) -> IndexOptions {
+    IndexOptions {
+        hub_percentile: requested
+            .or_else(|| Graph::saved_hub_percentile(root))
+            .unwrap_or(communities::DEFAULT_HUB_PERCENTILE),
+    }
+}
+
+/// Reuses the saved graph when it is up to date and was built with the requested
+/// settings, otherwise indexes and saves. Returns the settings in effect.
+pub fn load_or_index(
+    root: &Path,
+    force: bool,
+    requested: Option<f64>,
+) -> Result<(Graph, IndexOptions)> {
+    let index_path = Graph::index_path(root);
+    let opts = if force || !index_path.exists() {
+        if !force {
+            eprintln!("codenav: no index found, indexing {}…", root.display());
+        }
+        index_options(root, requested)
+    } else {
+        match Graph::load(root) {
+            Ok(mut g) => {
+                let opts = IndexOptions {
+                    hub_percentile: requested.unwrap_or(g.hub_percentile),
+                };
+                if opts.hub_percentile != g.hub_percentile {
+                    eprintln!(
+                        "codenav: hub percentile changed ({} → {}), re-indexing…",
+                        g.hub_percentile, opts.hub_percentile
+                    );
+                } else if is_stale(root, &g) {
+                    eprintln!("codenav: index is stale, re-indexing…");
+                } else {
+                    // Same code, maybe a new commit: keep the graph, update its Git state.
+                    if vcs::refresh_state(&mut g, root)
+                        && let Err(e) = g.save(root)
+                    {
+                        eprintln!("codenav: could not save index: {e:#}");
+                    }
+                    return Ok((g, opts));
+                }
+                opts
+            }
+            Err(e) => {
+                eprintln!("codenav: cannot use the saved index ({e:#}), re-indexing…");
+                index_options(root, requested)
+            }
+        }
+    };
+    let (graph, stats) = index_with(root, &opts)?;
+    eprintln!(
+        "codenav: {} files, {} symbols, {} edges, {} communities ({:.2?})",
+        stats.files, stats.symbols, stats.edges, stats.communities, stats.elapsed
+    );
+    if let Err(e) = graph.save(root) {
+        eprintln!("codenav: could not save index: {e:#}");
+    }
+    Ok((graph, opts))
+}
+
 /// Indexing settings that are not read from the repository itself.
 #[derive(Debug, Clone, Copy)]
 pub struct IndexOptions {

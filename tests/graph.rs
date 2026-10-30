@@ -1905,6 +1905,144 @@ fn explore_seed_review_cases() {
     );
 }
 
+/// Runs `codenav serve <args>` with `tools/call` requests (name, arguments) and returns
+/// each call's text and whether it was an error.
+fn serve_calls(args: &[&std::ffi::OsStr], calls: &[(&str, Value)]) -> Vec<(bool, String)> {
+    let mut child = codenav()
+        .arg("serve")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for (i, (name, arguments)) in calls.iter().enumerate() {
+            let r = json!({"jsonrpc":"2.0","id":i,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+            writeln!(stdin, "{r}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let lines: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), calls.len());
+    lines
+        .iter()
+        .map(|l| {
+            let r = &l["result"];
+            (
+                r["isError"] == false,
+                r["content"][0]["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn one_server_answers_about_several_projects() {
+    let other = TempRepo::new(
+        "multi-b",
+        &[("lib/tools.py", "def sharpen():\n    pass\n".into())],
+    );
+    let third = TempRepo::new(
+        "multi-c",
+        &[("x.py", "def only_in_third():\n    pass\n".into())],
+    );
+    let poly = fixture().as_os_str();
+    let b = other.0.as_os_str();
+    let b_name = other.0.file_name().unwrap().to_str().unwrap().to_string();
+    let search = |q: &str, project: Option<&str>| {
+        let mut a = json!({ "query": q, "format": "json" });
+        if let Some(p) = project {
+            a["project"] = json!(p);
+        }
+        ("search_symbols", a)
+    };
+
+    let r = serve_calls(
+        &[poly, b],
+        &[
+            ("list_projects", json!({ "format": "json" })),
+            search("sharpen", Some(&b_name)),
+            search("sharpen", None),
+            search("ItemStore", None),
+            search("sharpen", Some(other.0.to_str().unwrap())),
+            search("x", Some("nope")),
+            search("only_in_third", Some(third.0.to_str().unwrap())),
+        ],
+    );
+    let projects: Value = serde_json::from_str(&r[0].1).unwrap();
+    let list = projects["projects"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{projects:#}");
+    assert_eq!(list[0]["name"], "poly");
+    assert_eq!(list[0]["default"], true);
+    assert_eq!(list[1]["name"], b_name.as_str());
+    assert_eq!(list[1]["loaded"], false, "loaded on first use");
+    assert!(
+        r[1].0 && r[1].1.contains("lib/tools.py::sharpen"),
+        "{}",
+        r[1].1
+    );
+    let default: Value = serde_json::from_str(&r[2].1).unwrap();
+    assert_eq!(
+        default["total_matches"], 0,
+        "the default is the first project: {default:#}"
+    );
+    assert!(r[3].0 && r[3].1.contains("ItemStore"), "{}", r[3].1);
+    assert!(
+        r[4].0 && r[4].1.contains("lib/tools.py::sharpen"),
+        "by path: {}",
+        r[4].1
+    );
+    assert!(
+        !r[5].0 && r[5].1.contains("unknown project `nope`"),
+        "{}",
+        r[5].1
+    );
+    assert!(!r[6].0 && r[6].1.contains("--any-project"), "{}", r[6].1);
+
+    // One graph in memory at a time: switching drops and reloads, answers stay right.
+    let max1: &std::ffi::OsStr = "--max-loaded".as_ref();
+    let one: &std::ffi::OsStr = "1".as_ref();
+    let r = serve_calls(
+        &[poly, b, max1, one],
+        &[
+            search("ItemStore", None),
+            search("sharpen", Some(&b_name)),
+            search("ItemStore", None),
+            ("list_projects", json!({ "format": "json" })),
+        ],
+    );
+    assert!(
+        r[0].1.contains("ItemStore") && r[1].1.contains("sharpen") && r[2].1.contains("ItemStore")
+    );
+    let projects: Value = serde_json::from_str(&r[3].1).unwrap();
+    let loaded: Vec<bool> = projects["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["loaded"].as_bool().unwrap())
+        .collect();
+    assert_eq!(loaded, vec![true, false], "{projects:#}");
+
+    // --any-project opens other repositories by path.
+    let any: &std::ffi::OsStr = "--any-project".as_ref();
+    let r = serve_calls(
+        &[poly, any],
+        &[search("only_in_third", Some(third.0.to_str().unwrap()))],
+    );
+    assert!(
+        r[0].0 && r[0].1.contains("x.py::only_in_third"),
+        "{}",
+        r[0].1
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
