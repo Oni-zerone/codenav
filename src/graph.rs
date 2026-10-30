@@ -1,0 +1,287 @@
+//! The code graph: nodes (files and symbols), typed edges, persistence and lookup indexes.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::lang::Lang;
+
+pub const INDEX_DIR: &str = ".codenav";
+const GRAPH_FILE: &str = "graph.json";
+const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum SymKind {
+    File,
+    External,
+    Module,
+    Class,
+    Struct,
+    Enum,
+    Interface,
+    Type,
+    Function,
+    Method,
+    Constant,
+    Macro,
+}
+
+impl SymKind {
+    pub fn parse(s: &str) -> Option<SymKind> {
+        Some(match s {
+            "file" => SymKind::File,
+            "external" => SymKind::External,
+            "module" => SymKind::Module,
+            "class" => SymKind::Class,
+            "struct" => SymKind::Struct,
+            "enum" => SymKind::Enum,
+            "interface" | "trait" | "protocol" => SymKind::Interface,
+            "type" => SymKind::Type,
+            "function" => SymKind::Function,
+            "method" => SymKind::Method,
+            "constant" => SymKind::Constant,
+            "macro" => SymKind::Macro,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SymKind::File => "file",
+            SymKind::External => "external",
+            SymKind::Module => "module",
+            SymKind::Class => "class",
+            SymKind::Struct => "struct",
+            SymKind::Enum => "enum",
+            SymKind::Interface => "interface",
+            SymKind::Type => "type",
+            SymKind::Function => "function",
+            SymKind::Method => "method",
+            SymKind::Constant => "constant",
+            SymKind::Macro => "macro",
+        }
+    }
+
+    /// Used to pick a winner when one syntax node matches several patterns.
+    pub fn specificity(self) -> u8 {
+        match self {
+            SymKind::Type => 0,
+            SymKind::Function => 1,
+            _ => 2,
+        }
+    }
+
+    pub fn is_type(self) -> bool {
+        matches!(
+            self,
+            SymKind::Class | SymKind::Struct | SymKind::Enum | SymKind::Interface | SymKind::Type
+        )
+    }
+
+    pub fn is_callable(self) -> bool {
+        matches!(
+            self,
+            SymKind::Function
+                | SymKind::Method
+                | SymKind::Macro
+                | SymKind::Class
+                | SymKind::Struct
+                | SymKind::Enum
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeKind {
+    /// file -> symbol, type -> member
+    Contains,
+    /// file -> file / external package
+    Imports,
+    /// symbol -> symbol
+    Calls,
+    /// type -> supertype / trait / protocol
+    Inherits,
+    /// symbol -> type used in its signature or body
+    References,
+}
+
+impl EdgeKind {
+    pub fn parse(s: &str) -> Option<EdgeKind> {
+        Some(match s {
+            "contains" => EdgeKind::Contains,
+            "imports" => EdgeKind::Imports,
+            "calls" => EdgeKind::Calls,
+            "inherits" | "implements" => EdgeKind::Inherits,
+            "references" | "uses" => EdgeKind::References,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EdgeKind::Contains => "contains",
+            EdgeKind::Imports => "imports",
+            EdgeKind::Calls => "calls",
+            EdgeKind::Inherits => "inherits",
+            EdgeKind::References => "references",
+        }
+    }
+
+    /// Phrase for the reverse direction, used when describing incoming edges.
+    pub fn inverse_str(self) -> &'static str {
+        match self {
+            EdgeKind::Contains => "contained_by",
+            EdgeKind::Imports => "imported_by",
+            EdgeKind::Calls => "called_by",
+            EdgeKind::Inherits => "inherited_by",
+            EdgeKind::References => "referenced_by",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Node {
+    /// Stable identifier, e.g. `src/graph.rs::Graph::load`.
+    pub id: String,
+    pub kind: SymKind,
+    pub name: String,
+    /// Repo-relative path ("" for external packages).
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<Lang>,
+    pub line: u32,
+    pub end_line: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Edge {
+    pub from: usize,
+    pub to: usize,
+    pub kind: EdgeKind,
+    /// Number of occurrences (e.g. call sites) merged into this edge.
+    pub count: u32,
+    /// The target was chosen by name among several candidates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ambiguous: bool,
+    /// First line in the source file where the relation occurs.
+    pub line: u32,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Graph {
+    pub version: u32,
+    pub root: String,
+    /// Unix timestamp (seconds) of the indexing run.
+    pub indexed_at: u64,
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+
+    #[serde(skip)]
+    pub out_edges: Vec<Vec<usize>>,
+    #[serde(skip)]
+    pub in_edges: Vec<Vec<usize>>,
+    #[serde(skip)]
+    pub by_id: HashMap<String, usize>,
+    #[serde(skip)]
+    pub by_name: HashMap<String, Vec<usize>>,
+    #[serde(skip)]
+    pub by_file: HashMap<String, usize>,
+}
+
+impl Graph {
+    pub fn new(root: &Path) -> Graph {
+        Graph {
+            version: FORMAT_VERSION,
+            root: root.display().to_string(),
+            indexed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ..Default::default()
+        }
+    }
+
+    pub fn index_path(root: &Path) -> PathBuf {
+        root.join(INDEX_DIR).join(GRAPH_FILE)
+    }
+
+    pub fn save(&self, root: &Path) -> Result<PathBuf> {
+        let dir = root.join(INDEX_DIR);
+        fs::create_dir_all(&dir)?;
+        // Keep the index out of version control without touching the repo's .gitignore.
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            fs::write(&ignore, "*\n")?;
+        }
+        let path = Self::index_path(root);
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec(self)?)?;
+        fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
+    pub fn load(root: &Path) -> Result<Graph> {
+        let path = Self::index_path(root);
+        let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let mut g: Graph = serde_json::from_slice(&data)?;
+        anyhow::ensure!(
+            g.version == FORMAT_VERSION,
+            "index format v{} is outdated, re-run `codenav index`",
+            g.version
+        );
+        g.build_indexes();
+        Ok(g)
+    }
+
+    pub fn build_indexes(&mut self) {
+        let n = self.nodes.len();
+        self.out_edges = vec![Vec::new(); n];
+        self.in_edges = vec![Vec::new(); n];
+        for (i, e) in self.edges.iter().enumerate() {
+            self.out_edges[e.from].push(i);
+            self.in_edges[e.to].push(i);
+        }
+        self.by_id.clear();
+        self.by_name.clear();
+        self.by_file.clear();
+        for (i, node) in self.nodes.iter().enumerate() {
+            self.by_id.insert(node.id.clone(), i);
+            self.by_name
+                .entry(node.name.to_lowercase())
+                .or_default()
+                .push(i);
+            if node.kind == SymKind::File {
+                self.by_file.insert(node.file.clone(), i);
+            }
+        }
+    }
+
+    pub fn degree(&self, i: usize) -> usize {
+        self.out_edges[i].len() + self.in_edges[i].len()
+    }
+
+    /// Display-friendly qualified name without the file prefix.
+    pub fn qualified_name(&self, i: usize) -> String {
+        let node = &self.nodes[i];
+        node.id
+            .strip_prefix(&format!("{}::", node.file))
+            .unwrap_or(&node.id)
+            .to_string()
+    }
+
+    /// The file node that (transitively) contains a symbol.
+    pub fn file_of(&self, i: usize) -> Option<usize> {
+        self.by_file.get(&self.nodes[i].file).copied()
+    }
+}
