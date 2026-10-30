@@ -253,6 +253,103 @@ fn impact_follows_overrides_across_files_and_levels() {
     assert!(v.get("overridden_members").is_none(), "{v:#}");
 }
 
+/// Community of every non-external node in the fixture, by node id.
+fn fixture_communities() -> (Value, Vec<(String, u64)>) {
+    let out = codenav().arg("index").arg(fixture()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let g: Value =
+        serde_json::from_slice(&std::fs::read(fixture().join(".codenav/graph.cnav")).unwrap())
+            .unwrap();
+    let mut nodes = Vec::new();
+    for n in g["nodes"].as_array().unwrap() {
+        match n["community"].as_u64() {
+            Some(c) => nodes.push((n["id"].as_str().unwrap().to_string(), c)),
+            None => assert_eq!(n["kind"], "external", "{n}"),
+        }
+    }
+    (g, nodes)
+}
+
+#[test]
+fn communities_separate_the_fixture_apps() {
+    let (g, nodes) = fixture_communities();
+    let communities = g["communities"].as_array().unwrap();
+    let mut app_of = std::collections::HashMap::new();
+    for (id, c) in &nodes {
+        let app = id.split('/').next().unwrap();
+        let prev = app_of.entry(*c).or_insert(app);
+        assert_eq!(*prev, app, "community {c} mixes {prev} and {app}");
+    }
+    for app in ["py", "web", "goapp", "ios"] {
+        assert!(app_of.values().any(|a| *a == app), "{app} has no community");
+    }
+    // Ids are dense, largest first, and sizes match the nodes.
+    for (c, info) in communities.iter().enumerate() {
+        let size = nodes.iter().filter(|(_, n)| *n == c as u64).count();
+        assert_eq!(info["size"], json!(size), "{info}");
+        assert!(!info["label"].as_str().unwrap().is_empty());
+    }
+    let sizes: Vec<u64> = communities
+        .iter()
+        .map(|c| c["size"].as_u64().unwrap())
+        .collect();
+    assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
+
+    // Deterministic: re-indexing gives the same assignment.
+    let (_, again) = fixture_communities();
+    assert_eq!(nodes, again);
+}
+
+#[test]
+fn community_tools() {
+    let ios = "ios/Sources/App/Model.swift::ItemStore";
+    let c = tool("get_community", json!({ "id": ios }));
+    assert_eq!(c["node"], ios, "{c:#}");
+    let files = c["files"].to_string();
+    assert!(files.contains("ios/Sources/App/Model.swift"), "{c:#}");
+    assert!(!files.contains("py/"), "{c:#}");
+    let members = c["members"].to_string();
+    assert!(members.contains(ios), "{c:#}");
+
+    // Same community by number, and from get_symbol / graph_overview.
+    let id = c["id"].clone();
+    let by_number = tool("get_community", json!({ "community": id }));
+    assert_eq!(by_number["label"], c["label"]);
+    assert!(by_number.get("node").is_none());
+    let sym = tool("get_symbol", json!({ "id": ios, "include_code": false }));
+    assert_eq!(sym["community"]["id"], id, "{sym:#}");
+    assert_eq!(sym["community"]["label"], c["label"]);
+    let overview = tool("graph_overview", json!({}));
+    let largest = overview["largest_communities"].as_array().unwrap();
+    assert_eq!(
+        overview["community_count"],
+        json!(largest.len()),
+        "{overview:#}"
+    );
+    assert!(
+        largest
+            .iter()
+            .any(|l| l["id"] == id && l["label"] == c["label"])
+    );
+
+    // Limit, and the error paths.
+    let small = tool("get_community", json!({ "id": ios, "limit": 1 }));
+    assert_eq!(small["members"].as_array().unwrap().len(), 1);
+    assert_eq!(small["truncated"], true);
+    for (args, expected) in [
+        (json!({ "community": 999 }), "no community 999"),
+        (json!({}), "pass `id`"),
+        (json!({ "id": "ext:Foundation" }), "has no community"),
+    ] {
+        let (ok, text) = tool_text("get_community", args);
+        assert!(!ok && text.contains(expected), "{text}");
+    }
+}
+
 #[test]
 fn explore_question_returns_relevant_subgraph() {
     let (ok, text) = tool_text(
@@ -484,6 +581,10 @@ fn every_structured_tool_respects_token_budget() {
         ("file_outline", json!({ "path": "src/indexer.rs" })),
         ("impact_analysis", json!({ "id": "src/graph.rs::Graph" })),
         ("explore", json!({ "question": "how is the graph built" })),
+        (
+            "get_community",
+            json!({ "id": "src/graph.rs::Graph", "limit": 200 }),
+        ),
     ];
     let mut truncated = 0;
     for (name, mut args) in calls {

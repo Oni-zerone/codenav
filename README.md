@@ -57,6 +57,7 @@ codenav tool explore '{"question":"come UserService crea gli utenti"}'
 codenav tool search_symbols '{"query":"UserService"}'
 codenav tool find_paths '{"from":"Server::run","to":"extract","directed":true}'
 codenav tool module_graph '{"depth":2}'
+codenav tool get_community '{"id":"UserService"}'
 ```
 
 ### Escludere percorsi: `.codenavignore`
@@ -92,8 +93,9 @@ aggiornamento automatico quando l'indice cambia.
 | Tool | A cosa serve |
 |---|---|
 | `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`) |
-| `graph_overview` | Linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali |
+| `graph_overview` | Linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali, community più grandi |
 | `module_graph` | Architettura: dipendenze aggregate tra directory/componenti |
+| `get_community` | Community strutturale di un nodo (o per numero): file, membri più collegati, community da cui dipende e che la usano |
 | `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path |
 | `get_symbol` | Dettaglio di un nodo: firma, doc, relazioni in/out per tipo, codice sorgente |
 | `get_neighbors` | BFS attorno a un nodo (es. chi chiama X: `direction=in`, `edge_kinds=[calls]`) |
@@ -108,6 +110,21 @@ Tutti i tool che restituiscono dati strutturati rispondono di default in **testo
 100000). Se l'output viene tagliato, la prima riga lo dice e indica il `token_budget` necessario
 per vedere tutto, più un suggerimento per restringere la richiesta. Con `format: "json"` si ottiene
 invece il risultato JSON completo, senza budget.
+
+### Community
+
+Durante l'indicizzazione il grafo viene diviso in **community**: gruppi di file e simboli che
+dipendono tra loro più che dal resto del repo (algoritmo di Louvain sugli archi `calls`,
+`references`, `inherits`, `imports` e `contains`). Mostrano i componenti reali anche quando la
+struttura delle cartelle non li riflette. Ogni community ha un numero (0 è la più grande) e
+un'etichetta automatica: la cartella dominante, oppure il file o il simbolo dominante quando la
+cartella è condivisa. Il calcolo è deterministico, quindi lo stesso codice dà sempre gli stessi
+numeri.
+
+Gli archi di dipendenza degli *hub* (i nodi più collegati, sopra il 99° percentile) non contano,
+così le utility usate ovunque non uniscono parti che non c'entrano. La soglia si cambia con
+`codenav index --hub-percentile N` (o `serve --hub-percentile N`); `100` disattiva l'esclusione.
+I pacchetti esterni non hanno community, e gli archi `ambiguous` pesano la metà.
 
 Dove serve un id si può passare anche un nome univoco (`Graph::load`, `UserService`) o un path:
 se è ambiguo il tool risponde con la lista degli id candidati.

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::explore;
 use crate::graph::{EdgeKind, Graph, SymKind};
-use crate::indexer;
+use crate::indexer::{self, IndexOptions};
 use crate::output;
 use crate::query::{self, Direction};
 
@@ -20,7 +20,7 @@ const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(20);
 const INSTRUCTIONS: &str = "codenav exposes a pre-built graph of this repository. \
 Nodes are files, symbols (classes, structs, interfaces/traits/protocols, functions, methods, ...) \
 and external packages; edges are contains, imports, calls, inherits and references. \
-Start with graph_overview or module_graph for the big picture; for a question about specific code \
+Start with graph_overview or module_graph for the big picture (get_community for structural clusters); for a question about specific code \
 call explore first, which returns the relevant subgraph in one call. Use search_symbols to get node ids, \
 then get_symbol, get_neighbors, find_paths and impact_analysis to explore relations. \
 Call resolution is name-based: edges flagged `ambiguous` may be false positives, verify them with read_code.";
@@ -30,15 +30,22 @@ pub struct Server {
     graph: Graph,
     last_stale_check: Instant,
     auto_refresh: bool,
+    index_options: IndexOptions,
 }
 
 impl Server {
-    pub fn new(root: PathBuf, graph: Graph, auto_refresh: bool) -> Self {
+    pub fn new(
+        root: PathBuf,
+        graph: Graph,
+        auto_refresh: bool,
+        index_options: IndexOptions,
+    ) -> Self {
         Server {
             root,
             graph,
             last_stale_check: Instant::now(),
             auto_refresh,
+            index_options,
         }
     }
 
@@ -126,7 +133,7 @@ impl Server {
     }
 
     fn reindex(&mut self) -> Result<Value> {
-        let (graph, stats) = indexer::index(&self.root)?;
+        let (graph, stats) = indexer::index_with(&self.root, &self.index_options)?;
         if let Err(e) = graph.save(&self.root) {
             eprintln!("codenav: could not save index: {e:#}");
         }
@@ -135,6 +142,7 @@ impl Server {
             "files": stats.files,
             "symbols": stats.symbols,
             "edges": stats.edges,
+            "communities": stats.communities,
             "parse_errors": stats.errors,
             "elapsed_ms": stats.elapsed.as_millis(),
         }))
@@ -168,6 +176,35 @@ impl Server {
         let g = &self.graph;
         match name {
             "graph_overview" => Ok(query::overview(g, uint(a, "top", 15)?)),
+            "get_community" => {
+                let (c, from) = match a.get("community").filter(|v| !v.is_null()) {
+                    Some(_) => (uint(a, "community", 0)?, None),
+                    None => {
+                        let i = query::resolve(g, &string(a, "id").map_err(|_| {
+                            anyhow!("pass `id` (a node in the community) or `community` (its number)")
+                        })?)?;
+                        let c = g.nodes[i].community.ok_or_else(|| {
+                            anyhow!(
+                                "`{}` has no community (external packages are not clustered)",
+                                g.nodes[i].id
+                            )
+                        })?;
+                        (c as usize, Some(i))
+                    }
+                };
+                anyhow::ensure!(
+                    c < g.communities.len(),
+                    "no community {c}: there are {} (0-{})",
+                    g.communities.len(),
+                    g.communities.len().saturating_sub(1)
+                );
+                Ok(query::community(
+                    g,
+                    c as u32,
+                    from,
+                    uint(a, "limit", 30)?.max(1),
+                ))
+            }
             "module_graph" => Ok(query::module_graph(
                 g,
                 uint(a, "depth", 2)?.max(1),
@@ -308,6 +345,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "file_outline" => "use get_symbol on the members you need",
         "impact_analysis" => "lower depth or limit",
         "module_graph" => "lower depth or raise min_weight",
+        "get_community" => "lower limit",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -425,6 +463,15 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "depth": { "type": "integer", "description": "Directory depth defining a component (default 2)." },
                 "min_weight": { "type": "integer", "description": "Hide dependencies weaker than this (default 1)." }
+            } }
+        },
+        {
+            "name": "get_community",
+            "description": "Structural community (cluster of files and symbols that depend on each other more than on the rest, found by Louvain at index time) of a node, or by number: label, size, files, most connected members, and the communities it depends on / is used by. Shows real components when the directory layout doesn't.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "A node in the community (id, unique name or file path)." },
+                "community": { "type": "integer", "description": "Community number instead of id (0 is the largest; see graph_overview)." },
+                "limit": { "type": "integer", "description": "Members listed, most connected first (default 30)." }
             } }
         },
         {

@@ -7,13 +7,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::communities::Community;
 use crate::lang::Lang;
 
 pub const INDEX_DIR: &str = ".codenav";
 const GRAPH_FILE: &str = "graph.cnav";
 /// Name used before the switch to `.cnav`; removed on save so stale copies don't linger.
 const LEGACY_GRAPH_FILE: &str = "graph.json";
-const FORMAT_VERSION: u32 = 1;
+/// v2: communities (`Node::community`, `Graph::communities`).
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
@@ -164,6 +166,9 @@ pub struct Node {
     pub doc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<usize>,
+    /// Index in `Graph::communities`; none for external packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +193,9 @@ pub struct Graph {
     pub indexed_at: u64,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    /// Structural communities, largest first (see `communities`).
+    #[serde(default)]
+    pub communities: Vec<Community>,
 
     #[serde(skip)]
     pub out_edges: Vec<Vec<usize>>,
