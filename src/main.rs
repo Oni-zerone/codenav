@@ -169,7 +169,6 @@ fn main() -> Result<()> {
             path_flag,
             embeddings,
         } => {
-            let embeddings = load_embeddings(embeddings.as_deref())?;
             let (args, path) = tool_args_and_path(args, path.or(path_flag));
             // Validate before indexing: a wrong argument must not index anything.
             let args: serde_json::Value = serde_json::from_str(&args)
@@ -179,7 +178,10 @@ fn main() -> Result<()> {
             let root = canonical_root(&path)?;
             let (graph, opts) = indexer::load_or_index(&root, false, None)?;
             let mut server = mcp::Server::new(root, graph, false, opts);
-            server.set_embeddings(embeddings);
+            // Only explore uses them, and only after the arguments are known to be valid.
+            if name == "explore" {
+                server.set_embeddings(load_embeddings(embeddings.as_deref())?);
+            }
             let result = server.call_tool(&name, &args)?;
             println!("{result}");
         }

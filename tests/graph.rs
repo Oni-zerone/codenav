@@ -2422,10 +2422,7 @@ fn explore_matches_synonyms_with_embeddings() {
 
     // Without a model no word of the question appears in the code.
     let (ok, text) = explore(false);
-    assert!(
-        !ok || !text.contains("seeds: src/plans.ts::loadAthletePlans"),
-        "{text}"
-    );
+    assert!(!ok && text.contains("no node matches"), "{text}");
 
     let (ok, text) = explore(true);
     assert!(ok, "{text}");
@@ -2438,16 +2435,27 @@ fn explore_matches_synonyms_with_embeddings() {
     assert!(!text.contains("low_confidence"), "{text}");
     assert!(!seeds.contains("validatePkce"), "{text}");
 
-    // A broken model file is an error at startup.
-    std::fs::write(repo.0.join("bad.vec"), "a 1 2\nb 1\n").unwrap();
-    let out = codenav()
-        .args(["tool", "graph_overview", "{}"])
-        .arg(&repo.0)
-        .arg("--embeddings")
-        .arg(repo.0.join("bad.vec"))
-        .output()
-        .unwrap();
-    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("expected 2"));
+    assert!(
+        text.contains("matched through synonyms: retrieve ~ load"),
+        "{text}"
+    );
+
+    // A model file without any vector is an error; other tools never load it.
+    std::fs::write(repo.0.join("bad.vec"), "only words here\n").unwrap();
+    let run = |tool: &str| {
+        codenav()
+            .args(["tool", tool, r#"{"question":"load"}"#])
+            .arg(&repo.0)
+            .arg("--embeddings")
+            .arg(repo.0.join("bad.vec"))
+            .output()
+            .unwrap()
+    };
+    let out = run("explore");
+    assert!(
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("no word vectors")
+    );
+    assert!(run("graph_overview").status.success());
 }
 
 /// Several occurrences of one relation: a single sure one makes the edge sure.
