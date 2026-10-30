@@ -232,14 +232,14 @@ pub fn read_lines(root: &Path, file: &str, start: u32, end: u32) -> Option<Strin
 }
 
 /// One traversal step: (neighbor, edge index, edge followed forward?).
-type Step = (usize, usize, bool);
+pub type Step = (usize, usize, bool);
 
 fn edge_allowed(kinds: &[EdgeKind], k: EdgeKind) -> bool {
     kinds.is_empty() || kinds.contains(&k)
 }
 
 /// Steps from `i` along allowed edges in the given direction: (neighbor, edge, outgoing?).
-fn steps<'a>(
+pub fn steps<'a>(
     g: &'a Graph,
     i: usize,
     dir: Direction,

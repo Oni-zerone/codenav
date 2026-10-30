@@ -28,6 +28,23 @@ fn tool(name: &str, args: Value) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+fn tool_text(name: &str, args: Value) -> (bool, String) {
+    let out = codenav()
+        .args(["tool", name, &args.to_string(), "--path"])
+        .arg(fixture())
+        .output()
+        .unwrap();
+    let text = if out.status.success() {
+        out.stdout
+    } else {
+        out.stderr
+    };
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&text).into_owned(),
+    )
+}
+
 /// All non-containment edges of a node as `kind target-id` strings.
 fn outgoing(id: &str) -> Vec<String> {
     let v = tool("get_symbol", json!({ "id": id, "include_code": false }));
@@ -114,6 +131,78 @@ fn paths_and_impact() {
 }
 
 #[test]
+fn explore_question_returns_relevant_subgraph() {
+    let (ok, text) = tool_text(
+        "explore",
+        json!({ "question": "how does UserService create users" }),
+    );
+    assert!(ok, "{text}");
+    let seeds = text.lines().find(|l| l.starts_with("Traversal:")).unwrap();
+    assert!(
+        seeds.contains("py/app/services/users.py::UserService::create"),
+        "{text}"
+    );
+    for expected in [
+        "calls → py/app/models.py::User",
+        "calls → py/app/services/users.py::UserService::notify",
+        "py/app/models.py::Base",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+    }
+    assert!(!text.contains("TRUNCATED"), "{text}");
+}
+
+#[test]
+fn explore_refuses_ambiguous_names_and_honours_seeds() {
+    let (ok, text) = tool_text("explore", json!({ "question": "load" }));
+    assert!(!ok);
+    assert!(
+        text.contains("ItemStore::load") && text.contains("Repository::load"),
+        "{text}"
+    );
+
+    let (ok, text) = tool_text(
+        "explore",
+        json!({ "question": "store", "seeds": ["Store", "missing"], "depth": 1 }),
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("★ goapp/internal/store/store.go::Store (struct)"),
+        "{text}"
+    );
+    assert!(text.contains("seed `missing` skipped"), "{text}");
+}
+
+#[test]
+fn explore_dfs_follows_callers_and_respects_budget() {
+    let (ok, text) = tool_text(
+        "explore",
+        json!({ "question": "chi chiama refresh?", "mode": "dfs", "direction": "in", "edge_kinds": ["calls"] }),
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("★ ios/Sources/App/ViewModel.swift::ViewModel::refresh"),
+        "{text}"
+    );
+    assert!(
+        text.contains("called_by ← ios/Sources/App/ViewModel.swift::ViewModel::reset"),
+        "{text}"
+    );
+
+    let (ok, text) = tool_text(
+        "explore",
+        json!({ "question": "Profile component", "token_budget": 100 }),
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("[!] TRUNCATED"), "{text}");
+    assert!(
+        text.len() < 100 * 3 + 400,
+        "output too long: {}",
+        text.len()
+    );
+}
+
+#[test]
 fn mcp_stdio_handshake() {
     let mut child = codenav()
         .arg("serve")
@@ -144,7 +233,8 @@ fn mcp_stdio_handshake() {
         .collect();
     assert_eq!(lines.len(), 3, "notifications must not be answered");
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "codenav");
-    assert!(lines[1]["result"]["tools"].as_array().unwrap().len() >= 9);
+    let tools = lines[1]["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "explore"));
     let text = lines[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
         text.contains("ios/Sources/App/Model.swift::ItemStore"),

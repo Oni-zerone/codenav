@@ -1,3 +1,4 @@
+mod explore;
 mod extract;
 mod graph;
 mod indexer;
@@ -94,7 +95,7 @@ fn main() -> Result<()> {
                 serde_json::from_str(&args).context("arguments must be a JSON object")?;
             let mut server = mcp::Server::new(root, graph, false);
             let result = server.call_tool(&name, &args)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", mcp::render_text(&result));
         }
         Command::Ast { file } => {
             let lang = Lang::from_path(&file).ok_or_else(|| anyhow!("unsupported file type"))?;

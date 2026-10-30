@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::explore;
 use crate::graph::{EdgeKind, Graph, SymKind};
 use crate::indexer;
 use crate::query::{self, Direction};
@@ -18,7 +19,8 @@ const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(20);
 const INSTRUCTIONS: &str = "codenav exposes a pre-built graph of this repository. \
 Nodes are files, symbols (classes, structs, interfaces/traits/protocols, functions, methods, ...) \
 and external packages; edges are contains, imports, calls, inherits and references. \
-Start with graph_overview or module_graph for the big picture, use search_symbols to get node ids, \
+Start with graph_overview or module_graph for the big picture; for a question about specific code \
+call explore first, which returns the relevant subgraph in one call. Use search_symbols to get node ids, \
 then get_symbol, get_neighbors, find_paths and impact_analysis to explore relations. \
 Call resolution is name-based: edges flagged `ambiguous` may be false positives, verify them with read_code.";
 
@@ -90,7 +92,7 @@ impl Server {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 Ok(match self.call_tool(name, &args) {
                     Ok(v) => json!({
-                        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }],
+                        "content": [{ "type": "text", "text": render_text(&v) }],
                         "isError": false,
                     }),
                     Err(e) => json!({
@@ -151,6 +153,34 @@ impl Server {
                 uint(a, "depth", 2).max(1),
                 uint(a, "min_weight", 1) as u32,
             )),
+            "explore" => {
+                let mode = match a.get("mode").and_then(Value::as_str).unwrap_or("bfs") {
+                    "bfs" => explore::Mode::Bfs,
+                    "dfs" => explore::Mode::Dfs,
+                    m => return Err(anyhow!("mode must be bfs or dfs, got `{m}`")),
+                };
+                let direction = match a.get("direction").and_then(Value::as_str) {
+                    Some(d) => Direction::parse(d)
+                        .ok_or_else(|| anyhow!("direction must be in/out/both"))?,
+                    // DFS follows dependency chains forward by default.
+                    None if mode == explore::Mode::Dfs => Direction::Out,
+                    None => Direction::Both,
+                };
+                let kinds = edge_kinds(a)?;
+                let text = explore::explore(
+                    g,
+                    a.get("question").and_then(Value::as_str).unwrap_or(""),
+                    &list(a, "seeds"),
+                    &explore::Options {
+                        mode,
+                        depth: uint(a, "depth", 2).clamp(1, 6) as u32,
+                        direction,
+                        kinds: &kinds,
+                        token_budget: uint(a, "token_budget", 2000),
+                    },
+                )?;
+                Ok(Value::String(text))
+            }
             "search_symbols" => {
                 let kinds = list(a, "kinds")
                     .iter()
@@ -240,6 +270,14 @@ impl Server {
     }
 }
 
+/// Tools return either structured JSON or ready-to-read text (a JSON string).
+pub fn render_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string_pretty(v).unwrap_or_default(),
+    }
+}
+
 fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
@@ -298,6 +336,19 @@ fn tool_definitions() -> Value {
                 "depth": { "type": "integer", "description": "Directory depth defining a component (default 2)." },
                 "min_weight": { "type": "integer", "description": "Hide dependencies weaker than this (default 1)." }
             } }
+        },
+        {
+            "name": "explore",
+            "description": "Answer a question about the code in one call: picks the most relevant symbols for the question (or the given seeds), expands their neighborhood and returns the subgraph as text, cut to a token budget. Use mode=dfs to follow a dependency chain, bfs (default) for broad context.",
+            "inputSchema": { "type": "object", "properties": {
+                "question": { "type": "string", "description": "Natural-language question or keywords, e.g. `how does UserService create users`." },
+                "seeds": { "type": "array", "items": { "type": "string" }, "description": "Explicit start nodes (ids, unique names or file paths) instead of matching the question." },
+                "mode": { "type": "string", "enum": ["bfs", "dfs"], "description": "Default bfs." },
+                "depth": { "type": "integer", "description": "1-6, default 2." },
+                "direction": { "type": "string", "enum": ["out", "in", "both"], "description": "Default both (bfs) / out (dfs)." },
+                "edge_kinds": edge_kinds.clone(),
+                "token_budget": { "type": "integer", "description": "Approximate max output tokens, default 2000." }
+            }, "required": ["question"] }
         },
         {
             "name": "search_symbols",
