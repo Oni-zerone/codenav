@@ -235,6 +235,11 @@ impl Server {
             return self.reindex();
         }
         self.refresh_if_stale();
+        // diff_impact matches diff lines to the graph's: it must reflect the current files.
+        if name == "diff_impact" && indexer::is_stale(&self.root, &self.graph) {
+            self.last_stale_check = Instant::now();
+            self.reindex()?;
+        }
         if name == "insights" {
             let key = (self.graph.indexed_at_ms, uint(a, "top", 10)?.clamp(1, 50));
             if let Some((k, v)) = &self.insights_cache

@@ -1645,6 +1645,8 @@ fn diff_impact_maps_changes_to_symbols() {
     assert!(!ok && text.contains("git diff failed"), "{text}");
 
     git(&["init", "-q", "-b", "main"]);
+    // User diff settings must not change the paths parsed.
+    git(&["config", "diff.mnemonicPrefix", "true"]);
     std::fs::write(repo.0.join(".gitignore"), ".codenav/\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "base"]);
@@ -1695,6 +1697,67 @@ fn diff_impact_maps_changes_to_symbols() {
     assert_eq!(
         v["changed"]["py/app/extra.py"],
         json!(["extra (function) L1-2"]),
+        "{v:#}"
+    );
+
+    // Review cases on top of the branch.
+    git(&["checkout", "-q", "main"]);
+    // An untracked file counts as uncommitted.
+    std::fs::write(repo.0.join("py/app/loose.py"), "def loose():\n    pass\n").unwrap();
+    let v = diff(json!({}));
+    assert_eq!(v["new_files"], json!(["py/app/loose.py"]), "{v:#}");
+    assert_eq!(
+        v["changed"]["py/app/loose.py"],
+        json!(["loose (function) L1-2"]),
+        "{v:#}"
+    );
+    std::fs::remove_file(repo.0.join("py/app/loose.py")).unwrap();
+    // Removing `greet` (lines 10-11) reports it removed, and its enclosing class as changed
+    // only if lines of the class itself changed: here the deletion is inside User.
+    let text = std::fs::read_to_string(&models).unwrap();
+    std::fs::write(
+        &models,
+        text.replace(
+            "\n    def greet(self) -> str:\n        return format_name(self.name)\n",
+            "\n",
+        ),
+    )
+    .unwrap();
+    let v = diff(json!({}));
+    assert_eq!(
+        v["removed_symbols"],
+        json!(["py/app/models.py::User::greet (method)"]),
+        "{v:#}"
+    );
+    assert!(
+        v["note"].as_str().unwrap().contains("search its names"),
+        "{v:#}"
+    );
+    assert!(!v["changed"].to_string().contains("format_name"), "{v:#}");
+    git(&["checkout", "-q", "--", "py/app/models.py"]);
+    // A rename.
+    git(&[
+        "mv",
+        "py/app/services/users.py",
+        "py/app/services/accounts.py",
+    ]);
+    let v = diff(json!({}));
+    assert_eq!(
+        v["renamed_files"],
+        json!(["py/app/services/users.py → py/app/services/accounts.py"]),
+        "{v:#}"
+    );
+    git(&["reset", "-q", "--hard"]);
+    // Against a base, uncommitted edits in the same files are flagged.
+    git(&["checkout", "-q", "feature"]);
+    std::fs::write(
+        repo.0.join("py/app/extra.py"),
+        "def extra():\n    return 1\n",
+    )
+    .unwrap();
+    let v = diff(json!({ "base": "main" }));
+    assert!(
+        v["warning"].as_str().unwrap().contains("py/app/extra.py"),
         "{v:#}"
     );
 

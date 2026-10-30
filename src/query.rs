@@ -602,6 +602,20 @@ pub const DEPENDENCY_KINDS: [EdgeKind; 4] = [
 /// Nodes with the confidence of how they were reached.
 pub type Seeds = Vec<(usize, Confidence)>;
 
+/// `nodes` (sure) and the interface/base methods they override, each override with the
+/// best confidence any of them reaches it with.
+pub fn seeds_with_overrides(g: &Graph, nodes: &[usize], min: Confidence) -> Seeds {
+    let mut best: BTreeMap<usize, Confidence> =
+        nodes.iter().map(|&n| (n, Confidence::Exact)).collect();
+    for &n in nodes {
+        for (m, conf) in overridden_members(g, n, min) {
+            let e = best.entry(m).or_insert(conf);
+            *e = (*e).max(conf);
+        }
+    }
+    best.into_iter().collect()
+}
+
 /// What a change to `start` touches: `start`, its members (through containment at least
 /// `min` sure), and the members they override, each with the confidence of how it was
 /// reached. Shared by impact_analysis and tests_for.
