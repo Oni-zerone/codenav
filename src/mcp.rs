@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::cycles;
 use crate::diff_impact::{self, DiffSource};
+use crate::embeddings::Embeddings;
 use crate::explore;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
@@ -79,6 +80,8 @@ pub struct Server {
     max_loaded: usize,
     load_options: LoadOptions,
     clock: u64,
+    /// Static word embeddings for explore's synonym matching (`--embeddings`).
+    embeddings: Option<Embeddings>,
 }
 
 impl Server {
@@ -109,6 +112,7 @@ impl Server {
             max_loaded: DEFAULT_MAX_LOADED,
             load_options: LoadOptions::default(),
             clock: 0,
+            embeddings: None,
         }
     }
 
@@ -134,6 +138,10 @@ impl Server {
 
     pub fn set_max_loaded(&mut self, n: usize) {
         self.max_loaded = n.max(1);
+    }
+
+    pub fn set_embeddings(&mut self, embeddings: Option<Embeddings>) {
+        self.embeddings = embeddings;
     }
 
     /// Applies `--fresh` / `--hub-percentile` to the repositories loaded later.
@@ -542,6 +550,7 @@ impl Server {
                         kinds: &kinds,
                         min_confidence: min_confidence(a)?,
                         token_budget: token_budget(a)?,
+                        embeddings: self.embeddings.as_ref(),
                     },
                 )?;
                 Ok(Value::String(text))

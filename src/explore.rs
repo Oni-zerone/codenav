@@ -6,10 +6,11 @@
 //! 3. Nodes are rendered seeds first, then by distance and relevance, each with its
 //!    edges to other rendered nodes, and the text is cut to a token budget.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{Result, bail};
 
+use crate::embeddings::Embeddings;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::output;
 use crate::query::{self, Direction};
@@ -92,6 +93,8 @@ pub struct Options<'a> {
     /// Only edges at least this sure are followed and drawn.
     pub min_confidence: Confidence,
     pub token_budget: usize,
+    /// Static word embeddings: question words also match synonyms in names and docs.
+    pub embeddings: Option<&'a Embeddings>,
 }
 
 impl Options<'_> {
@@ -105,7 +108,7 @@ impl Options<'_> {
 
 pub fn explore(g: &Graph, question: &str, seeds: &[String], opts: &Options) -> Result<String> {
     let terms = query_terms(question);
-    let scores = score_nodes(g, &symbol_terms(&terms));
+    let scores = score_nodes(g, &symbol_terms(&terms), opts.embeddings);
 
     let seeds: Vec<&str> = seeds
         .iter()
@@ -240,15 +243,70 @@ struct Scores {
     best_by_term: Vec<Option<usize>>,
     /// Terms each node matches by name or by a word of its doc.
     strong_terms: Vec<Vec<usize>>,
+    /// Of those, the ones matched only through a synonym (embeddings).
+    synonym_terms: Vec<Vec<usize>>,
+    /// For the note: each term's synonyms found in the graph.
+    synonyms: Vec<HashSet<String>>,
 }
 
-fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
+/// Weight of a synonym found through embeddings: below a literal name match, enough to
+/// anchor a seed (as doc words do). Synonyms in docs weigh like a path match.
+const SYNONYM_IN_NAME: f64 = 1.75;
+const SYNONYM_IN_DOC: f64 = 1.0;
+
+/// Words of the graph worth comparing with a question term: not short or empty words.
+fn synonym_candidate(word: &str) -> bool {
+    word.chars().count() >= 3 && !STOP_WORDS.contains(&word)
+}
+
+/// For each term, the words of the graph (name tokens, doc words) that are its synonyms.
+fn synonym_sets(g: &Graph, terms: &[String], embeddings: &Embeddings) -> Vec<HashSet<String>> {
+    let mut vocabulary: HashSet<String> = HashSet::new();
+    for node in &g.nodes {
+        vocabulary.extend(
+            name_tokens(&node.name)
+                .into_iter()
+                .filter(|t| synonym_candidate(t)),
+        );
+        if let Some(doc) = &node.doc {
+            vocabulary.extend(
+                doc.to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| synonym_candidate(w))
+                    .map(str::to_string),
+            );
+        }
+    }
+    terms
+        .iter()
+        .map(|term| {
+            vocabulary
+                .iter()
+                .filter(|w| *w != term)
+                .filter(|w| {
+                    embeddings
+                        .similarity(term, w)
+                        .is_some_and(|s| s >= crate::embeddings::SYNONYM)
+                })
+                .cloned()
+                .collect()
+        })
+        .collect()
+}
+
+fn score_nodes(g: &Graph, terms: &[String], embeddings: Option<&Embeddings>) -> Scores {
+    let synonyms: Vec<HashSet<String>> = match embeddings {
+        Some(e) => synonym_sets(g, terms, e),
+        None => vec![HashSet::new(); terms.len()],
+    };
     let n = g.nodes.len();
     let mut total = vec![0.0; n];
     let mut name_match = vec![false; n];
     let mut per_term: Vec<Vec<f64>> = vec![vec![0.0; n]; terms.len()];
-    // Terms (indices into `terms`) each node matches by name or by a word of its doc.
+    // Terms (indices into `terms`) each node matches by name or by a word of its doc, and
+    // those it matches only through a synonym of a name token.
     let mut strong_terms: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut synonym_terms: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, node) in g.nodes.iter().enumerate() {
         // A file is named by its stem: `api.ts` must not match the term `ts`.
         let display = if node.kind == SymKind::File {
@@ -268,7 +326,16 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
             .filter(|w| w.chars().count() >= 2)
             .collect();
         for (t, term) in terms.iter().enumerate() {
-            let w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            let mut w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            if !synonyms[t].is_empty() {
+                if w < SYNONYM_IN_NAME && tokens.iter().any(|tok| synonyms[t].contains(tok)) {
+                    w = SYNONYM_IN_NAME;
+                    synonym_terms[i].push(t);
+                } else if w < SYNONYM_IN_DOC && doc_words.iter().any(|&dw| synonyms[t].contains(dw))
+                {
+                    w = SYNONYM_IN_DOC;
+                }
+            }
             per_term[t][i] = w;
             if w >= DOC_WORD {
                 strong_terms[i].push(t);
@@ -309,6 +376,8 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
         name_match,
         best_by_term,
         strong_terms,
+        synonym_terms,
+        synonyms,
     }
 }
 
@@ -415,10 +484,39 @@ fn pick_seeds(
         .iter()
         .flat_map(|&s| scores.strong_terms[s].iter().copied())
         .collect();
+    // A term covered only through synonyms counts half: they are looser than the words.
+    let literal: BTreeSet<usize> = seeds
+        .iter()
+        .flat_map(|&s| {
+            scores.strong_terms[s]
+                .iter()
+                .copied()
+                .filter(move |t| !scores.synonym_terms[s].contains(t))
+        })
+        .collect();
     let covered_terms = (0..symbol_terms.len())
         .filter(|t| covered.contains(t))
         .count();
-    if anchored.is_empty() || covered_terms * 2 < symbol_terms.len() {
+    let literal_terms = (0..symbol_terms.len())
+        .filter(|t| literal.contains(t))
+        .count();
+    let synonym_only: Vec<String> = (0..symbol_terms.len())
+        .filter(|t| covered.contains(t) && !literal.contains(t))
+        .map(|t| {
+            let mut words: Vec<&String> = scores.synonyms[t].iter().collect();
+            words.sort();
+            let words: Vec<&str> = words.iter().take(3).map(|w| w.as_str()).collect();
+            format!("{} ~ {}", symbol_terms[t], words.join("/"))
+        })
+        .collect();
+    if !synonym_only.is_empty() {
+        notes.push(format!(
+            "matched through synonyms: {}",
+            synonym_only.join(", ")
+        ));
+    }
+    let weighted = 2 * literal_terms + (covered_terms - literal_terms);
+    if anchored.is_empty() || weighted < symbol_terms.len() {
         let missing: Vec<&str> = (0..symbol_terms.len())
             .filter(|t| !covered.contains(t))
             .map(|t| symbol_terms[t].as_str())
@@ -633,6 +731,9 @@ fn render(
     if !opts.kinds.is_empty() {
         let kinds: Vec<&str> = opts.kinds.iter().map(|k| k.as_str()).collect();
         header.push_str(&format!(" | edges: {}", kinds.join(",")));
+    }
+    if opts.embeddings.is_some() {
+        header.push_str(" | synonyms: on");
     }
     if opts.min_confidence != Confidence::Ambiguous {
         header.push_str(&format!(

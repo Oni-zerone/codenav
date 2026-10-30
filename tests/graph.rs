@@ -2376,6 +2376,88 @@ fn local_package_review_cases() {
     assert!(ext.get("provided_by_project").is_none(), "{ext:#}");
 }
 
+#[test]
+fn explore_matches_synonyms_with_embeddings() {
+    let repo = TempRepo::new(
+        "synonyms",
+        &[
+            (
+                "src/plans.ts",
+                "export function loadAthletePlans(id: string) { return [id]; }\n\
+                 export function validatePkce(v: string) { return v; }\n\
+                 export function computeStats() { return 0; }\n"
+                    .into(),
+            ),
+            (
+                // A tiny static embedding table: question words near code words.
+                "vectors.vec",
+                "8 4\nload 1 0 0 0\nretrieve 0.95 0.05 0 0\nathlete 0 1 0 0\ntrainee 0.05 0.95 0 0\n\
+                 plans 0 0 1 0\nschedules 0 0 0.95 0.05\nvalidate 0 0 0 1\nbanana 0.5 0.5 0.5 0.5\n"
+                    .into(),
+            ),
+        ],
+    );
+    let explore = |embeddings: bool| -> (bool, String) {
+        let mut cmd = codenav();
+        cmd.args([
+            "tool",
+            "explore",
+            r#"{"question":"retrieve the trainee schedules","depth":1}"#,
+        ])
+        .arg(&repo.0);
+        if embeddings {
+            cmd.arg("--embeddings").arg(repo.0.join("vectors.vec"));
+        }
+        let out = cmd.output().unwrap();
+        let text = if out.status.success() {
+            &out.stdout
+        } else {
+            &out.stderr
+        };
+        (
+            out.status.success(),
+            String::from_utf8_lossy(text).into_owned(),
+        )
+    };
+
+    // Without a model no word of the question appears in the code.
+    let (ok, text) = explore(false);
+    assert!(!ok && text.contains("no node matches"), "{text}");
+
+    let (ok, text) = explore(true);
+    assert!(ok, "{text}");
+    let seeds = text.lines().find(|l| l.starts_with("Traversal:")).unwrap();
+    assert!(
+        seeds.contains("seeds: src/plans.ts::loadAthletePlans"),
+        "{text}"
+    );
+    assert!(seeds.contains("synonyms: on"), "{text}");
+    assert!(!text.contains("low_confidence"), "{text}");
+    assert!(!seeds.contains("validatePkce"), "{text}");
+
+    assert!(
+        text.contains("matched through synonyms: retrieve ~ load"),
+        "{text}"
+    );
+
+    // A model file without any vector is an error; other tools never load it.
+    std::fs::write(repo.0.join("bad.vec"), "only words here\n").unwrap();
+    let run = |tool: &str| {
+        codenav()
+            .args(["tool", tool, r#"{"question":"load"}"#])
+            .arg(&repo.0)
+            .arg("--embeddings")
+            .arg(repo.0.join("bad.vec"))
+            .output()
+            .unwrap()
+    };
+    let out = run("explore");
+    assert!(
+        !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("no word vectors")
+    );
+    assert!(run("graph_overview").status.success());
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {

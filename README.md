@@ -154,6 +154,17 @@ Tutti i tool che restituiscono dati strutturati rispondono di default in **testo
 per vedere tutto, più un suggerimento per restringere la richiesta. Con `format: "json"` si ottiene
 invece il risultato JSON completo, senza budget.
 
+### Sinonimi in `explore` (opzionale)
+
+`codenav serve --embeddings parole.vec` (o `codenav tool … --embeddings parole.vec`) carica una
+tabella di embedding statici nel formato testo di word2vec, fastText e GloVe (`token v1 … vN`,
+con o senza la riga `conteggio dimensioni`). `explore` usa allora anche i sinonimi: una parola
+della domanda corrisponde a una parola di un nome o di un doc comment con significato simile
+(similarità coseno ≥ 0,6), quindi trova il codice anche quando la domanda non ne usa i termini
+(altre parole, altra lingua se il modello è multilingue). Senza file tutto funziona come prima.
+I modelli più piccoli bastano (vocabolario della lingua del codice e dei commenti); il file va
+scaricato a parte, codenav non ne include uno.
+
 ### Più repository
 
 `codenav serve repo-a repo-b …` serve più repository da un solo server: ogni tool accetta
