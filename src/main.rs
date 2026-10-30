@@ -4,6 +4,7 @@ mod graph;
 mod indexer;
 mod lang;
 mod mcp;
+mod output;
 mod query;
 
 use std::path::{Path, PathBuf};
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
                 serde_json::from_str(&args).context("arguments must be a JSON object")?;
             let mut server = mcp::Server::new(root, graph, false);
             let result = server.call_tool(&name, &args)?;
-            println!("{}", mcp::render_text(&result));
+            println!("{result}");
         }
         Command::Ast { file } => {
             let lang = Lang::from_path(&file).ok_or_else(|| anyhow!("unsupported file type"))?;

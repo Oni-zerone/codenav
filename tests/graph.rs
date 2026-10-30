@@ -14,7 +14,9 @@ fn fixture() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/poly"))
 }
 
-fn tool(name: &str, args: Value) -> Value {
+/// Calls a tool asking for the full structured result.
+fn tool(name: &str, mut args: Value) -> Value {
+    args["format"] = json!("json");
     let out = codenav()
         .args(["tool", name, &args.to_string(), "--path"])
         .arg(fixture())
@@ -355,6 +357,91 @@ fn explore_prefers_exact_names() {
 }
 
 #[test]
+fn every_structured_tool_respects_token_budget() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let calls = [
+        ("graph_overview", json!({ "top": 50 })),
+        ("module_graph", json!({ "depth": 3 })),
+        ("search_symbols", json!({ "query": "e", "limit": 200 })),
+        ("get_symbol", json!({ "id": "src/indexer.rs::Builder" })),
+        (
+            "get_neighbors",
+            json!({ "id": "src/indexer.rs::Builder", "depth": 2 }),
+        ),
+        ("file_outline", json!({ "path": "src/indexer.rs" })),
+        ("impact_analysis", json!({ "id": "src/graph.rs::Graph" })),
+        ("explore", json!({ "question": "how is the graph built" })),
+    ];
+    for (name, mut args) in calls {
+        args["token_budget"] = json!(150);
+        let (ok, text) = tool_text_in(repo, name, args.clone());
+        assert!(ok, "{name}: {text}");
+        let text = text.trim_end();
+        assert!(
+            text.len() <= 150 * 3,
+            "{name}: {} bytes\n{text}",
+            text.len()
+        );
+        let notice = text
+            .lines()
+            .find(|l| l.starts_with("[!] TRUNCATED"))
+            .unwrap_or_else(|| panic!("{name}: no truncation notice\n{text}"));
+
+        // The suggested budget really shows everything.
+        let suggested: usize = notice
+            .split("token_budget=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("{name}: no suggested budget in `{notice}`"));
+        args["token_budget"] = json!(suggested);
+        let (ok, full) = tool_text_in(repo, name, args);
+        assert!(
+            ok && !full.contains("[!] TRUNCATED"),
+            "{name} with {suggested}: {full}"
+        );
+    }
+}
+
+#[test]
+fn text_and_json_formats() {
+    let (ok, text) = tool_text("get_symbol", json!({ "id": "UserService::create" }));
+    assert!(ok, "{text}");
+    assert!(
+        text.starts_with("id: py/app/services/users.py::UserService::create\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  calls:\n    - py/app/models.py::User\n"),
+        "{text}"
+    );
+    assert!(text.contains("code: |\n      6 |     def create"), "{text}");
+
+    let (ok, json_text) = tool_text(
+        "get_symbol",
+        json!({ "id": "UserService::create", "format": "json" }),
+    );
+    assert!(ok);
+    let v: Value = serde_json::from_str(&json_text).unwrap();
+    assert_eq!(v["kind"], "method");
+
+    let (ok, text) = tool_text("graph_overview", json!({ "format": "xml" }));
+    assert!(
+        !ok && text.contains("format must be text or json"),
+        "{text}"
+    );
+
+    let (ok, text) = tool_text(
+        "read_code",
+        json!({ "file": "py/app/models.py", "start_line": 1, "end_line": 2 }),
+    );
+    assert!(
+        ok && text.starts_with("py/app/models.py\n    1 | class Base:"),
+        "{text}"
+    );
+}
+
+#[test]
 fn mcp_stdio_handshake() {
     let mut child = codenav()
         .arg("serve")
@@ -387,6 +474,9 @@ fn mcp_stdio_handshake() {
     assert_eq!(lines[0]["result"]["serverInfo"]["name"], "codenav");
     let tools = lines[1]["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "explore"));
+    let get_symbol = tools.iter().find(|t| t["name"] == "get_symbol").unwrap();
+    let props = &get_symbol["inputSchema"]["properties"];
+    assert!(props["token_budget"].is_object() && props["format"].is_object());
     let text = lines[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
         text.contains("ios/Sources/App/Model.swift::ItemStore"),

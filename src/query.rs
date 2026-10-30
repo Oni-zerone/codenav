@@ -31,10 +31,10 @@ impl Direction {
 }
 
 pub fn summary(g: &Graph, i: usize) -> Value {
+    // The id already carries the file and the name.
     let n = &g.nodes[i];
-    let mut v = json!({ "id": n.id, "kind": n.kind.as_str(), "name": n.name });
+    let mut v = json!({ "id": n.id, "kind": n.kind.as_str() });
     if !n.file.is_empty() {
-        v["file"] = json!(n.file);
         v["lines"] = json!(format!("{}-{}", n.line, n.end_line));
     }
     if !n.signature.is_empty() {
