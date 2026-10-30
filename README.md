@@ -127,6 +127,7 @@ aggiornamento automatico quando l'indice cambia.
 | `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`) |
 | `graph_overview` | Linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali, community più grandi |
 | `module_graph` | Architettura: dipendenze aggregate tra directory/componenti |
+| `find_cycles` | Cicli di dipendenze tra file o moduli: componenti fortemente connesse e cicli più corti (default: import, archi almeno `inferred`) |
 | `get_community` | Community strutturale di un nodo (o per numero): file, membri più collegati, community da cui dipende e che la usano |
 | `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path |
 | `get_symbol` | Dettaglio di un nodo: firma, doc, relazioni in/out per tipo, codice sorgente |

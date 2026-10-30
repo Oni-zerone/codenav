@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+use crate::cycles;
 use crate::explore;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
@@ -318,6 +319,40 @@ impl Server {
                     min_confidence(a)?,
                 ))
             }
+            "find_cycles" => {
+                let level = match opt_str(a, "level")?.unwrap_or("file") {
+                    "file" => cycles::Level::File,
+                    "module" => cycles::Level::Module(uint(a, "depth", 2)?.max(1)),
+                    l => return Err(anyhow!("level must be file or module, got `{l}`")),
+                };
+                let kinds = match edge_kinds(a)? {
+                    k if k.is_empty() => vec![EdgeKind::Imports],
+                    k if k.contains(&EdgeKind::Contains) => {
+                        return Err(anyhow!(
+                            "find_cycles follows dependencies: contains is not one"
+                        ));
+                    }
+                    k => k,
+                };
+                let max_length = uint(a, "max_length", 6)?;
+                anyhow::ensure!(
+                    (2..=20).contains(&max_length),
+                    "max_length must be between 2 and 20"
+                );
+                let limit = uint(a, "limit", 20)?;
+                anyhow::ensure!(limit >= 1, "limit must be at least 1");
+                let min = match opt_str(a, "min_confidence")? {
+                    Some(c) => parse_confidence(c)?,
+                    None => Confidence::Inferred,
+                };
+                Ok(cycles::find_cycles(
+                    g,
+                    level,
+                    EdgeFilter { kinds: &kinds, min },
+                    max_length,
+                    limit,
+                ))
+            }
             "audit_edges" => {
                 let level = match opt_str(a, "confidence")? {
                     Some(c) => parse_confidence(c)?,
@@ -372,6 +407,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "module_graph" => "lower depth or raise min_weight",
         "get_community" => "lower limit",
         "audit_edges" => "narrow with path or edge_kinds, or lower limit",
+        "find_cycles" => "lower limit or max_length",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -580,6 +616,18 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "find_cycles",
+            "description": "Dependency cycles between files or modules (directories, as in module_graph): strongly connected components, largest first, each with its members and short cycles (for each member searched, one shortest cycle through it: `a --imports--> b --imports--> a`). By default import cycles only, over edges at least inferred.",
+            "inputSchema": { "type": "object", "properties": {
+                "level": { "type": "string", "enum": ["file", "module"], "description": "Units to find cycles between (default file)." },
+                "depth": { "type": "integer", "description": "module level: directory depth of a module (default 2)." },
+                "edge_kinds": { "type": "array", "items": { "type": "string", "enum": ["imports", "calls", "inherits", "references"] }, "description": "Dependencies to follow (default imports)." },
+                "min_confidence": { "type": "string", "enum": ["exact", "inferred", "ambiguous"], "description": "Least confidence of the edges followed (default inferred: guesses would add spurious cycles)." },
+                "max_length": { "type": "integer", "description": "Longest cycle reported, in units (2-20, default 6)." },
+                "limit": { "type": "integer", "description": "Components listed (default 20)." }
+            } }
         },
         {
             "name": "audit_edges",

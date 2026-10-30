@@ -1001,6 +1001,119 @@ fn indexes_from_an_older_analysis_are_rebuilt() {
     assert!(out.status.success() && log.contains("stale"), "{log}");
 }
 
+#[test]
+fn find_cycles_between_files_and_modules() {
+    let repo = TempRepo::new(
+        "cycles",
+        &[
+            (
+                "app/a.ts",
+                "import { b } from './b';\nexport function a() { b(); }\n".into(),
+            ),
+            (
+                "app/b.ts",
+                "import { a } from './a';\nexport function b() { a(); }\n".into(),
+            ),
+            // A three-file ring across two directories, plus a file outside it.
+            (
+                "lib/x.ts",
+                "import { y } from './y';\nexport function x() { y(); }\n".into(),
+            ),
+            (
+                "lib/y.ts",
+                "import { z } from '../core/z';\nexport function y() { z(); }\n".into(),
+            ),
+            (
+                "core/z.ts",
+                "import { x } from '../lib/x';\nexport function z() { x(); }\n".into(),
+            ),
+            (
+                "core/leaf.ts",
+                "import { z } from './z';\nexport function leaf() { z(); }\n".into(),
+            ),
+        ],
+    );
+    let cycles = |args: Value| -> Value {
+        let mut args = args;
+        args["format"] = json!("json");
+        let (ok, text) = tool_text_in(&repo.0, "find_cycles", args);
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+
+    let v = cycles(json!({}));
+    assert_eq!(v["cyclic_components"], 2, "{v:#}");
+    let comps = v["components"].as_array().unwrap();
+    assert_eq!(comps[0]["size"], 3, "largest first: {v:#}");
+    assert_eq!(
+        comps[0]["cycles"],
+        json!(["core/z.ts --imports--> lib/x.ts --imports--> lib/y.ts --imports--> core/z.ts"]),
+        "{v:#}"
+    );
+    assert_eq!(
+        comps[1]["cycles"],
+        json!(["app/a.ts --imports--> app/b.ts --imports--> app/a.ts"]),
+        "{v:#}"
+    );
+    assert!(
+        !v.to_string().contains("leaf"),
+        "not part of a cycle: {v:#}"
+    );
+
+    // Bounded length, limit, other edge kinds, module level.
+    let v = cycles(json!({ "max_length": 2 }));
+    assert!(
+        comps_note(&v).contains("no cycle within max_length 2"),
+        "{v:#}"
+    );
+    let v = cycles(json!({ "limit": 1 }));
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    let v = cycles(json!({ "edge_kinds": ["calls"] }));
+    assert_eq!(
+        v["cyclic_components"], 2,
+        "calls form the same rings: {v:#}"
+    );
+    let v = cycles(json!({ "level": "module", "depth": 1 }));
+    assert_eq!(
+        v["components"][0]["cycles"],
+        json!(["core --imports--> lib --imports--> core"]),
+        "{v:#}"
+    );
+
+    let (ok, text) = tool_text_in(&repo.0, "find_cycles", json!({ "level": "dir" }));
+    assert!(!ok && text.contains("file or module"), "{text}");
+    for (args, expected) in [
+        (json!({ "edge_kinds": ["contains"] }), "contains is not one"),
+        (json!({ "max_length": 1 }), "between 2 and 20"),
+        (json!({ "limit": 0 }), "at least 1"),
+    ] {
+        let (ok, text) = tool_text_in(&repo.0, "find_cycles", args);
+        assert!(!ok && text.contains(expected), "{text}");
+    }
+}
+
+fn comps_note(v: &Value) -> String {
+    v["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["note"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn fixture_has_no_cycles() {
+    let all = json!(["imports", "calls", "inherits", "references"]);
+    for level in ["file", "module"] {
+        let v = tool(
+            "find_cycles",
+            json!({ "level": level, "edge_kinds": all, "min_confidence": "ambiguous" }),
+        );
+        assert_eq!(v["cyclic_components"], 0, "{level}: {v:#}");
+    }
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
@@ -1264,6 +1377,10 @@ fn every_structured_tool_respects_token_budget() {
         (
             "audit_edges",
             json!({ "confidence": "exact", "limit": 500 }),
+        ),
+        (
+            "find_cycles",
+            json!({ "edge_kinds": ["imports", "calls", "references"], "min_confidence": "ambiguous" }),
         ),
     ];
     let mut truncated = 0;
