@@ -32,6 +32,23 @@
     inherits: '#e15759',
     contains: '#8a8a8a',
   };
+  // Categorical palette for communities (Tableau 10, then golden-angle hues).
+  const COMMUNITY_COLORS = ['#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f',
+    '#edc948', '#b07aa1', '#ff9da7', '#9c755f', '#bab0ac'];
+  const NO_COMMUNITY = '#888888';
+  const LEGEND_MAX = 12;
+
+  function communityColor(id) {
+    if (id === undefined || id === null) {
+      return NO_COMMUNITY;
+    }
+    if (id < COMMUNITY_COLORS.length) {
+      return COMMUNITY_COLORS[id];
+    }
+    const hue = Math.round((id * 137.508) % 360);
+    return `hsl(${hue}, 55%, 55%)`;
+  }
+
   const INVERSE = {
     contains: 'contained by',
     imports: 'imported by',
@@ -44,6 +61,7 @@
     params: { mode: 'modules', edgeKinds: ALL_EDGE_KINDS.slice(), showExternal: false, direction: 'both' },
     depths: { modules: 2, focus: 1 },
     layout: window.cytoscapeFcose ? 'fcose' : 'cose',
+    colorBy: 'community',
     history: [],
   };
   const state = Object.assign({}, defaults, vscode.getState() || {});
@@ -51,6 +69,25 @@
   let selectedId = null;
   let info = null;
   let currentView = null;
+  let highlighted = null;
+
+  /** Colour by community only when the graph has communities (format v2). */
+  function byCommunity() {
+    return state.colorBy === 'community' && !!(currentView && currentView.communities);
+  }
+
+  function nodeColor(e) {
+    const kind = e.data('kind');
+    if (!byCommunity() || kind === 'external') {
+      return NODE_COLORS[kind] || '#888';
+    }
+    return communityColor(e.data('community'));
+  }
+
+  /** Directory groups stay neutral when colouring by community. */
+  function groupColor(e) {
+    return byCommunity() ? NO_COMMUNITY : NODE_COLORS[e.data('kind')] || '#888';
+  }
 
   // ---------- Cytoscape ----------
 
@@ -86,7 +123,7 @@
           'text-margin-y': 4,
           'text-outline-color': bg,
           'text-outline-width': 2,
-          'background-color': (e) => NODE_COLORS[e.data('kind')] || '#888',
+          'background-color': nodeColor,
           width: nodeSize,
           height: nodeSize,
           'border-width': 0,
@@ -96,10 +133,10 @@
       {
         selector: ':parent',
         style: {
-          'background-color': (e) => NODE_COLORS[e.data('kind')] || '#888',
+          'background-color': groupColor,
           'background-opacity': 0.08,
           'border-width': 1,
-          'border-color': (e) => NODE_COLORS[e.data('kind')] || '#888',
+          'border-color': groupColor,
           'border-opacity': 0.6,
           shape: 'round-rectangle',
           'text-valign': 'top',
@@ -133,7 +170,7 @@
       },
       { selector: 'edge[?ambiguous]', style: { 'line-style': 'dashed' } },
       { selector: 'edge[kind = "contains"]', style: { 'line-style': 'dotted', 'target-arrow-shape': 'none' } },
-      { selector: '.faded', style: { opacity: 0.12 } },
+      { selector: '.faded, .cfaded', style: { opacity: 0.12 } },
       { selector: 'edge.hl', style: { opacity: 1, label: 'data(label)', 'font-size': 10, color: fg,
         'text-background-color': bg, 'text-background-opacity': 0.8, 'text-background-padding': 2,
         'font-family': font } },
@@ -193,6 +230,9 @@
       elements.push({ group: 'edges', data: Object.assign({ label }, e) });
     }
     cy.add(elements);
+    highlighted = null;
+    cy.style(buildStyle());
+    renderLegend();
 
     const empty = $('empty');
     if (view.nodes.length === 0) {
@@ -316,6 +356,7 @@
     $('directionField').hidden = p.mode !== 'focus';
     $('direction').value = p.direction || 'both';
     $('layout').value = state.layout;
+    $('colorBy').value = state.colorBy;
     $('showExternal').checked = !!p.showExternal;
     document.querySelectorAll('#edgeKinds input[value]').forEach((cb) => {
       cb.checked = p.edgeKinds.includes(cb.value);
@@ -369,8 +410,12 @@
   cy.on('dbltap', 'node', (evt) => drillDown(evt.target));
 
   cy.on('mouseover', 'node', (evt) => {
-    const tip = evt.target.data('tooltip');
+    let tip = evt.target.data('tooltip');
     if (!tip) return;
+    const label = communityLabel(evt.target.data('community'));
+    if (label !== undefined) {
+      tip += `\ncommunity ${evt.target.data('community')}: ${label}`;
+    }
     const t = $('tooltip');
     t.textContent = tip;
     t.hidden = false;
@@ -463,6 +508,7 @@
       <h3>${esc(d.name)}</h3>
       <div class="muted id">${esc(d.id)}</div>
       ${loc ? `<div class="loc"><a href="#" data-act="open">${loc}</a></div>` : ''}
+      ${d.community ? `<div class="community"><i class="dot" style="background:${communityColor(d.community.id)}"></i>community ${d.community.id}: ${esc(d.community.label)}</div>` : ''}
       ${d.signature ? `<pre>${esc(d.signature)}</pre>` : ''}
       ${d.doc ? `<p class="doc">${esc(d.doc)}</p>` : ''}
       <div class="actions">
@@ -491,6 +537,61 @@
 
   function hideDetails() {
     $('details').hidden = true;
+  }
+
+  // ---------- Community legend ----------
+
+  function renderLegend() {
+    const legend = $('legend');
+    const list = (currentView && currentView.communities) || [];
+    $('colorField').hidden = list.length === 0;
+    if (!byCommunity() || list.length === 0) {
+      legend.hidden = true;
+      return;
+    }
+    // Most visible communities first.
+    const shown = new Map();
+    cy.nodes().forEach((n) => {
+      const c = n.data('community');
+      if (c !== undefined && n.isChildless()) {
+        shown.set(c, (shown.get(c) || 0) + 1);
+      }
+    });
+    const items = list.slice().sort((a, b) => (shown.get(b.id) || 0) - (shown.get(a.id) || 0) || a.id - b.id);
+    const rows = items
+      .slice(0, LEGEND_MAX)
+      .map(
+        (c) => `<li><a href="#" data-community="${c.id}" class="${highlighted === c.id ? 'active' : ''}"
+          title="${esc(c.label)}: ${c.size} nodes in the repository, ${shown.get(c.id) || 0} shown">
+          <i class="dot" style="background:${communityColor(c.id)}"></i>${esc(c.label)}</a></li>`,
+      )
+      .join('');
+    const more = items.length > LEGEND_MAX ? `<li class="muted">+${items.length - LEGEND_MAX} more</li>` : '';
+    legend.innerHTML = `<div class="muted">Communities</div><ul>${rows}${more}</ul>`;
+    legend.hidden = false;
+    legend.querySelectorAll('a[data-community]').forEach((a) => {
+      a.onclick = (e) => {
+        e.preventDefault();
+        highlightCommunity(Number(a.dataset.community));
+      };
+    });
+  }
+
+  /** Fades everything outside community `id`; the same id again clears it. */
+  function highlightCommunity(id) {
+    highlighted = highlighted === id ? null : id;
+    cy.elements().removeClass('cfaded');
+    if (highlighted !== null) {
+      const members = cy.nodes().filter((n) => n.data('community') === highlighted);
+      const keep = members.union(members.ancestors()).union(members.edgesWith(members));
+      cy.elements().not(keep).addClass('cfaded');
+    }
+    renderLegend();
+  }
+
+  function communityLabel(id) {
+    const c = currentView && currentView.communities && currentView.communities.find((x) => x.id === id);
+    return c ? c.label : undefined;
   }
 
   // ---------- Search ----------
@@ -589,6 +690,12 @@
     state.layout = e.target.value;
     save();
     runLayout();
+  };
+  $('colorBy').onchange = (e) => {
+    state.colorBy = e.target.value;
+    save();
+    cy.style(buildStyle());
+    renderLegend();
   };
   $('showExternal').onchange = (e) => go({ showExternal: e.target.checked }, false);
   document.querySelectorAll('#edgeKinds input[value]').forEach((cb) => {

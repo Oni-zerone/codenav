@@ -27,6 +27,13 @@ Interazioni:
 - filtri per tipo di arco (`calls`, `imports`, `references`, `inherits`, `contains`) e
   layout (force, albero, concentrico, cerchio, griglia).
 
+**Colori per community**: con un indice di codenav recente (formato v2) i nodi sono colorati per
+*community* strutturale, cioè i gruppi di codice che dipendono tra loro più che dal resto (vedi
+`get_community` nel [README di codenav](../README.md)). La forma del nodo continua a indicarne il
+tipo. Una cartella nella vista Modules prende la community più frequente tra i suoi file. La
+legenda in basso a sinistra elenca le community visibili: clic su una voce per evidenziarne i
+nodi, di nuovo per tornare indietro. Il selettore *Color* nella toolbar torna ai colori per tipo.
+
 Archi tratteggiati = riferimenti `ambiguous` (risolti per nome tra più candidati). Lo spessore
 cresce con il numero di occorrenze.
 

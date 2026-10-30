@@ -1,7 +1,7 @@
 // Pure model of `.codenav/graph.cnav` (JSON) and the views drawn by the webview.
 // No `vscode` import here, so it can be unit-tested with plain Node.
 
-/** Graph format versions this extension reads (v2 adds communities, ignored here). */
+/** Graph format versions this extension reads (v2 adds communities). */
 export const SUPPORTED_VERSIONS = [1, 2];
 
 export type SymKind =
@@ -23,6 +23,8 @@ export interface RawNode {
   signature?: string;
   doc?: string;
   parent?: number;
+  /** Index in `RawGraph.communities` (v2); absent for external packages. */
+  community?: number;
 }
 
 export interface RawEdge {
@@ -40,6 +42,14 @@ export interface RawGraph {
   indexed_at: number;
   nodes: RawNode[];
   edges: RawEdge[];
+  /** Structural communities, largest first (v2). */
+  communities?: { label: string; size: number }[];
+}
+
+export interface CommunityInfo {
+  id: number;
+  label: string;
+  size: number;
 }
 
 /** Node as drawn by the webview. `kind` may also be `dir` (a directory group or component). */
@@ -58,6 +68,8 @@ export interface ViewNode {
   /** Shown for context only (outside the drilled-down directory). */
   dim?: boolean;
   tooltip?: string;
+  /** Structural community; for a directory component, the most common one of its files. */
+  community?: number;
 }
 
 export interface ViewEdge {
@@ -75,6 +87,8 @@ export interface View {
   edges: ViewEdge[];
   /** Set when nodes were dropped to stay under `maxNodes`. */
   truncated?: { shown: number; total: number };
+  /** Communities of the drawn nodes, by id (for the legend). */
+  communities?: CommunityInfo[];
 }
 
 export type Direction = 'in' | 'out' | 'both';
@@ -102,6 +116,7 @@ export interface NodeDetails {
   endLine: number;
   signature?: string;
   doc?: string;
+  community?: CommunityInfo;
   outgoing: Record<string, number>;
   incoming: Record<string, number>;
 }
@@ -113,6 +128,7 @@ export class CodeGraph {
   readonly edges: RawEdge[];
   readonly root: string;
   readonly indexedAt: number;
+  readonly communities: CommunityInfo[];
   private readonly out: number[][];
   private readonly in: number[][];
   private readonly byId = new Map<string, number>();
@@ -125,6 +141,7 @@ export class CodeGraph {
     this.edges = raw.edges;
     this.root = raw.root;
     this.indexedAt = raw.indexed_at;
+    this.communities = (raw.communities ?? []).map((c, id) => ({ id, label: c.label, size: c.size }));
     this.out = this.nodes.map(() => []);
     this.in = this.nodes.map(() => []);
     this.nodes.forEach((n, i) => {
@@ -272,12 +289,29 @@ export class CodeGraph {
       endLine: n.end_line,
       signature: n.signature,
       doc: n.doc,
+      community: n.community === undefined ? undefined : this.communities[n.community],
       outgoing: count(this.out[i]),
       incoming: count(this.in[i]),
     };
   }
 
   build(params: ViewParams, maxNodes: number): View {
+    const view = this.buildView(params, maxNodes);
+    const ids = new Set<number>();
+    for (const n of view.nodes) {
+      if (n.community !== undefined) {
+        ids.add(n.community);
+      }
+    }
+    if (ids.size > 0) {
+      view.communities = [...ids]
+        .sort((a, b) => a - b)
+        .map((id) => this.communities[id] ?? { id, label: `community ${id}`, size: 0 });
+    }
+    return view;
+  }
+
+  private buildView(params: ViewParams, maxNodes: number): View {
     switch (params.mode) {
       case 'modules':
         return this.moduleView(params, maxNodes);
@@ -294,12 +328,21 @@ export class CodeGraph {
     const kinds = new Set<EdgeKind>(params.edgeKinds.filter((k) => k !== 'contains'));
     const nodes = new Map<string, ViewNode>();
     const dirKey = (file: string) => 'dir:' + dirPrefix(file, depth);
+    const communityCounts = new Map<string, Map<number, number>>();
 
     for (const n of this.nodes) {
       if (n.kind !== 'file') {
         continue;
       }
       const key = dirKey(n.file);
+      if (n.community !== undefined) {
+        let counts = communityCounts.get(key);
+        if (!counts) {
+          counts = new Map();
+          communityCounts.set(key, counts);
+        }
+        counts.set(n.community, (counts.get(n.community) ?? 0) + 1);
+      }
       const existing = nodes.get(key);
       if (existing) {
         existing.size = (existing.size ?? 0) + 1;
@@ -307,6 +350,10 @@ export class CodeGraph {
         const dir = dirPrefix(n.file, depth);
         nodes.set(key, { id: key, label: dir, kind: 'dir', path: dir, size: 1, tooltip: dir });
       }
+    }
+
+    for (const [key, counts] of communityCounts) {
+      nodes.get(key)!.community = dominantCommunity(counts);
     }
 
     const agg = new EdgeAggregator();
@@ -364,6 +411,7 @@ export class CodeGraph {
           size: this.symbolsByFile.get(n.file)?.length ?? 0,
           dim,
           tooltip: n.file,
+          community: n.community,
         });
       }
     };
@@ -487,6 +535,7 @@ export class CodeGraph {
               kind: 'file',
               ref: parent,
               tooltip: fileNode.file,
+              community: fileNode.community,
             });
           }
         }
@@ -501,6 +550,7 @@ export class CodeGraph {
         ref: n.id,
         focus: i === center,
         tooltip: nodeTooltip(n),
+        community: n.community,
       });
     }
 
@@ -645,6 +695,19 @@ function directoryGroups(nodes: ViewNode[]): ViewNode[] {
     }
   }
   return [...groups.values()];
+}
+
+/** Most frequent community; ties go to the lowest (largest) one. */
+function dominantCommunity(counts: Map<number, number>): number | undefined {
+  let best: number | undefined;
+  let bestCount = 0;
+  for (const [c, n] of counts) {
+    if (n > bestCount || (n === bestCount && best !== undefined && c < best)) {
+      best = c;
+      bestCount = n;
+    }
+  }
+  return best;
 }
 
 function externalNode(n: RawNode): ViewNode {

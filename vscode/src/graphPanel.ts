@@ -314,6 +314,12 @@ export class GraphView implements vscode.Disposable {
         <option value="grid">Grid</option>
       </select>
     </label>
+    <label class="field" id="colorField" title="Node colour: structural community or symbol kind (the shape always shows the kind)">
+      Color <select id="colorBy">
+        <option value="community">Community</option>
+        <option value="kind">Kind</option>
+      </select>
+    </label>
     <button id="fit" title="Fit to screen">Fit</button>
     <button id="reindex" title="Run codenav index">Re-index</button>
   </header>
@@ -332,6 +338,7 @@ export class GraphView implements vscode.Disposable {
     <div id="cy"></div>
     <div id="empty" class="empty" hidden></div>
     <aside id="details" hidden></aside>
+    <div id="legend" hidden></div>
     <div id="tooltip" hidden></div>
   </main>
   <script nonce="${nonce}" src="${media('vendor/cytoscape.min.js')}"></script>

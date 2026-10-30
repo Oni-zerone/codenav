@@ -180,3 +180,67 @@ test('details counts relations by kind', () => {
   assert.deepEqual(d.incoming, { contains: 1, calls: 1 });
   assert.deepEqual(d.outgoing, {});
 });
+
+/** The sample as a v2 graph: api + main in community 0, db in community 1. */
+function withCommunities(): RawGraph {
+  const g = sample();
+  g.version = 2;
+  g.communities = [
+    { label: 'src/api', size: 4 },
+    { label: 'src/db', size: 3 },
+  ];
+  const of = [0, 0, 0, 1, 1, 1, undefined, 0];
+  g.nodes.forEach((n, i) => {
+    if (of[i] !== undefined) {
+      n.community = of[i];
+    }
+  });
+  return g;
+}
+
+test('views carry communities and list them for the legend', () => {
+  const g = new CodeGraph(withCommunities());
+  const files = g.build(all({ mode: 'files', showExternal: true }), 100);
+  const byId = new Map(files.nodes.map((n) => [n.id, n]));
+  assert.equal(byId.get('src/api/server.rs')?.community, 0);
+  assert.equal(byId.get('src/db/store.rs')?.community, 1);
+  assert.equal(byId.get('ext:serde')?.community, undefined);
+  assert.deepEqual(files.communities, [
+    { id: 0, label: 'src/api', size: 4 },
+    { id: 1, label: 'src/db', size: 3 },
+  ]);
+
+  const focus = g.build(all({ mode: 'focus', center: 'src/db/store.rs::Store::get', depth: 1 }), 100);
+  const f = new Map(focus.nodes.map((n) => [n.id, n]));
+  assert.equal(f.get('src/db/store.rs::Store::get')?.community, 1);
+  assert.equal(f.get('src/api/server.rs::Server::run')?.community, 0);
+  assert.equal(f.get('src/api/server.rs')?.community, 0, 'enclosing file group');
+
+  assert.deepEqual(g.details('src/db/store.rs::Store')?.community, { id: 1, label: 'src/db', size: 3 });
+});
+
+test('a module takes the most common community of its files', () => {
+  const raw = withCommunities();
+  // Two more files in src/db, one of them in community 0: db stays 1 (2 vs 1).
+  raw.nodes.push(
+    { id: 'src/db/a.rs', kind: 'file', name: 'a.rs', file: 'src/db/a.rs', line: 1, end_line: 1, community: 0 },
+    { id: 'src/db/b.rs', kind: 'file', name: 'b.rs', file: 'src/db/b.rs', line: 1, end_line: 1, community: 1 },
+  );
+  const m = new CodeGraph(raw).build(all({ mode: 'modules', depth: 2 }), 100);
+  const byId = new Map(m.nodes.map((n) => [n.id, n]));
+  assert.equal(byId.get('dir:src/db')?.community, 1);
+  assert.equal(byId.get('dir:src/api')?.community, 0);
+
+  // A tie goes to the lower (larger) community.
+  raw.nodes.pop();
+  const tie = new CodeGraph(raw).build(all({ mode: 'modules', depth: 2 }), 100);
+  assert.equal(tie.nodes.find((n) => n.id === 'dir:src/db')?.community, 0);
+});
+
+test('v1 graphs have no communities', () => {
+  const g = new CodeGraph(sample());
+  const view = g.build(all({ mode: 'files' }), 100);
+  assert.equal(view.communities, undefined);
+  assert.ok(view.nodes.every((n) => n.community === undefined));
+  assert.equal(g.details('src/db/store.rs::Store')?.community, undefined);
+});
