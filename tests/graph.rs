@@ -763,14 +763,14 @@ fn js_resolution_respects_module_scope() {
         &[
             // Same-named private helpers in two files that don't import each other.
             ("lib/a.ts", "function helper() {}\nexport function a() { helper(); }\n".into()),
-            ("lib/b.ts", "function helper() {}\nexport function shared() {}\nexport class Repo { load() {} }\n".into()),
+            ("lib/b.ts", "function helper() {}\nexport function shared() {}\nexport class Repo { fetchAll() {} }\n".into()),
             ("app/c.ts", "export function c() { helper(); }\n".into()),
             // Barrel re-export, explicit import, nested function, instance method.
             ("lib/index.ts", "export * from './b';\n".into()),
             (
                 "app/d.ts",
                 "import { shared } from '../lib/index';\n\
-                 export function d(r: any) {\n  shared();\n  r.load();\n  function inner() {}\n  inner();\n}\n\
+                 export function d(r: any) {\n  shared();\n  r.fetchAll();\n  function inner() {}\n  inner();\n}\n\
                  export function e() { inner(); }\n"
                     .into(),
             ),
@@ -797,7 +797,7 @@ fn js_resolution_respects_module_scope() {
         calls.contains("\"lib/b.ts::shared\""),
         "barrel import is exact: {d:#}"
     );
-    assert!(calls.contains("lib/b.ts::Repo::load"), "{d:#}");
+    assert!(calls.contains("lib/b.ts::Repo::fetchAll"), "{d:#}");
     assert!(calls.contains("app/d.ts::d::inner"), "{d:#}");
     let e = symbol_in(&repo, "app/d.ts::e");
     assert!(
@@ -2075,6 +2075,38 @@ fn one_server_answers_about_several_projects() {
     assert!(
         !not_repo.0.join(".codenav").exists(),
         "nothing indexed in a non-repository"
+    );
+}
+
+#[test]
+fn common_methods_need_their_type_nearby() {
+    let repo = TempRepo::new(
+        "commonmethods",
+        &[(
+            "src/lib.rs",
+            "pub struct WGraph { adj: Vec<u32> }\n\
+             impl WGraph {\n    pub fn new() -> WGraph { WGraph { adj: Vec::new() } }\n    pub fn len(&self) -> usize { 0 }\n}\n\
+             pub fn plain(xs: Vec<u32>) -> usize { xs.len() }\n\
+             pub fn uses_graph() -> usize { let g = WGraph::new(); g.len() }\n\
+             pub struct Stats { communities: Vec<u32> }\n\
+             pub fn counts(s: &Stats) -> usize { s.communities.len() }\n"
+                .into(),
+        ), ("src/communities.rs", "pub fn len() -> usize { 0 }\n".into())],
+    );
+    let calls = |id: &str| symbol_in(&repo, id)["outgoing"]["calls"].to_string();
+    assert!(
+        !calls("src/lib.rs::plain").contains("WGraph::len"),
+        "a Vec's len is not WGraph's"
+    );
+    assert!(
+        calls("src/lib.rs::uses_graph").contains("src/lib.rs::WGraph::len"),
+        "the type is named"
+    );
+    // `s.communities` is a field, not the module `communities`.
+    assert!(
+        !calls("src/lib.rs::counts").contains("communities.rs"),
+        "{}",
+        calls("src/lib.rs::counts")
     );
 }
 

@@ -384,6 +384,8 @@ struct Builder<'a> {
     owner_confidence: HashMap<usize, Confidence>,
     /// exact name -> symbol nodes
     names: HashMap<String, Vec<usize>>,
+    /// definition node -> its byte range in its file
+    def_ranges: HashMap<usize, (usize, usize)>,
     /// path without extension -> file node (also `dir` for mod.rs / __init__.py / index.ts)
     stems: HashMap<String, usize>,
     /// every path suffix of a stem (by component) -> file nodes
@@ -429,6 +431,7 @@ impl<'a> Builder<'a> {
             edge_index: HashMap::new(),
             lang_of_node: Vec::new(),
             hidden: HashSet::new(),
+            def_ranges: HashMap::new(),
             script_files: HashSet::new(),
             reexports: HashMap::new(),
             unresolved_imports: Vec::new(),
@@ -513,6 +516,7 @@ impl<'a> Builder<'a> {
                     f.lang,
                 );
                 self.names.entry(d.name.clone()).or_default().push(node);
+                self.def_ranges.insert(node, (d.start_byte, d.end_byte));
                 // Without any `export`, a JS file is CommonJS or a script: nothing is hidden.
                 if is_js && f.has_exports && !d.exported {
                     self.hidden.insert(node);
@@ -1140,7 +1144,7 @@ impl<'a> Builder<'a> {
                 let matched: Vec<usize> = cands
                     .iter()
                     .copied()
-                    .filter(|&n| self.qualifier_matches(n, q))
+                    .filter(|&n| self.qualifier_matches(n, q, r))
                     .collect();
                 if !matched.is_empty() {
                     cands = matched;
@@ -1159,6 +1163,20 @@ impl<'a> Builder<'a> {
             return none;
         }
         let common = COMMON_METHODS.contains(&r.name.as_str());
+        // `x.len()`, `it.filter(…)` on an unknown receiver are almost always library
+        // methods: link a same-named repo method only when the calling code names its
+        // type (an annotation, `WGraph::new()`, a reference).
+        if risky && common {
+            cands.retain(|&n| {
+                self.graph.nodes[n]
+                    .parent
+                    .filter(|&p| self.graph.nodes[p].kind.is_type())
+                    .is_some_and(|p| self.scope_mentions(fi, scope, &self.graph.nodes[p].name))
+            });
+            if cands.is_empty() {
+                return none;
+            }
+        }
         // A unique match: `sure` when found where it should be (same or imported file) or
         // named by a qualifier; an unknown receiver lowers it, a common method name on an
         // unknown receiver is a guess.
@@ -1228,6 +1246,25 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Whether code of `scope` (in file `fi`; the whole file for top-level code), or of
+    /// the type it belongs to (its fields and properties), names `name`: as a referenced
+    /// type or value, a call, or a qualifier (`Name::new()`).
+    fn scope_mentions(&self, fi: usize, scope: usize, name: &str) -> bool {
+        let owner = self.graph.nodes[scope]
+            .parent
+            .filter(|&p| self.graph.nodes[p].kind.is_type());
+        let range = |n: usize| self.def_ranges.get(&n).copied().unwrap_or((0, usize::MAX));
+        let (start, end) = match owner {
+            Some(t) if self.graph.nodes[t].file == self.facts[fi].path => range(t),
+            _ => range(scope),
+        };
+        self.facts[fi].refs.iter().any(|r| {
+            start <= r.byte
+                && r.byte < end
+                && (r.name == name || r.qualifier.as_deref() == Some(name))
+        })
+    }
+
     /// JS/TS module scoping: can code in file `fi`, inside `scope`, see definition `n`
     /// through reference `r`? In its own file a definition nested in a function is visible
     /// only inside that function. From another file a top-level definition must be
@@ -1293,10 +1330,17 @@ impl<'a> Builder<'a> {
 
     /// `q.name()` / `q::name()` may target a member of type `q`, a function in module
     /// (file) `q`, or in Go package (directory) `q`.
-    fn qualifier_matches(&self, n: usize, q: &str) -> bool {
+    /// A module or package qualifier is a single name: `utils.f()` (Python/JS), `store.F()`
+    /// (Go), or a `::` path in Rust; `self.graph.len()` or a Rust field `x.items.len()`
+    /// names a value, whatever the file it happens to share its name with.
+    fn qualifier_matches(&self, n: usize, q: &str, r: &extract::Ref) -> bool {
         let node = &self.graph.nodes[n];
         if node.parent.is_some_and(|p| self.graph.nodes[p].name == q) {
             return true;
+        }
+        let module_like = r.simple_qualifier && (r.is_static || self.lang_of_node[n] != Lang::Rust);
+        if !module_like {
+            return false;
         }
         let mut parts = node.file.rsplit('/');
         let file_stem = parts.next().and_then(|f| f.split('.').next());
