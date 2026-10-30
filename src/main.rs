@@ -1,4 +1,5 @@
 mod communities;
+mod cycles;
 mod explore;
 mod extract;
 mod graph;
