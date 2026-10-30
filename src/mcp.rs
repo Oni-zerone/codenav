@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::cycles;
+use crate::diff_impact::{self, DiffSource};
 use crate::explore;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::indexer::{self, IndexOptions};
@@ -391,6 +392,25 @@ impl Server {
                     min_confidence(a)?,
                 ))
             }
+            "diff_impact" => {
+                let staged = opt_bool(a, "staged")?.unwrap_or(false);
+                let source = match opt_str(a, "base")? {
+                    Some(_) if staged => {
+                        return Err(anyhow!("pass either `base` or `staged`, not both"));
+                    }
+                    Some(b) => DiffSource::Base(b.to_string()),
+                    None if staged => DiffSource::Staged,
+                    None => DiffSource::WorkingTree,
+                };
+                diff_impact::diff_impact(
+                    g,
+                    &self.root,
+                    &source,
+                    uint(a, "depth", 3)?.clamp(1, 8) as u32,
+                    uint(a, "limit", 200)?.max(1),
+                    min_confidence(a)?,
+                )
+            }
             "tests_for" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 // Guesses among same-named candidates would list unrelated tests.
@@ -497,6 +517,7 @@ fn narrow_hint(tool: &str) -> &'static str {
         "find_cycles" => "lower limit or max_length",
         "tests_for" => "lower depth or limit, or raise min_confidence",
         "insights" => "lower top",
+        "diff_impact" => "lower depth or limit, or raise min_confidence",
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
@@ -706,7 +727,7 @@ fn tool_definitions() -> Value {
         props.entry("token_budget").or_insert(budget.clone());
         if matches!(
             name.as_str(),
-            "get_neighbors" | "find_paths" | "impact_analysis" | "explore"
+            "get_neighbors" | "find_paths" | "impact_analysis" | "explore" | "diff_impact"
         ) {
             props.insert("min_confidence".into(), min_confidence.clone());
         }
@@ -819,6 +840,16 @@ fn base_tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {
                 "path": { "type": "string", "description": "Repo-relative file path." }
             }, "required": ["path"] }
+        },
+        {
+            "name": "diff_impact",
+            "description": "Impact of a change set from git: the symbols whose lines changed (innermost symbol around each changed line; the file for top-level code), new/deleted files, everything that depends on them (as impact_analysis, including callers through overridden interface methods), and the communities and modules touched. Default: all uncommitted changes vs HEAD; `staged` for the index only; `base` for the commits since the branch left it (`base...HEAD`).",
+            "inputSchema": { "type": "object", "properties": {
+                "base": { "type": "string", "description": "Branch, tag or commit: analyse `base...HEAD` instead of uncommitted changes." },
+                "staged": { "type": "boolean", "description": "Only staged changes (default false)." },
+                "depth": { "type": "integer", "description": "1-8, default 3." },
+                "limit": { "type": "integer", "description": "Affected nodes listed (default 200)." }
+            } }
         },
         {
             "name": "insights",

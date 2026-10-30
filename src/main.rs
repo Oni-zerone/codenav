@@ -1,5 +1,6 @@
 mod communities;
 mod cycles;
+mod diff_impact;
 mod explore;
 mod extract;
 mod graph;

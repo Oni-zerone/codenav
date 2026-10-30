@@ -630,15 +630,20 @@ pub fn change_seeds(g: &Graph, start: usize, min: Confidence) -> (Seeds, Seeds) 
     (seeds, overridden)
 }
 
-pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
-    let (mut seeds, overridden) = change_seeds(g, start, min);
-    seeds.extend(&overridden);
-    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
-    let kinds = DEPENDENCY_KINDS;
+/// A dependent found by `dependents`: node, depth, edge kind reaching it, confidence.
+pub type Dependent = (usize, u32, EdgeKind, Confidence);
 
-    // One BFS per confidence level, surest first, following only edges (and seeds) at least
-    // that sure: a node gets the best confidence any path within `depth` gives it, and the
-    // shortest depth at that level. So the label does not depend on edge order.
+/// Everything that depends on `seeds` within `depth` through dependency edges at least
+/// `min` sure, closest first. One BFS per confidence level, surest first, following only
+/// edges (and seeds) at least that sure: a node gets the best confidence any path gives it,
+/// and the shortest depth at that level, so the result does not depend on edge order.
+pub fn dependents(
+    g: &Graph,
+    seeds: &[(usize, Confidence)],
+    depth: u32,
+    min: Confidence,
+) -> Vec<Dependent> {
+    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
     let mut best: HashMap<usize, (u32, EdgeKind, Confidence)> = HashMap::new();
     for level in Confidence::ALL.into_iter().filter(|&l| l >= min) {
         let mut seen = seed_set.clone();
@@ -653,7 +658,9 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
             }
             for &e in &g.in_edges[cur] {
                 let edge = &g.edges[e];
-                if !kinds.contains(&edge.kind) || edge.confidence < level || !seen.insert(edge.from)
+                if !DEPENDENCY_KINDS.contains(&edge.kind)
+                    || edge.confidence < level
+                    || !seen.insert(edge.from)
                 {
                     continue;
                 }
@@ -662,12 +669,20 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
             }
         }
     }
-    let mut hits: Vec<(usize, u32, EdgeKind, Confidence)> = best
+    let mut hits: Vec<Dependent> = best
         .into_iter()
         .map(|(n, (d, k, c))| (n, d, k, c))
         .collect();
     hits.sort_by(|a, b| a.1.cmp(&b.1).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
+    hits
+}
 
+/// The first `limit` dependents as `Name (kind) via called_by [depth 2, inferred]`, by file.
+pub fn dependents_by_file(
+    g: &Graph,
+    hits: &[Dependent],
+    limit: usize,
+) -> BTreeMap<String, Vec<Value>> {
     let mut by_file: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for &(n, d, k, conf) in hits.iter().take(limit) {
         let node = &g.nodes[n];
@@ -687,6 +702,15 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
             .or_default()
             .push(json!(label));
     }
+    by_file
+}
+
+pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
+    let (mut seeds, overridden) = change_seeds(g, start, min);
+    seeds.extend(&overridden);
+    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
+    let hits = dependents(g, &seeds, depth, min);
+    let by_file = dependents_by_file(g, &hits, limit);
     let mut out = json!({
         "target": summary(g, start),
         "members_considered": seed_set.len(),
@@ -717,7 +741,7 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
 /// Methods with the same name as method `m` in the supertypes of its type, nearest
 /// first, following `inherits` edges at least `min` sure transitively. Each comes with
 /// the confidence of the weakest link that reached it.
-fn overridden_members(g: &Graph, m: usize, min: Confidence) -> Vec<(usize, Confidence)> {
+pub fn overridden_members(g: &Graph, m: usize, min: Confidence) -> Vec<(usize, Confidence)> {
     let node = &g.nodes[m];
     if node.kind != SymKind::Method {
         return vec![];

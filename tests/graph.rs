@@ -1588,6 +1588,126 @@ fn search_says_how_results_match() {
     assert!(search("m.py plan").get("note").is_none());
 }
 
+/// Copies a directory tree (without `.codenav`).
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == ".codenav" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            copy_tree(&path, &to.join(&name));
+        } else {
+            std::fs::copy(&path, to.join(&name)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn diff_impact_maps_changes_to_symbols() {
+    let repo = TempRepo::new("diffimpact", &[]);
+    copy_tree(fixture(), &repo.0);
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo.0)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let diff = |args: Value| -> Value {
+        let mut args = args;
+        args["format"] = json!("json");
+        let (ok, text) = tool_text_in(&repo.0, "diff_impact", args);
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+
+    // Not a repository yet.
+    let (ok, text) = tool_text_in(&repo.0, "diff_impact", json!({}));
+    assert!(!ok && text.contains("git diff failed"), "{text}");
+
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.0.join(".gitignore"), ".codenav/\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+
+    // Change the body of format_name (line 14).
+    let models = repo.0.join("py/app/models.py");
+    let text = std::fs::read_to_string(&models).unwrap();
+    std::fs::write(
+        &models,
+        text.replace("return n.title()", "return n.strip().title()"),
+    )
+    .unwrap();
+    let v = diff(json!({}));
+    assert_eq!(v["diff"], "uncommitted changes vs HEAD");
+    assert_eq!(
+        v["changed"]["py/app/models.py"],
+        json!(["format_name (function) L13-14"]),
+        "{v:#}"
+    );
+    let affected = v["by_file"].to_string();
+    assert!(
+        affected.contains("User::greet") && affected.contains("UserService::notify"),
+        "{v:#}"
+    );
+    assert!(!affected.contains("ios/"), "{v:#}");
+    assert!(v["modules"].to_string().contains("py/app"), "{v:#}");
+
+    // Only staged changes: none yet, then the staged file.
+    assert_eq!(diff(json!({ "staged": true }))["changed_files"], 0);
+    git(&["add", "py/app/models.py"]);
+    assert_eq!(diff(json!({ "staged": true }))["changed_files"], 1);
+    git(&["commit", "-q", "-m", "strip"]);
+
+    // A branch: a new file and a deleted one, against main.
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::write(repo.0.join("py/app/extra.py"), "def extra():\n    pass\n").unwrap();
+    std::fs::remove_file(repo.0.join("web/src/components/Avatar.tsx")).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "feature"]);
+    let v = diff(json!({ "base": "main" }));
+    assert_eq!(v["diff"], "main...HEAD");
+    assert_eq!(v["new_files"], json!(["py/app/extra.py"]), "{v:#}");
+    assert_eq!(
+        v["deleted_files"],
+        json!(["web/src/components/Avatar.tsx"]),
+        "{v:#}"
+    );
+    assert_eq!(
+        v["changed"]["py/app/extra.py"],
+        json!(["extra (function) L1-2"]),
+        "{v:#}"
+    );
+
+    for (args, expected) in [
+        (json!({ "base": "nope" }), "git diff failed"),
+        (json!({ "base": "--output=x" }), "must be a branch"),
+        (json!({ "base": "main", "staged": true }), "not both"),
+    ] {
+        let (ok, text) = tool_text_in(&repo.0, "diff_impact", args);
+        assert!(!ok && text.contains(expected), "{text}");
+    }
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
