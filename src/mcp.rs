@@ -100,7 +100,11 @@ impl Server {
                     .get("protocolVersion")
                     .and_then(Value::as_str)
                     .unwrap_or(PROTOCOL_VERSION),
-                "capabilities": { "tools": { "listChanged": false } },
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "listChanged": false, "subscribe": false },
+                    "prompts": { "listChanged": false },
+                },
                 "serverInfo": { "name": "codenav", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": INSTRUCTIONS,
             })),
@@ -120,8 +124,45 @@ impl Server {
                     }),
                 })
             }
-            "resources/list" => Ok(json!({ "resources": [] })),
-            "prompts/list" => Ok(json!({ "prompts": [] })),
+            "resources/list" => Ok(json!({ "resources": resource_list() })),
+            "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
+            "resources/read" => match params.get("uri").and_then(Value::as_str) {
+                None => Err((-32602, "resources/read needs a `uri` string".to_string())),
+                Some(uri) => match RESOURCES.iter().find(|r| r.uri == uri) {
+                    None => Err((-32002, format!("resource not found: {uri}"))),
+                    Some(r) => {
+                        // The tool's defaults, with a larger budget; a reader cannot narrow
+                        // a resource, so a cut points to the tool instead.
+                        let args = json!({ "token_budget": RESOURCE_TOKEN_BUDGET });
+                        let hint = format!("call the {} tool with narrower arguments", r.tool);
+                        match self.render_tool(r.tool, &args, &hint) {
+                            Ok(text) => Ok(json!({ "contents": [{
+                                "uri": r.uri,
+                                "mimeType": "text/plain",
+                                "text": text,
+                            }] })),
+                            Err(e) => Err((-32603, format!("{e:#}"))),
+                        }
+                    }
+                },
+            },
+            "prompts/list" => Ok(json!({ "prompts": [architecture_review_definition()] })),
+            "prompts/get" => {
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                if name != "architecture-review" {
+                    Err((-32602, format!("unknown prompt: {name}")))
+                } else {
+                    match params.get("arguments").and_then(|a| a.get("focus")) {
+                        None | Some(Value::Null) => Ok(architecture_review(None)),
+                        Some(Value::String(f)) => {
+                            // Backticks would break the inline code it is quoted in.
+                            let f = f.replace('`', "").trim().to_string();
+                            Ok(architecture_review((!f.is_empty()).then_some(f.as_str())))
+                        }
+                        Some(v) => Err((-32602, format!("`focus` must be a string, got {v}"))),
+                    }
+                }
+            }
             _ => Err((-32601, format!("method not found: {method}"))),
         };
         Some(match result {
@@ -166,6 +207,11 @@ impl Server {
     /// Runs a tool and renders its result: plain text tools as is, structured ones as
     /// compact text cut to `token_budget`, or as full JSON with `format: "json"`.
     pub fn call_tool(&mut self, name: &str, a: &Value) -> Result<String> {
+        self.render_tool(name, a, narrow_hint(name))
+    }
+
+    /// A tool's answer as text (or JSON); `hint` says how to get a smaller one when cut.
+    fn render_tool(&mut self, name: &str, a: &Value, hint: &str) -> Result<String> {
         let format = opt_str(a, "format")?.unwrap_or("text").to_lowercase();
         anyhow::ensure!(
             format == "text" || format == "json",
@@ -178,7 +224,7 @@ impl Server {
         Ok(match self.run_tool(name, a)? {
             Value::String(text) => text,
             v if format == "json" => serde_json::to_string(&v)?,
-            v => output::fit_value(&v, budget, narrow_hint(name)),
+            v => output::fit_value(&v, budget, hint),
         })
     }
 
@@ -454,6 +500,109 @@ fn narrow_hint(tool: &str) -> &'static str {
         "find_paths" => "lower max_paths or restrict edge_kinds",
         _ => "narrow the request",
     }
+}
+
+/// A resource: a fixed read-only view, one tool's answer with its default arguments.
+struct Resource {
+    uri: &'static str,
+    name: &'static str,
+    description: &'static str,
+    tool: &'static str,
+}
+
+/// Resources are larger than a default tool answer: they are read once, as context.
+const RESOURCE_TOKEN_BUDGET: usize = 8000;
+
+const RESOURCES: &[Resource] = &[
+    Resource {
+        uri: "codenav://overview",
+        name: "Repository overview",
+        description: "Index state, languages, counts, most depended-on symbols and files, external dependencies, largest communities (graph_overview).",
+        tool: "graph_overview",
+    },
+    Resource {
+        uri: "codenav://modules",
+        name: "Module graph",
+        description: "Directories as components and the dependencies between them (module_graph, depth 2).",
+        tool: "module_graph",
+    },
+    Resource {
+        uri: "codenav://insights",
+        name: "Insights",
+        description: "Surprising connections, bridge nodes between communities and suggested questions (insights).",
+        tool: "insights",
+    },
+    Resource {
+        uri: "codenav://cycles",
+        name: "Import cycles",
+        description: "Import cycles between files (find_cycles).",
+        tool: "find_cycles",
+    },
+    Resource {
+        uri: "codenav://audit",
+        name: "Resolver audit",
+        description: "Edge counts by confidence and the edges guessed by name, to verify (audit_edges).",
+        tool: "audit_edges",
+    },
+];
+
+fn resource_list() -> Value {
+    json!(
+        RESOURCES
+            .iter()
+            .map(|r| json!({
+                "uri": r.uri,
+                "name": r.name,
+                "description": r.description,
+                "mimeType": "text/plain",
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn architecture_review_definition() -> Value {
+    json!({
+        "name": "architecture-review",
+        "description": "Review the architecture of this repository (or of one area) with codenav's tools: components, dependencies, cycles, hotspots, risky guesses.",
+        "arguments": [{
+            "name": "focus",
+            "description": "Optional area to concentrate on: a directory, file or symbol.",
+            "required": false,
+        }],
+    })
+}
+
+fn architecture_review(focus: Option<&str>) -> Value {
+    let scope = match focus {
+        Some(f) => format!(
+            "Concentrate on `{f}`: locate it with search_symbols or file_outline, and read the rest \
+             of the repository only as far as it explains `{f}`.\n\n"
+        ),
+        None => String::new(),
+    };
+    let text = format!(
+        "Review the architecture of this repository using the codenav tools.\n\n{scope}\
+         1. Call graph_overview (also offered as the codenav://overview resource): languages, size, central symbols, \
+         largest communities, and whether the index matches the current commit.\n\
+         2. Call module_graph, then get_community on the largest communities: what the real \
+         components are, and where they differ from the directory layout.\n\
+         3. Call find_cycles (level file, then module) and say which cycles look accidental.\n\
+         4. Call insights: explain the bridge nodes and the surprising connections. Verify every \
+         edge marked ambiguous or inferred with read_code before relying on it.\n\
+         5. For the most central symbols, call impact_analysis and tests_for to judge how risky \
+         and how covered a change there would be.\n\n\
+         Report: the components and their responsibilities, dependency problems (cycles, \
+         unexpected couplings, overloaded hubs), and concrete suggestions, each citing the files \
+         and symbols involved."
+    );
+    let description = match focus {
+        Some(f) => format!("Architecture review of {f}"),
+        None => "Architecture review".to_string(),
+    };
+    json!({
+        "description": description,
+        "messages": [{ "role": "user", "content": { "type": "text", "text": text } }],
+    })
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> Value {

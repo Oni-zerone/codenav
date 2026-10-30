@@ -147,6 +147,14 @@ Tutti i tool che restituiscono dati strutturati rispondono di default in **testo
 per vedere tutto, più un suggerimento per restringere la richiesta. Con `format: "json"` si ottiene
 invece il risultato JSON completo, senza budget.
 
+### Risorse e prompt MCP
+
+Oltre ai tool, il server espone **risorse** di sola lettura, utili come contesto iniziale (testo
+compatto, budget di 8000 token): `codenav://overview`, `codenav://modules`, `codenav://insights`,
+`codenav://cycles` e `codenav://audit`. Il prompt **`architecture-review`** (argomento opzionale
+`focus`: una cartella, un file o un simbolo) guida l'LLM in una revisione dell'architettura con i
+tool di codenav: componenti, cicli, punti critici e collegamenti da verificare.
+
 ### Community
 
 Durante l'indicizzazione il grafo viene diviso in **community**: gruppi di file e simboli che
