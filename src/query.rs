@@ -500,6 +500,9 @@ pub fn file_outline(g: &Graph, file: usize) -> Value {
 
 /// What could break if `start` changes: everything that transitively depends on it
 /// (or on its members) through calls, inheritance, type references and imports.
+///
+/// A method also stands in for the members it overrides: a call through the interface
+/// or base class (`repo.load()` resolved to `Repository::load`) reaches it at runtime.
 pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize) -> Value {
     let mut seeds = vec![start];
     let mut i = 0;
@@ -511,6 +514,15 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize) -> Value {
         }
         i += 1;
     }
+    let mut overridden = Vec::new();
+    for &s in &seeds {
+        for m in overridden_members(g, s) {
+            if !seeds.contains(&m) && !overridden.contains(&m) {
+                overridden.push(m);
+            }
+        }
+    }
+    seeds.extend(&overridden);
     let seed_set: HashSet<usize> = seeds.iter().copied().collect();
     let kinds = [
         EdgeKind::Calls,
@@ -554,14 +566,63 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize) -> Value {
             .or_default()
             .push(json!(label));
     }
-    json!({
+    let mut out = json!({
         "target": summary(g, start),
         "members_considered": seed_set.len(),
-        "affected_symbols": hits.iter().filter(|h| g.nodes[h.0].kind != SymKind::File).count(),
-        "affected_files": by_file.len(),
-        "truncated": hits.len() > limit,
-        "by_file": by_file,
-    })
+    });
+    // Listed before `by_file` so a text output cut to the budget keeps it.
+    if !overridden.is_empty() {
+        out["overridden_members"] = json!(
+            overridden
+                .iter()
+                .map(|&m| &g.nodes[m].id)
+                .collect::<Vec<_>>()
+        );
+    }
+    out["affected_symbols"] = json!(
+        hits.iter()
+            .filter(|h| g.nodes[h.0].kind != SymKind::File)
+            .count()
+    );
+    out["affected_files"] = json!(by_file.len());
+    out["truncated"] = json!(hits.len() > limit);
+    out["by_file"] = json!(by_file);
+    out
+}
+
+/// Methods with the same name as method `m` in the supertypes of its type, nearest
+/// first, following `inherits` edges transitively.
+fn overridden_members(g: &Graph, m: usize) -> Vec<usize> {
+    let node = &g.nodes[m];
+    if node.kind != SymKind::Method {
+        return vec![];
+    }
+    let Some(owner) = node.parent.filter(|&p| g.nodes[p].kind.is_type()) else {
+        return vec![];
+    };
+    let mut found = Vec::new();
+    let mut seen = HashSet::from([owner]);
+    let mut queue = VecDeque::from([owner]);
+    while let Some(t) = queue.pop_front() {
+        for &e in &g.out_edges[t] {
+            let edge = &g.edges[e];
+            if edge.kind != EdgeKind::Inherits || !seen.insert(edge.to) {
+                continue;
+            }
+            let base = edge.to;
+            found.extend(
+                g.out_edges[base]
+                    .iter()
+                    .filter(|&&c| g.edges[c].kind == EdgeKind::Contains)
+                    .map(|&c| g.edges[c].to)
+                    .filter(|&c| {
+                        g.nodes[c].kind == SymKind::Method && g.nodes[c].name == node.name
+                    }),
+            );
+            queue.push_back(base);
+        }
+    }
+    found
 }
 
 /// Component-level view: edges aggregated between directories truncated at `depth`.

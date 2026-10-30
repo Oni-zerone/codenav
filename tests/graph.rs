@@ -137,6 +137,123 @@ fn paths_and_impact() {
 }
 
 #[test]
+fn impact_reaches_callers_of_overridden_members() {
+    let impact = tool(
+        "impact_analysis",
+        json!({ "id": "ios/Sources/App/Model.swift::ItemStore::load" }),
+    );
+    let swift = impact["by_file"]["ios/Sources/App/ViewModel.swift"].to_string();
+    assert!(swift.contains("ViewModel::refresh"), "{impact:#}");
+    assert_eq!(
+        impact["overridden_members"],
+        json!(["ios/Sources/App/Model.swift::Repository::load"]),
+        "{impact:#}"
+    );
+
+    let impact = tool(
+        "impact_analysis",
+        json!({ "id": "web/src/lib/api.ts::HttpClient::get" }),
+    );
+    assert!(
+        impact["by_file"]["web/src/components/Profile.tsx"].is_array(),
+        "{impact:#}"
+    );
+    assert_eq!(
+        impact["overridden_members"],
+        json!(["web/src/lib/api.ts::Client::get"]),
+        "{impact:#}"
+    );
+}
+
+/// The call resolves to the interface method only (the caller imports just the
+/// interface), so the implementation is reached only through the override link.
+#[test]
+fn impact_follows_overrides_across_files_and_levels() {
+    let repo = TempRepo::new(
+        "overrides",
+        &[
+            (
+                "lib/client.ts",
+                "export interface Client { get(path: string): string; }\n".into(),
+            ),
+            (
+                "impl/http.ts",
+                "import { Client } from '../lib/client';\n\
+                 export class HttpClient implements Client {\n  get(path: string): string { return path; }\n}\n"
+                    .into(),
+            ),
+            (
+                "impl/cached.ts",
+                "import { HttpClient } from './http';\n\
+                 export class CachedClient extends HttpClient {\n  get(path: string): string { return path; }\n  clear() {}\n}\n"
+                    .into(),
+            ),
+            (
+                "impl/mock.ts",
+                "import { Client } from '../lib/client';\n\
+                 export class MockClient implements Client {\n  get(path: string): string { return ''; }\n}\n"
+                    .into(),
+            ),
+            (
+                "app/use.ts",
+                "import { Client } from '../lib/client';\n\
+                 export function load(c: Client) { return c.get('/x'); }\n"
+                    .into(),
+            ),
+        ],
+    );
+    let impact = |id: &str| {
+        let (ok, text) = tool_text_in(
+            &repo.0,
+            "impact_analysis",
+            json!({ "id": id, "format": "json" }),
+        );
+        assert!(ok, "{text}");
+        serde_json::from_str::<Value>(&text).unwrap()
+    };
+
+    // Precondition: the call is linked to the interface only.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "get_symbol",
+        json!({ "id": "app/use.ts::load", "format": "json" }),
+    );
+    assert!(ok && text.contains("lib/client.ts::Client::get"), "{text}");
+    assert!(!text.contains("impl/http.ts::HttpClient::get"), "{text}");
+
+    let v = impact("impl/http.ts::HttpClient::get");
+    assert!(v["by_file"]["app/use.ts"].is_array(), "{v:#}");
+    assert_eq!(
+        v["overridden_members"],
+        json!(["lib/client.ts::Client::get"]),
+        "{v:#}"
+    );
+
+    // Two levels up: CachedClient -> HttpClient -> Client.
+    let v = impact("impl/cached.ts::CachedClient::get");
+    assert!(v["by_file"]["app/use.ts"].is_array(), "{v:#}");
+    assert_eq!(
+        v["overridden_members"],
+        json!([
+            "impl/http.ts::HttpClient::get",
+            "lib/client.ts::Client::get"
+        ]),
+        "{v:#}"
+    );
+
+    // Analysing the whole class covers its methods' overrides too.
+    let v = impact("impl/cached.ts::CachedClient");
+    assert!(v["by_file"]["app/use.ts"].is_array(), "{v:#}");
+
+    // Only supertypes: a sibling implementation is not pulled in, and a method that
+    // overrides nothing reports no overridden members.
+    let v = impact("impl/http.ts::HttpClient::get");
+    assert!(!v.to_string().contains("MockClient"), "{v:#}");
+    let v = impact("impl/cached.ts::CachedClient::clear");
+    assert!(v.get("overridden_members").is_none(), "{v:#}");
+}
+
+#[test]
 fn explore_question_returns_relevant_subgraph() {
     let (ok, text) = tool_text(
         "explore",

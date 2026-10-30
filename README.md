@@ -99,7 +99,7 @@ aggiornamento automatico quando l'indice cambia.
 | `get_neighbors` | BFS attorno a un nodo (es. chi chiama X: `direction=in`, `edge_kinds=[calls]`) |
 | `find_paths` | Catene di relazioni più brevi tra due nodi ("come sono collegati A e B?") |
 | `file_outline` | Simboli di un file (annidati), import, importatori, file più correlati |
-| `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia |
+| `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base) |
 | `read_code` | Legge un intervallo di righe di un file del repo |
 | `reindex` | Ricostruisce il grafo |
 
