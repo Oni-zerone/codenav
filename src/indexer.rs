@@ -302,8 +302,10 @@ struct Builder<'a> {
     file_by_path: HashMap<String, usize>,
     /// file index -> def index -> node
     def_nodes: Vec<Vec<usize>>,
-    /// file index -> impl index -> resolved owner type node
-    impl_owner: Vec<Vec<Option<usize>>>,
+    /// file index -> impl index -> resolved owner type node and how sure that is
+    impl_owner: Vec<Vec<Option<(usize, Confidence)>>>,
+    /// member node -> confidence of its owner type, when the owner was not certain
+    owner_confidence: HashMap<usize, Confidence>,
     /// exact name -> symbol nodes
     names: HashMap<String, Vec<usize>>,
     /// path without extension -> file node (also `dir` for mod.rs / __init__.py / index.ts)
@@ -330,6 +332,7 @@ impl<'a> Builder<'a> {
             file_by_path: HashMap::new(),
             def_nodes: Vec::new(),
             impl_owner: Vec::new(),
+            owner_confidence: HashMap::new(),
             names: HashMap::new(),
             stems: HashMap::new(),
             stem_suffixes: HashMap::new(),
@@ -344,6 +347,8 @@ impl<'a> Builder<'a> {
 
     fn build(mut self) -> Graph {
         self.add_files_and_defs();
+        // Owners and base types are looked up in imported files too.
+        self.collect_imported_files();
         self.resolve_owners();
         self.assign_ids();
         self.add_contains_edges();
@@ -454,7 +459,7 @@ impl<'a> Builder<'a> {
     fn resolve_owners(&mut self) {
         for (fi, f) in self.facts.iter().enumerate() {
             for (ii, imp) in f.impls.iter().enumerate() {
-                self.impl_owner[fi][ii] = self.find_type(&imp.type_name, fi).map(|(t, _)| t);
+                self.impl_owner[fi][ii] = self.find_type(&imp.type_name, fi);
             }
             for (di, d) in f.defs.iter().enumerate() {
                 let node = self.def_nodes[fi][di];
@@ -479,8 +484,13 @@ impl<'a> Builder<'a> {
                 if self.graph.nodes[node].kind == SymKind::Function {
                     self.graph.nodes[node].kind = SymKind::Method;
                 }
-                match self.find_type(&owner_name, fi).map(|(t, _)| t) {
-                    Some(owner) if owner != node => self.graph.nodes[node].parent = Some(owner),
+                match self.find_type(&owner_name, fi) {
+                    Some((owner, conf)) if owner != node => {
+                        self.graph.nodes[node].parent = Some(owner);
+                        if !conf.is_exact() {
+                            self.owner_confidence.insert(node, conf);
+                        }
+                    }
                     // Type not in the repo: keep the owner in the qualified name (see `qualified`).
                     _ => self.graph.nodes[node].id = format!("{owner_name}::{}", d.name),
                 }
@@ -488,46 +498,51 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// The type named `name` as seen from file `fi`: same file, else same directory, else
-    /// the only one in the repository.
+    /// The type named `name` as seen from file `fi`: same file, else an imported file, else
+    /// same directory, else the only one in the repository.
     fn find_type(&self, name: &str, fi: usize) -> Option<(usize, Confidence)> {
-        let cands: Vec<usize> = self
-            .names
-            .get(name)?
-            .iter()
-            .copied()
-            .filter(|&n| self.graph.nodes[n].kind.is_type())
-            .filter(|&n| self.lang_of_node[n].family() == self.facts[fi].lang.family())
-            .collect();
+        let family = self.facts[fi].lang.family();
+        let cands = || {
+            self.names
+                .get(name)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(move |&n| {
+                    self.graph.nodes[n].kind.is_type() && self.lang_of_node[n].family() == family
+                })
+        };
         let file = &self.facts[fi].path;
         let dir = parent_dir(file);
-        let same_file: Vec<usize> = cands
-            .iter()
-            .copied()
-            .filter(|&n| &self.graph.nodes[n].file == file)
-            .collect();
-        if let Some(&t) = same_file.first() {
-            let conf = if same_file.len() == 1 {
-                Confidence::Exact
-            } else {
-                Confidence::Ambiguous
-            };
-            return Some((t, conf));
-        }
-        let same_dir: Vec<usize> = cands
-            .iter()
-            .copied()
-            .filter(|&n| parent_dir(&self.graph.nodes[n].file) == dir)
-            .collect();
-        if let Some(&t) = same_dir.first() {
-            let conf = if same_dir.len() == 1 {
-                Confidence::Inferred
-            } else {
-                Confidence::Ambiguous
-            };
-            return Some((t, conf));
-        }
-        (cands.len() == 1).then(|| (cands[0], Confidence::Inferred))
+        let imported = self.imported.get(&self.file_nodes[fi]);
+        pick_one(
+            cands().filter(|&n| &self.graph.nodes[n].file == file),
+            Confidence::Exact,
+        )
+        .or_else(|| {
+            let imported = imported?;
+            pick_one(
+                cands().filter(|&n| {
+                    self.file_by_path
+                        .get(&self.graph.nodes[n].file)
+                        .is_some_and(|f| imported.contains(f))
+                }),
+                Confidence::Exact,
+            )
+        })
+        .or_else(|| {
+            pick_one(
+                cands().filter(|&n| parent_dir(&self.graph.nodes[n].file) == dir),
+                Confidence::Inferred,
+            )
+        })
+        .or_else(|| {
+            let mut all = cands();
+            match (all.next(), all.next()) {
+                (Some(t), None) => Some((t, Confidence::Inferred)),
+                _ => None,
+            }
+        })
     }
 
     fn assign_ids(&mut self) {
@@ -570,7 +585,13 @@ impl<'a> Builder<'a> {
         for i in 0..self.graph.nodes.len() {
             if let Some(p) = self.graph.nodes[i].parent {
                 let line = self.graph.nodes[i].line;
-                self.add_edge(p, i, EdgeKind::Contains, line, Confidence::Exact);
+                // A member attached to a guessed owner type is only as sure as that guess.
+                let conf = self
+                    .owner_confidence
+                    .get(&i)
+                    .copied()
+                    .unwrap_or(Confidence::Exact);
+                self.add_edge(p, i, EdgeKind::Contains, line, conf);
             }
         }
     }
@@ -619,20 +640,41 @@ impl<'a> Builder<'a> {
         n
     }
 
+    /// Import targets of file `fi` (repo files and external packages).
+    fn import_targets(&self, fi: usize, imp: &extract::Import) -> Vec<Target> {
+        let f = &self.facts[fi];
+        match f.lang {
+            Lang::Rust => self.resolve_rust_import(&f.path, imp),
+            Lang::Python => self.resolve_python_import(&f.path, imp),
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+                self.resolve_js_import(&f.path, &imp.path)
+            }
+            Lang::Go => self.resolve_go_import(&imp.path),
+            Lang::Swift => vec![Target::External(imp.path.clone())],
+        }
+    }
+
+    /// Fills `imported` (file -> repo files it imports) without adding edges or nodes.
+    fn collect_imported_files(&mut self) {
+        for (fi, f) in self.facts.iter().enumerate() {
+            let from = self.file_nodes[fi];
+            for imp in &f.imports {
+                for t in self.import_targets(fi, imp) {
+                    if let Target::File(n) = t
+                        && n != from
+                    {
+                        self.imported.entry(from).or_default().insert(n);
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_imports(&mut self) {
         for (fi, f) in self.facts.iter().enumerate() {
             let from = self.file_nodes[fi];
             for imp in &f.imports {
-                let targets = match f.lang {
-                    Lang::Rust => self.resolve_rust_import(&f.path, imp),
-                    Lang::Python => self.resolve_python_import(&f.path, imp),
-                    Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-                        self.resolve_js_import(&f.path, &imp.path)
-                    }
-                    Lang::Go => self.resolve_go_import(&imp.path),
-                    Lang::Swift => vec![Target::External(imp.path.clone())],
-                };
-                for t in targets {
+                for t in self.import_targets(fi, imp) {
                     let to = match t {
                         Target::File(n) if n == from => continue,
                         Target::File(n) => {
@@ -810,11 +852,13 @@ impl<'a> Builder<'a> {
     fn resolve_impls(&mut self) {
         for (fi, f) in self.facts.iter().enumerate() {
             for (ii, imp) in f.impls.iter().enumerate() {
-                let (Some(owner), Some(tr)) = (self.impl_owner[fi][ii], imp.trait_name.as_ref())
+                let (Some((owner, owner_conf)), Some(tr)) =
+                    (self.impl_owner[fi][ii], imp.trait_name.as_ref())
                 else {
                     continue;
                 };
                 if let Some((t, conf)) = self.find_type(tr, fi) {
+                    let conf = conf.min(owner_conf);
                     self.add_edge(owner, t, EdgeKind::Inherits, imp.line, conf);
                 }
             }
@@ -873,7 +917,7 @@ impl<'a> Builder<'a> {
                 if kind == RefKind::TypeRef {
                     return None;
                 }
-                Some(self.impl_owner[fi][ii].unwrap_or(self.file_nodes[fi]))
+                Some(self.impl_owner[fi][ii].map_or(self.file_nodes[fi], |(t, _)| t))
             }
             (None, None) => Some(self.file_nodes[fi]),
         }
@@ -912,12 +956,8 @@ impl<'a> Builder<'a> {
                     .filter(|&n| owner.is_some() && self.graph.nodes[n].parent == owner)
                     .collect();
                 if !own.is_empty() {
-                    let conf = if own.len() == 1 {
-                        Confidence::Exact
-                    } else {
-                        Confidence::Ambiguous
-                    };
-                    return (own, conf);
+                    // The owner is certain; several hits are overloads of one member.
+                    return (own, Confidence::Exact);
                 }
                 // Inherited member: any method with that name.
                 cands.retain(|&n| self.graph.nodes[n].kind == SymKind::Method);
@@ -948,7 +988,7 @@ impl<'a> Builder<'a> {
         // A unique match: `sure` when found where it should be (same or imported file) or
         // named by a qualifier; an unknown receiver lowers it, a common method name on an
         // unknown receiver is a guess.
-        let unique = move |sure: bool| -> Confidence {
+        let unique = |sure: bool, risky: bool| -> Confidence {
             if risky && common {
                 Confidence::Ambiguous
             } else if (sure || qualified) && !risky {
@@ -991,7 +1031,7 @@ impl<'a> Builder<'a> {
             let hits: Vec<usize> = cands.iter().copied().filter(|&n| tier(n)).collect();
             match hits.len() {
                 0 => continue,
-                1 => return (hits, unique(*sure)),
+                1 => return (hits, unique(*sure, risky)),
                 k if k <= MAX_AMBIGUOUS => return (hits, Confidence::Ambiguous),
                 _ => return none,
             }
@@ -1006,8 +1046,9 @@ impl<'a> Builder<'a> {
             return none;
         }
         match cands.len() {
+            // Only a cross-crate Rust match gets here while risky: a guess.
             1 if risky => (cands, Confidence::Ambiguous),
-            1 => (cands, unique(false)),
+            1 => (cands, unique(false, false)),
             k if k <= MAX_AMBIGUOUS => (cands, Confidence::Ambiguous),
             _ => none,
         }
@@ -1119,6 +1160,20 @@ fn crate_root(file: &str) -> String {
         }
         dir = parent_dir(&dir);
     }
+}
+
+/// The first of `hits` with confidence `unique` if it is the only one, else ambiguous.
+fn pick_one(
+    mut hits: impl Iterator<Item = usize>,
+    unique: Confidence,
+) -> Option<(usize, Confidence)> {
+    let first = hits.next()?;
+    let conf = if hits.next().is_none() {
+        unique
+    } else {
+        Confidence::Ambiguous
+    };
+    Some((first, conf))
 }
 
 fn parent_dir(path: &str) -> String {

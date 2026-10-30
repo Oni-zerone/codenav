@@ -145,6 +145,11 @@ impl Confidence {
     pub fn is_exact(&self) -> bool {
         *self == Confidence::Exact
     }
+
+    /// The name to show next to an edge or a result, or `None` when exact (the default).
+    pub fn label(self) -> Option<&'static str> {
+        (!self.is_exact()).then(|| self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]

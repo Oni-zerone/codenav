@@ -504,8 +504,8 @@ fn render(
             if edge.count > 1 {
                 line.push_str(&format!(" (×{})", edge.count));
             }
-            if !edge.confidence.is_exact() {
-                line.push_str(&format!(" ({})", edge.confidence.as_str()));
+            if let Some(l) = edge.confidence.label() {
+                line.push_str(&format!(" ({l})"));
             }
             edges.push((r, line));
         }

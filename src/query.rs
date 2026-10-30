@@ -197,8 +197,8 @@ fn edge_ref(g: &Graph, other: usize, e: &crate::graph::Edge) -> Value {
         if e.count > 1 {
             o["count"] = json!(e.count);
         }
-        if !e.confidence.is_exact() {
-            o["confidence"] = json!(e.confidence.as_str());
+        if let Some(l) = e.confidence.label() {
+            o["confidence"] = json!(l);
         }
         v = o;
     }
@@ -332,8 +332,8 @@ pub fn neighbors(
             if edge.count > 1 {
                 ev["count"] = json!(edge.count);
             }
-            if !edge.confidence.is_exact() {
-                ev["confidence"] = json!(edge.confidence.as_str());
+            if let Some(l) = edge.confidence.label() {
+                ev["confidence"] = json!(l);
             }
             edges.push(ev);
             if seen.insert(next) {
@@ -424,10 +424,14 @@ pub fn find_paths(
             let mut text = g.nodes[from].id.clone();
             for &(_, e, fwd) in p {
                 let edge = &g.edges[e];
+                let kind = match edge.confidence.label() {
+                    Some(l) => format!("{} ({l})", edge.kind.as_str()),
+                    None => edge.kind.as_str().to_string(),
+                };
                 let (arrow, other) = if fwd {
-                    (format!(" --{}--> ", edge.kind.as_str()), edge.to)
+                    (format!(" --{kind}--> "), edge.to)
                 } else {
-                    (format!(" <--{}-- ", edge.kind.as_str()), edge.from)
+                    (format!(" <--{kind}-- "), edge.from)
                 };
                 text.push_str(&arrow);
                 text.push_str(&g.nodes[other].id);
@@ -527,59 +531,74 @@ pub fn file_outline(g: &Graph, file: usize) -> Value {
 /// Only edges at least as sure as `min` are followed; each hit reports the confidence of
 /// the weakest edge on the path that reached it.
 pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
-    let mut seeds = vec![start];
+    // Seeds: the target, its members (through containment at least `min` sure), and the
+    // members they override, each with the confidence of how it was reached.
+    let mut seeds: Vec<(usize, Confidence)> = vec![(start, Confidence::Exact)];
     let mut i = 0;
     while i < seeds.len() {
-        for &e in &g.out_edges[seeds[i]] {
-            if g.edges[e].kind == EdgeKind::Contains {
-                seeds.push(g.edges[e].to);
+        let (s, conf) = seeds[i];
+        for &e in &g.out_edges[s] {
+            let edge = &g.edges[e];
+            if edge.kind == EdgeKind::Contains && edge.confidence >= min {
+                seeds.push((edge.to, conf.min(edge.confidence)));
             }
         }
         i += 1;
     }
-    let mut overridden = Vec::new();
-    for &s in &seeds {
-        for m in overridden_members(g, s) {
-            if !seeds.contains(&m) && !overridden.contains(&m) {
-                overridden.push(m);
+    let mut overridden: Vec<(usize, Confidence)> = Vec::new();
+    for &(s, conf) in &seeds {
+        for (m, via) in overridden_members(g, s, min) {
+            let known = seeds.iter().chain(&overridden).any(|&(x, _)| x == m);
+            if !known {
+                overridden.push((m, conf.min(via)));
             }
         }
     }
     seeds.extend(&overridden);
-    let seed_set: HashSet<usize> = seeds.iter().copied().collect();
+    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
     let kinds = [
         EdgeKind::Calls,
         EdgeKind::Inherits,
         EdgeKind::References,
         EdgeKind::Imports,
     ];
-    let mut seen = seed_set.clone();
-    let mut queue: VecDeque<(usize, u32, Confidence)> =
-        seeds.iter().map(|&s| (s, 0, Confidence::Exact)).collect();
-    let mut hits: Vec<(usize, u32, EdgeKind, Confidence)> = Vec::new();
-    while let Some((cur, d, path_conf)) = queue.pop_front() {
-        if d >= depth {
-            continue;
-        }
-        for &e in &g.in_edges[cur] {
-            let edge = &g.edges[e];
-            if !kinds.contains(&edge.kind) || edge.confidence < min || !seen.insert(edge.from) {
+
+    // One BFS per confidence level, surest first, following only edges (and seeds) at least
+    // that sure: a node gets the best confidence any path within `depth` gives it, and the
+    // shortest depth at that level. So the label does not depend on edge order.
+    let mut best: HashMap<usize, (u32, EdgeKind, Confidence)> = HashMap::new();
+    for level in Confidence::ALL.into_iter().filter(|&l| l >= min) {
+        let mut seen = seed_set.clone();
+        let mut queue: VecDeque<(usize, u32)> = seeds
+            .iter()
+            .filter(|&&(_, c)| c >= level)
+            .map(|&(s, _)| (s, 0))
+            .collect();
+        while let Some((cur, d)) = queue.pop_front() {
+            if d >= depth {
                 continue;
             }
-            let conf = path_conf.min(edge.confidence);
-            hits.push((edge.from, d + 1, edge.kind, conf));
-            queue.push_back((edge.from, d + 1, conf));
+            for &e in &g.in_edges[cur] {
+                let edge = &g.edges[e];
+                if !kinds.contains(&edge.kind) || edge.confidence < level || !seen.insert(edge.from)
+                {
+                    continue;
+                }
+                best.entry(edge.from).or_insert((d + 1, edge.kind, level));
+                queue.push_back((edge.from, d + 1));
+            }
         }
     }
+    let mut hits: Vec<(usize, u32, EdgeKind, Confidence)> = best
+        .into_iter()
+        .map(|(n, (d, k, c))| (n, d, k, c))
+        .collect();
+    hits.sort_by(|a, b| a.1.cmp(&b.1).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
 
     let mut by_file: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for &(n, d, k, conf) in hits.iter().take(limit) {
         let node = &g.nodes[n];
-        let guess = if conf.is_exact() {
-            String::new()
-        } else {
-            format!(", {}", conf.as_str())
-        };
+        let guess = conf.label().map(|l| format!(", {l}")).unwrap_or_default();
         let label = if node.kind == SymKind::File {
             format!("(file) via {} [depth {d}{guess}]", k.inverse_str())
         } else {
@@ -604,7 +623,10 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
         out["overridden_members"] = json!(
             overridden
                 .iter()
-                .map(|&m| &g.nodes[m].id)
+                .map(|&(m, conf)| match conf.label() {
+                    Some(l) => format!("{} ({l})", g.nodes[m].id),
+                    None => g.nodes[m].id.clone(),
+                })
                 .collect::<Vec<_>>()
         );
     }
@@ -620,8 +642,9 @@ pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence
 }
 
 /// Methods with the same name as method `m` in the supertypes of its type, nearest
-/// first, following `inherits` edges transitively.
-fn overridden_members(g: &Graph, m: usize) -> Vec<usize> {
+/// first, following `inherits` edges at least `min` sure transitively. Each comes with
+/// the confidence of the weakest link that reached it.
+fn overridden_members(g: &Graph, m: usize, min: Confidence) -> Vec<(usize, Confidence)> {
     let node = &g.nodes[m];
     if node.kind != SymKind::Method {
         return vec![];
@@ -631,24 +654,24 @@ fn overridden_members(g: &Graph, m: usize) -> Vec<usize> {
     };
     let mut found = Vec::new();
     let mut seen = HashSet::from([owner]);
-    let mut queue = VecDeque::from([owner]);
-    while let Some(t) = queue.pop_front() {
+    let mut queue = VecDeque::from([(owner, Confidence::Exact)]);
+    while let Some((t, conf)) = queue.pop_front() {
         for &e in &g.out_edges[t] {
             let edge = &g.edges[e];
-            if edge.kind != EdgeKind::Inherits || !seen.insert(edge.to) {
+            if edge.kind != EdgeKind::Inherits || edge.confidence < min || !seen.insert(edge.to) {
                 continue;
             }
             let base = edge.to;
+            let conf = conf.min(edge.confidence);
             found.extend(
                 g.out_edges[base]
                     .iter()
                     .filter(|&&c| g.edges[c].kind == EdgeKind::Contains)
                     .map(|&c| g.edges[c].to)
-                    .filter(|&c| {
-                        g.nodes[c].kind == SymKind::Method && g.nodes[c].name == node.name
-                    }),
+                    .filter(|&c| g.nodes[c].kind == SymKind::Method && g.nodes[c].name == node.name)
+                    .map(|c| (c, conf)),
             );
-            queue.push_back(base);
+            queue.push_back((base, conf));
         }
     }
     found
@@ -834,7 +857,7 @@ pub fn audit_edges(
     let in_scope = |e: &crate::graph::Edge| {
         e.kind != EdgeKind::Contains
             && edge_allowed(kinds, e.kind)
-            && path.is_none_or(|p| g.nodes[e.from].file.starts_with(p))
+            && path.is_none_or(|p| in_path(&g.nodes[e.from].file, p))
     };
     let mut totals: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
     let mut matching: Vec<&crate::graph::Edge> = Vec::new();
@@ -877,6 +900,12 @@ pub fn audit_edges(
         "truncated": matching.len() > limit,
         "by_file": by_file,
     })
+}
+
+/// `file` is `path` or inside directory `path` (component-wise, so `src` excludes `src2/`).
+fn in_path(file: &str, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path.is_empty() || file == path || file.strip_prefix(path).is_some_and(|r| r.starts_with('/'))
 }
 
 fn community_ref(g: &Graph, c: u32) -> Value {
@@ -1012,4 +1041,157 @@ pub fn community(g: &Graph, c: u32, from: Option<usize>, limit: usize) -> Value 
     v["depends_on"] = json!(links(depends_on));
     v["used_by"] = json!(links(used_by));
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{Edge, Node};
+
+    /// A graph from (name, kind, parent) nodes and (from, kind, to, confidence) edges;
+    /// every node lives in `m.rs` and its id is its name.
+    fn graph(
+        nodes: &[(&str, SymKind, Option<usize>)],
+        edges: &[(usize, EdgeKind, usize, Confidence)],
+    ) -> Graph {
+        let mut g = Graph::new(Path::new("/repo"));
+        for &(name, kind, parent) in nodes {
+            g.nodes.push(Node {
+                id: name.into(),
+                kind,
+                name: name.rsplit("::").next().unwrap().into(),
+                file: "m.rs".into(),
+                lang: None,
+                line: 1,
+                end_line: 1,
+                signature: String::new(),
+                doc: None,
+                parent,
+                community: None,
+            });
+        }
+        for &(from, kind, to, confidence) in edges {
+            g.edges.push(Edge {
+                from,
+                to,
+                kind,
+                count: 1,
+                confidence,
+                line: 1,
+            });
+        }
+        g.build_indexes();
+        g
+    }
+
+    fn labels(v: &Value) -> String {
+        v["by_file"]["m.rs"].to_string()
+    }
+
+    #[test]
+    fn impact_reports_the_surest_path_whatever_the_edge_order() {
+        use Confidence::*;
+        use EdgeKind::Calls;
+        // caller -> target is a guess, but caller -> helper -> target is sure. The guessed
+        // edge comes first in target's incoming edges.
+        let g = graph(
+            &[
+                ("target", SymKind::Function, None),
+                ("caller", SymKind::Function, None),
+                ("helper", SymKind::Function, None),
+            ],
+            &[
+                (1, Calls, 0, Ambiguous),
+                (2, Calls, 0, Exact),
+                (1, Calls, 2, Exact),
+            ],
+        );
+        let v = impact(&g, 0, 3, 100, Ambiguous);
+        let l = labels(&v);
+        assert!(
+            l.contains("caller (function) via called_by [depth 2]"),
+            "{v:#}"
+        );
+        assert!(
+            l.contains("helper (function) via called_by [depth 1]"),
+            "{v:#}"
+        );
+        // Without the sure path, the guess is reported as such.
+        let g = graph(
+            &[
+                ("target", SymKind::Function, None),
+                ("caller", SymKind::Function, None),
+            ],
+            &[(1, Calls, 0, Ambiguous)],
+        );
+        let l = labels(&impact(&g, 0, 3, 100, Ambiguous));
+        assert!(
+            l.contains("caller (function) via called_by [depth 1, ambiguous]"),
+            "{l}"
+        );
+    }
+
+    #[test]
+    fn min_confidence_also_limits_override_seeds() {
+        use Confidence::*;
+        use EdgeKind::*;
+        // Impl::run overrides Base::run through an inferred `inherits`; user calls Base::run.
+        let g = graph(
+            &[
+                ("Base", SymKind::Interface, None),
+                ("Base::run", SymKind::Method, Some(0)),
+                ("Impl", SymKind::Class, None),
+                ("Impl::run", SymKind::Method, Some(2)),
+                ("user", SymKind::Function, None),
+            ],
+            &[
+                (0, Contains, 1, Exact),
+                (2, Contains, 3, Exact),
+                (2, Inherits, 0, Inferred),
+                (4, Calls, 1, Exact),
+            ],
+        );
+        let v = impact(&g, 3, 3, 100, Ambiguous);
+        assert_eq!(
+            v["overridden_members"],
+            json!(["Base::run (inferred)"]),
+            "{v:#}"
+        );
+        assert!(
+            labels(&v).contains("user (function) via called_by [depth 1, inferred]"),
+            "{v:#}"
+        );
+
+        let v = impact(&g, 3, 3, 100, Exact);
+        assert!(v.get("overridden_members").is_none(), "{v:#}");
+        assert_eq!(v["affected_symbols"], 0, "{v:#}");
+    }
+
+    #[test]
+    fn find_paths_labels_guessed_edges() {
+        use Confidence::*;
+        let g = graph(
+            &[
+                ("a", SymKind::Function, None),
+                ("b", SymKind::Function, None),
+            ],
+            &[(0, EdgeKind::Calls, 1, Inferred)],
+        );
+        let filter = EdgeFilter {
+            kinds: &[],
+            min: Ambiguous,
+        };
+        let v = find_paths(&g, 0, 1, filter, true, 3, 1);
+        assert_eq!(v["paths"], json!(["a --calls (inferred)--> b"]));
+    }
+
+    #[test]
+    fn in_path_matches_whole_components() {
+        assert!(in_path("src/a.rs", "src"));
+        assert!(in_path("src/a.rs", "src/"));
+        assert!(in_path("src/a.rs", "src/a.rs"));
+        assert!(in_path("src/a.rs", ""));
+        assert!(!in_path("src2/a.rs", "src"));
+        assert!(!in_path("src/abc.rs", "src/a"));
+    }
 }

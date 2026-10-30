@@ -650,6 +650,60 @@ fn audit_edges_lists_guesses() {
     assert_eq!(v["truncated"], true);
 }
 
+#[test]
+fn owner_and_overload_confidence() {
+    let repo = TempRepo::new(
+        "confowner",
+        &[
+            ("src/a.rs", "pub struct Foo;\n".into()),
+            ("src/b.rs", "pub struct Foo;\n".into()),
+            // `impl Foo` with two candidate owners in the directory: a guess.
+            ("src/c.rs", "impl Foo {\n    pub fn m(&self) {}\n}\n".into()),
+            // Two same-named members of the current type: the owner is certain.
+            (
+                "src/d.rs",
+                "pub struct T;\nimpl T {\n    fn f(&self) {}\n    fn show(&self) { self.f(); }\n}\n\
+                 impl Other for T {\n    fn f(&self) {}\n}\n"
+                    .into(),
+            ),
+        ],
+    );
+    let symbol = |id: &str| -> Value {
+        let (ok, text) = tool_text_in(
+            &repo.0,
+            "get_symbol",
+            json!({ "id": id, "include_code": false, "format": "json" }),
+        );
+        assert!(ok, "{text}");
+        serde_json::from_str(&text).unwrap()
+    };
+    let foo = symbol("src/a.rs::Foo");
+    assert_eq!(
+        foo["outgoing"]["contains"],
+        json!([{ "id": "src/c.rs::Foo::m", "confidence": "ambiguous" }]),
+        "{foo:#}"
+    );
+    let show = symbol("src/d.rs::T::show");
+    let calls = show["outgoing"]["calls"].to_string();
+    assert!(
+        calls.contains("src/d.rs::T::f") && !calls.contains("confidence"),
+        "{show:#}"
+    );
+
+    // audit_edges paths are whole components.
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "audit_edges",
+        json!({ "confidence": "exact", "path": "src/a", "format": "json" }),
+    );
+    assert!(ok, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["matching_edges"],
+        0,
+        "{text}"
+    );
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
