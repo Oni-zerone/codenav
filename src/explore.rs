@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use anyhow::{Result, bail};
 
+use crate::embeddings::Embeddings;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
 use crate::output;
 use crate::query::{self, Direction};
@@ -92,6 +93,8 @@ pub struct Options<'a> {
     /// Only edges at least this sure are followed and drawn.
     pub min_confidence: Confidence,
     pub token_budget: usize,
+    /// Static word embeddings: question words also match synonyms in names and docs.
+    pub embeddings: Option<&'a Embeddings>,
 }
 
 impl Options<'_> {
@@ -105,7 +108,7 @@ impl Options<'_> {
 
 pub fn explore(g: &Graph, question: &str, seeds: &[String], opts: &Options) -> Result<String> {
     let terms = query_terms(question);
-    let scores = score_nodes(g, &symbol_terms(&terms));
+    let scores = score_nodes(g, &symbol_terms(&terms), opts.embeddings);
 
     let seeds: Vec<&str> = seeds
         .iter()
@@ -242,7 +245,24 @@ struct Scores {
     strong_terms: Vec<Vec<usize>>,
 }
 
-fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
+/// Weight of a synonym found through embeddings in a name (it can seed) or a doc.
+const SYNONYM_IN_NAME: f64 = NAME_MATCH;
+const SYNONYM_IN_DOC: f64 = DOC_WORD;
+
+fn score_nodes(g: &Graph, terms: &[String], embeddings: Option<&Embeddings>) -> Scores {
+    // Similarity of each term to each word seen, computed once per pair.
+    let mut synonyms: Vec<HashMap<String, bool>> = vec![HashMap::new(); terms.len()];
+    let mut is_synonym = |t: usize, word: &str| -> bool {
+        let Some(e) = embeddings else { return false };
+        if let Some(&known) = synonyms[t].get(word) {
+            return known;
+        }
+        let yes = word != terms[t]
+            && e.similarity(&terms[t], word)
+                .is_some_and(|s| s >= crate::embeddings::SYNONYM);
+        synonyms[t].insert(word.to_string(), yes);
+        yes
+    };
     let n = g.nodes.len();
     let mut total = vec![0.0; n];
     let mut name_match = vec![false; n];
@@ -268,7 +288,12 @@ fn score_nodes(g: &Graph, terms: &[String]) -> Scores {
             .filter(|w| w.chars().count() >= 2)
             .collect();
         for (t, term) in terms.iter().enumerate() {
-            let w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            let mut w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            if w < SYNONYM_IN_NAME && tokens.iter().any(|tok| is_synonym(t, tok)) {
+                w = SYNONYM_IN_NAME;
+            } else if w < SYNONYM_IN_DOC && doc_words.iter().any(|dw| is_synonym(t, dw)) {
+                w = SYNONYM_IN_DOC;
+            }
             per_term[t][i] = w;
             if w >= DOC_WORD {
                 strong_terms[i].push(t);
@@ -633,6 +658,9 @@ fn render(
     if !opts.kinds.is_empty() {
         let kinds: Vec<&str> = opts.kinds.iter().map(|k| k.as_str()).collect();
         header.push_str(&format!(" | edges: {}", kinds.join(",")));
+    }
+    if opts.embeddings.is_some() {
+        header.push_str(" | synonyms: on");
     }
     if opts.min_confidence != Confidence::Ambiguous {
         header.push_str(&format!(

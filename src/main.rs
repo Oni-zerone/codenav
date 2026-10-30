@@ -1,6 +1,7 @@
 mod communities;
 mod cycles;
 mod diff_impact;
+mod embeddings;
 mod explore;
 mod extract;
 mod graph;
@@ -61,6 +62,10 @@ enum Command {
         no_refresh: bool,
         #[command(flatten)]
         opts: IndexArgs,
+        /// Static word embeddings (word2vec/fastText/GloVe text format) to let explore
+        /// match synonyms of the question's words in names and docs.
+        #[arg(long, value_name = "FILE")]
+        embeddings: Option<PathBuf>,
     },
     /// Call one MCP tool from the command line and print its JSON result.
     Tool {
@@ -75,6 +80,9 @@ enum Command {
         /// Same as the positional PATH (kept for compatibility).
         #[arg(long = "path", value_name = "PATH", id = "path_flag")]
         path_flag: Option<PathBuf>,
+        /// Static word embeddings for explore (as for `serve`).
+        #[arg(long, value_name = "FILE")]
+        embeddings: Option<PathBuf>,
     },
     /// Print the tree-sitter syntax tree of a file (useful to write extraction queries).
     Ast { file: PathBuf },
@@ -132,7 +140,9 @@ fn main() -> Result<()> {
             fresh,
             no_refresh,
             opts,
+            embeddings,
         } => {
+            let embeddings = load_embeddings(embeddings.as_deref())?;
             let roots: Vec<PathBuf> = paths
                 .iter()
                 .map(|p| canonical_root(p))
@@ -149,6 +159,7 @@ fn main() -> Result<()> {
             }
             server.allow_any_project(any_project);
             server.set_max_loaded(usize::from(max_loaded));
+            server.set_embeddings(embeddings);
             server.run()?;
         }
         Command::Tool {
@@ -156,7 +167,9 @@ fn main() -> Result<()> {
             args,
             path,
             path_flag,
+            embeddings,
         } => {
+            let embeddings = load_embeddings(embeddings.as_deref())?;
             let (args, path) = tool_args_and_path(args, path.or(path_flag));
             // Validate before indexing: a wrong argument must not index anything.
             let args: serde_json::Value = serde_json::from_str(&args)
@@ -166,6 +179,7 @@ fn main() -> Result<()> {
             let root = canonical_root(&path)?;
             let (graph, opts) = indexer::load_or_index(&root, false, None)?;
             let mut server = mcp::Server::new(root, graph, false, opts);
+            server.set_embeddings(embeddings);
             let result = server.call_tool(&name, &args)?;
             println!("{result}");
         }
@@ -193,6 +207,17 @@ fn tool_args_and_path(args: Option<String>, path: Option<PathBuf>) -> (String, P
             p.unwrap_or_else(|| PathBuf::from(".")),
         ),
     }
+}
+
+fn load_embeddings(path: Option<&Path>) -> Result<Option<embeddings::Embeddings>> {
+    let Some(path) = path else { return Ok(None) };
+    let e = embeddings::Embeddings::load(path)?;
+    eprintln!(
+        "codenav: {} word vectors ({} dims) for synonyms",
+        e.len(),
+        e.dim()
+    );
+    Ok(Some(e))
 }
 
 fn canonical_root(path: &Path) -> Result<PathBuf> {
