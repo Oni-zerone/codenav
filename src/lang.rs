@@ -160,10 +160,28 @@ const JS_COMMON_QUERY: &str = r#"
 (program (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant))
 (program (export_statement declaration: (lexical_declaration kind: "const" (variable_declarator name: (identifier) @name) @def.constant)))
 
-; Exports: any export statement makes the file an ES module; named/default exports.
+; Module kind: ES exports / imports, CommonJS exports. Files with none are scripts.
 (export_statement) @export
-(export_statement (export_clause (export_specifier name: (identifier) @export.name)))
+(import_statement) @esm
+((assignment_expression left: (member_expression object: (identifier) @_m property: (property_identifier) @_e))
+  (#eq? @_m "module") (#eq? @_e "exports")) @commonjs
+((assignment_expression left: (member_expression object: (identifier) @_x)) (#eq? @_x "exports")) @commonjs
+
+; Local names exported by `export { a, b }` / `export default a` (not `export { a } from`).
+(export_statement !source (export_clause (export_specifier name: (identifier) @export.name)))
 (export_statement value: (identifier) @export.name)
+
+; Names bound by imports, with their source (to recognise imports we cannot resolve).
+(import_statement (import_clause (named_imports (import_specifier !alias name: (identifier) @import.binding))) source: (string (string_fragment) @import.from))
+(import_statement (import_clause (identifier) @import.binding) source: (string (string_fragment) @import.from))
+
+; Local bindings (parameters, local variables, catch/loop variables): they shadow
+; top-level constants inside their function.
+(formal_parameters) @binding.pattern
+(arrow_function parameter: (identifier) @binding.pattern)
+(variable_declarator name: (_) @binding.pattern)
+(catch_clause parameter: (_) @binding.pattern)
+(for_in_statement left: (identifier) @binding.pattern)
 
 ; Values that may name a top-level constant.
 (identifier) @valueref
@@ -205,8 +223,8 @@ const TS_QUERY: &str = r#"
 const JSX_QUERY: &str = r#"
 ((jsx_opening_element name: (identifier) @name) @call (#match? @name "^[A-Z]"))
 ((jsx_self_closing_element name: (identifier) @name) @call (#match? @name "^[A-Z]"))
-(jsx_opening_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call
-(jsx_self_closing_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call
+((jsx_opening_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call (#match? @name "^[A-Z]"))
+((jsx_self_closing_element name: (member_expression object: (_) @qualifier property: (property_identifier) @name)) @call (#match? @name "^[A-Z]"))
 "#;
 
 const GO_QUERY: &str = r#"

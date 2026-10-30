@@ -867,6 +867,140 @@ fn js_top_level_constants_are_indexed_and_referenced() {
     );
 }
 
+#[test]
+fn js_locals_shadow_constants_and_imports_are_not_uses() {
+    let repo = TempRepo::new(
+        "jsshadow",
+        &[
+            (
+                "a.ts",
+                "export const config = { x: 1 };\n\
+                 export function param(config: any) { return config.x; }\n\
+                 export function destructured({ config }: any, [cfg] = []) { return config; }\n\
+                 export const arrow = (config: any) => config;\n\
+                 export function local() { const config = 2; try {} catch (config) {} return config; }\n\
+                 export function loop(xs: any[]) { for (const config of xs) { config; } }\n\
+                 export function real() { return config.x; }\n"
+                    .into(),
+            ),
+            (
+                "b.ts",
+                "import { config } from './a';\nexport function other(config: any) { return config; }\n\
+                 export function uses() { return config; }\n"
+                    .into(),
+            ),
+        ],
+    );
+    for id in [
+        "a.ts::param",
+        "a.ts::destructured",
+        "a.ts::arrow",
+        "a.ts::local",
+        "a.ts::loop",
+        "b.ts::other",
+        "b.ts",
+    ] {
+        let v = symbol_in(&repo, id);
+        assert!(
+            v["outgoing"].get("references").is_none(),
+            "{id} does not use the constant: {v:#}"
+        );
+    }
+    for id in ["a.ts::real", "b.ts::uses"] {
+        let v = symbol_in(&repo, id);
+        assert_eq!(
+            v["outgoing"]["references"],
+            json!(["a.ts::config"]),
+            "{id}: {v:#}"
+        );
+    }
+}
+
+#[test]
+fn js_module_edge_cases() {
+    let repo = TempRepo::new(
+        "jsedges",
+        &[
+            // Workspace package import the resolver cannot map to a file: still linked.
+            ("packages/utils/index.ts", "export function helper() {}\n".into()),
+            ("packages/app/x.ts", "import { helper } from '@acme/utils';\nexport function run() { helper(); }\n".into()),
+            // `<motion.div>` is an intrinsic element, not a call to a `div` method.
+            ("ui/anim.ts", "export class Motion { div() {} }\n".into()),
+            ("ui/view.tsx", "import { Motion } from './anim';\nexport function View() { return <motion.div />; }\n".into()),
+            // A private helper sharing a re-exported name stays private.
+            ("lib/other.ts", "export function x() {}\n".into()),
+            ("lib/barrel.ts", "function x() {}\nexport { x } from './other';\nexport function y() { x(); }\n".into()),
+            ("lib/user.ts", "import { y } from './barrel';\nexport function z() { x(); y(); }\n".into()),
+            // Scripts: a dynamic import keeps a file a script; CommonJS exports make a module.
+            ("web/globals.js", "function legacyGlobal() {}\nfunction lazy() { return import('./chart.js'); }\n".into()),
+            ("web/util.js", "function cjsOnly() {}\nmodule.exports = { cjsOnly };\n".into()),
+            ("web/page.js", "legacyGlobal();\ncjsOnly();\n".into()),
+            // Members of a namespaced class or an unexported class, through an instance.
+            (
+                "api/client.ts",
+                "export namespace Api { export class Client { fetchAll() {} } }\nclass Hidden { secret() {} }\n\
+                 export function make(): any { return new Hidden(); }\n"
+                    .into(),
+            ),
+            ("api/use.ts", "export function go(c: any) { c.fetchAll(); c.secret(); }\n".into()),
+        ],
+    );
+    let run = symbol_in(&repo, "packages/app/x.ts::run");
+    assert!(
+        run["outgoing"]["calls"]
+            .to_string()
+            .contains("packages/utils/index.ts::helper"),
+        "{run:#}"
+    );
+
+    let view = symbol_in(&repo, "ui/view.tsx::View");
+    assert!(view["outgoing"].get("calls").is_none(), "{view:#}");
+
+    let z = symbol_in(&repo, "lib/user.ts::z");
+    let calls = z["outgoing"]["calls"].to_string();
+    assert!(
+        calls.contains("lib/barrel.ts::y") && !calls.contains("lib/barrel.ts::x"),
+        "{z:#}"
+    );
+
+    let page = symbol_in(&repo, "web/page.js");
+    let calls = page["outgoing"]["calls"].to_string();
+    assert!(calls.contains("web/globals.js::legacyGlobal"), "{page:#}");
+    assert!(
+        !calls.contains("cjsOnly"),
+        "CommonJS needs require: {page:#}"
+    );
+
+    let go = symbol_in(&repo, "api/use.ts::go");
+    let calls = go["outgoing"]["calls"].to_string();
+    assert!(
+        calls.contains("api/client.ts::Api::Client::fetchAll"),
+        "{go:#}"
+    );
+    assert!(calls.contains("api/client.ts::Hidden::secret"), "{go:#}");
+}
+
+#[test]
+fn indexes_from_an_older_analysis_are_rebuilt() {
+    let repo = TempRepo::new("analysis", &[("a.py", "def f():\n    pass\n".into())]);
+    let out = codenav().arg("index").arg(&repo.0).output().unwrap();
+    assert!(out.status.success());
+    let path = repo.0.join(".codenav/graph.cnav");
+    let mut g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(g["analysis"].as_u64().unwrap() >= 1, "{}", g["analysis"]);
+    g.as_object_mut().unwrap().remove("analysis");
+    std::fs::write(&path, g.to_string()).unwrap();
+
+    let out = codenav()
+        .args(["tool", "graph_overview"])
+        .arg("--path")
+        .arg(&repo.0)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && log.contains("stale"), "{log}");
+}
+
 /// Several occurrences of one relation: a single sure one makes the edge sure.
 #[test]
 fn merged_edges_keep_the_best_confidence() {
