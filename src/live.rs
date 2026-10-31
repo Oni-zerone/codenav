@@ -53,8 +53,8 @@ struct Signal {
 }
 
 impl Live {
-    /// `watch`: keep the graph up to date with a background worker (it first parses
-    /// every file into the cache, once the project is active).
+    /// `watch`: keep the graph up to date with a background worker (once the project is
+    /// active it checks the graph, then parses every file into the cache if needed).
     pub fn new(root: PathBuf, graph: Graph, index_options: IndexOptions, watch: bool) -> Live {
         let shared = Arc::new(Shared {
             root,
@@ -138,11 +138,16 @@ impl Shared {
         loop {
             if self.active.load(Ordering::Relaxed) {
                 let run = catch_unwind(AssertUnwindSafe(|| {
+                    let result = self.update();
                     if !filled {
-                        lock_facts(&self.facts).fill(&self.root);
+                        // Unless a re-index just did it.
+                        let mut facts = lock_facts(&self.facts);
+                        if facts.is_empty() {
+                            facts.fill(&self.root);
+                        }
                         filled = true;
                     }
-                    self.update()
+                    result
                 }));
                 match run {
                     Ok(Ok((_, scan))) => {

@@ -1,5 +1,6 @@
 //! The code graph: nodes (files and symbols), typed edges, persistence and lookup indexes.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,62 @@ pub const INDEX_DIR: &str = ".codenav";
 const GRAPH_FILE: &str = "graph.cnav";
 /// Name used before the switch to `.cnav`; removed on save so stale copies don't linger.
 const LEGACY_GRAPH_FILE: &str = "graph.json";
+/// Binary copy of `graph.cnav`, saved next to it and read first: it loads several times
+/// faster. `graph.cnav` stays JSON for other readers (the VS Code extension). The copy
+/// records the size and modification time of the JSON file it was made with, and is
+/// used only while that file is still the one in place.
+const BINARY_FILE: &str = "graph.bin";
+const BINARY_MAGIC: &[u8; 8] = b"CNAVBIN\0";
+/// Changes with the sources of the serialized types and the dependency versions (the
+/// encoding), so a binary copy written by another build is never misread: the JSON is
+/// read instead, and the copy rewritten.
+const BINARY_LAYOUT: u64 = {
+    let sources: [&str; 5] = [
+        include_str!("graph.rs"),
+        include_str!("communities.rs"),
+        include_str!("lang.rs"),
+        include_str!("packages.rs"),
+        include_str!("../Cargo.lock"),
+    ];
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut s = 0;
+    while s < sources.len() {
+        let bytes = sources[s].as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            hash = (hash ^ bytes[i] as u64).wrapping_mul(0x0100_0000_01b3);
+            i += 1;
+        }
+        s += 1;
+    }
+    hash
+};
+
+thread_local! {
+    /// Set while writing the binary copy: its format has no field names, so every field
+    /// is written (`skip_serializing_if` would shift the following ones).
+    static WRITING_BINARY: Cell<bool> = const { Cell::new(false) };
+}
+
+fn writing_binary() -> bool {
+    WRITING_BINARY.with(Cell::get)
+}
+
+fn omit_none<T>(v: &Option<T>) -> bool {
+    v.is_none() && !writing_binary()
+}
+
+fn omit_empty_string(v: &str) -> bool {
+    v.is_empty() && !writing_binary()
+}
+
+fn omit_empty_vec<T>(v: &[T]) -> bool {
+    v.is_empty() && !writing_binary()
+}
+
+fn omit_exact(c: &Confidence) -> bool {
+    c.is_exact() && !writing_binary()
+}
 /// v2: communities (`Node::community`, `Graph::communities`).
 /// v3: `Edge::confidence` replaces the `ambiguous` flag.
 const FORMAT_VERSION: u32 = 3;
@@ -221,18 +278,18 @@ pub struct Node {
     pub name: String,
     /// Repo-relative path ("" for external packages).
     pub file: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub lang: Option<Lang>,
     pub line: u32,
     pub end_line: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "omit_empty_string")]
     pub signature: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub doc: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub parent: Option<usize>,
     /// Index in `Graph::communities`; none for external packages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub community: Option<u32>,
 }
 
@@ -244,13 +301,13 @@ pub struct Edge {
     /// Number of occurrences (e.g. call sites) merged into this edge.
     pub count: u32,
     /// How sure the resolver is about the target (omitted when exact).
-    #[serde(default, skip_serializing_if = "Confidence::is_exact")]
+    #[serde(default, skip_serializing_if = "omit_exact")]
     pub confidence: Confidence,
     /// First line in the source file where the relation occurs.
     pub line: u32,
     /// Every line where it occurs, ascending (dependency edges; empty in older indexes
     /// and for containment).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "omit_empty_vec")]
     pub lines: Vec<u32>,
 }
 
@@ -311,19 +368,19 @@ pub struct Graph {
     pub communities: Vec<Community>,
     /// Git HEAD commit and branch (None: detached) when the graph was built; absent
     /// outside a Git repository.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub git_commit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub git_branch: Option<String>,
     /// Tracked files had uncommitted changes when the graph was built (absent when
     /// unknown: no Git repository or no `git` command).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "omit_none")]
     pub git_dirty: Option<bool>,
     /// `ANALYSIS_VERSION` of the indexer that built the graph (0: before it existed).
     #[serde(default)]
     pub analysis: u32,
     /// Packages the repository declares (npm workspaces, crates).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "omit_empty_vec")]
     pub packages: Vec<crate::packages::PackageRef>,
     /// Package manifests found when indexing (a new or removed one makes it stale).
     #[serde(default)]
@@ -349,6 +406,32 @@ pub fn dir_of(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
+/// Writes through a temporary file, so readers never see a partial file. Returns the
+/// file's stamp (taken before the rename, so it is this content's).
+fn write_atomically(path: &Path, data: &[u8]) -> Result<Option<[u8; 20]>> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    fs::write(&tmp, data)?;
+    let stamp = file_stamp(Path::new(&tmp));
+    fs::rename(&tmp, path)?;
+    Ok(stamp)
+}
+
+/// Size and modification time (to the nanosecond) of a file.
+fn file_stamp(path: &Path) -> Option<[u8; 20]> {
+    let meta = fs::metadata(path).ok()?;
+    let since = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut stamp = [0; 20];
+    stamp[..8].copy_from_slice(&meta.len().to_le_bytes());
+    stamp[8..16].copy_from_slice(&since.as_secs().to_le_bytes());
+    stamp[16..].copy_from_slice(&since.subsec_nanos().to_le_bytes());
+    Some(stamp)
+}
+
 fn default_hub_percentile() -> f64 {
     crate::communities::DEFAULT_HUB_PERCENTILE
 }
@@ -362,6 +445,9 @@ impl Graph {
             #[serde(default = "default_hub_percentile")]
             hub_percentile: f64,
         }
+        if let Some(g) = Self::load_binary(root) {
+            return Some(g.hub_percentile);
+        }
         let data = fs::read(Self::index_path(root)).ok()?;
         let h: Header = serde_json::from_slice(&data).ok()?;
         (h.version == FORMAT_VERSION).then_some(h.hub_percentile)
@@ -374,6 +460,9 @@ impl Graph {
             version: u32,
             #[serde(default)]
             packages: Vec<crate::packages::PackageRef>,
+        }
+        if let Some(g) = Self::load_binary(root) {
+            return g.packages;
         }
         fs::read(Self::index_path(root))
             .ok()
@@ -410,22 +499,78 @@ impl Graph {
             fs::write(&ignore, "*\n")?;
         }
         let path = Self::index_path(root);
-        let tmp = path.with_extension("cnav.tmp");
-        fs::write(&tmp, serde_json::to_vec(self)?)?;
-        fs::rename(&tmp, &path)?;
+        let stamp = write_atomically(&path, &serde_json::to_vec(self)?)?;
+        // Only an optimization: the JSON is the index.
+        if let Some(stamp) = stamp
+            && let Err(e) = self.save_binary(root, stamp)
+        {
+            eprintln!("codenav: could not save the binary index: {e:#}");
+        }
         let _ = fs::remove_file(dir.join(LEGACY_GRAPH_FILE));
         Ok(path)
     }
 
+    fn binary_path(root: &Path) -> PathBuf {
+        root.join(INDEX_DIR).join(BINARY_FILE)
+    }
+
+    /// `json`: the stamp of the JSON file this graph was written to or read from.
+    fn save_binary(&self, root: &Path, json: [u8; 20]) -> Result<()> {
+        struct Writing;
+        impl Drop for Writing {
+            fn drop(&mut self) {
+                WRITING_BINARY.with(|w| w.set(false));
+            }
+        }
+        WRITING_BINARY.with(|w| w.set(true));
+        let writing = Writing;
+        let mut data = BINARY_MAGIC.to_vec();
+        data.extend(BINARY_LAYOUT.to_le_bytes());
+        data.extend(json);
+        bincode::serialize_into(&mut data, self)?;
+        drop(writing);
+        write_atomically(&Self::binary_path(root), &data)?;
+        Ok(())
+    }
+
+    /// The binary copy, if it was made from the JSON file in place, by this build.
+    fn load_binary(root: &Path) -> Option<Graph> {
+        let json = file_stamp(&Self::index_path(root))?;
+        let data = fs::read(Self::binary_path(root)).ok()?;
+        let body = data
+            .strip_prefix(BINARY_MAGIC.as_slice())?
+            .strip_prefix(BINARY_LAYOUT.to_le_bytes().as_slice())?
+            .strip_prefix(json.as_slice())?;
+        bincode::deserialize::<Graph>(body)
+            .ok()
+            .filter(|g| g.version == FORMAT_VERSION)
+    }
+
     pub fn load(root: &Path) -> Result<Graph> {
-        let path = Self::index_path(root);
-        let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let mut g: Graph = serde_json::from_slice(&data)?;
-        anyhow::ensure!(
-            g.version == FORMAT_VERSION,
-            "index format v{} is outdated, re-run `codenav index`",
-            g.version
-        );
+        let mut g = match Self::load_binary(root) {
+            Some(g) => g,
+            None => {
+                let path = Self::index_path(root);
+                // Before reading: if the file is replaced meanwhile, the stamp is the old
+                // one's and the binary copy made below is not used.
+                let stamp = file_stamp(&path);
+                let data =
+                    fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                let g: Graph = serde_json::from_slice(&data)?;
+                anyhow::ensure!(
+                    g.version == FORMAT_VERSION,
+                    "index format v{} is outdated, re-run `codenav index`",
+                    g.version
+                );
+                // Next time, load the binary copy.
+                if let Some(stamp) = stamp
+                    && let Err(e) = g.save_binary(root, stamp)
+                {
+                    eprintln!("codenav: could not save the binary index: {e:#}");
+                }
+                g
+            }
+        };
         g.build_indexes();
         Ok(g)
     }
@@ -441,6 +586,8 @@ impl Graph {
         self.by_id.clear();
         self.by_name.clear();
         self.by_file.clear();
+        self.by_id.reserve(n);
+        self.by_name.reserve(n);
         for (i, node) in self.nodes.iter().enumerate() {
             self.by_id.insert(node.id.clone(), i);
             self.by_name
@@ -491,5 +638,130 @@ mod tests {
         assert!(!root.join(".codenav/graph.cnav.tmp").exists());
         assert_eq!(Graph::load(&root).unwrap().version, FORMAT_VERSION);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A graph with every optional field both set and unset.
+    fn sample(root: &Path) -> Graph {
+        let mut g = Graph::new(root);
+        let node = |name: &str, parent: Option<usize>| Node {
+            id: format!("a.py::{name}"),
+            kind: SymKind::Function,
+            name: name.into(),
+            file: "a.py".into(),
+            lang: parent.map(|_| Lang::Python),
+            line: 1,
+            end_line: 2,
+            signature: if parent.is_some() {
+                "def f()".into()
+            } else {
+                String::new()
+            },
+            doc: parent.map(|_| "Docs.".into()),
+            parent,
+            community: parent.map(|_| 0),
+        };
+        g.nodes = vec![node("f", None), node("g", Some(0))];
+        let edge = |confidence, lines: Vec<u32>| Edge {
+            from: 1,
+            to: 0,
+            kind: EdgeKind::Calls,
+            count: 1,
+            confidence,
+            line: 1,
+            lines,
+        };
+        g.edges = vec![
+            edge(Confidence::Exact, vec![]),
+            edge(Confidence::Ambiguous, vec![1, 3]),
+        ];
+        g.git_commit = Some("abc".into());
+        g.git_dirty = Some(false);
+        g
+    }
+
+    fn json(g: &Graph) -> serde_json::Value {
+        serde_json::to_value(g).unwrap()
+    }
+
+    #[test]
+    fn the_binary_copy_round_trips_and_is_read_first() {
+        let root = std::env::temp_dir().join(format!("codenav-unit-bin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let g = sample(&root);
+        g.save(&root).unwrap();
+        assert!(Graph::binary_path(&root).exists());
+        let binary = Graph::load_binary(&root).expect("binary copy");
+        assert_eq!(json(&binary), json(&g));
+        // The JSON keeps omitting empty fields (for other readers).
+        let text = fs::read_to_string(Graph::index_path(&root)).unwrap();
+        assert!(!text.contains("\"doc\":null") && !text.contains("\"lines\":[]"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_json_only_index_loads_and_gets_its_binary_copy() {
+        let root = std::env::temp_dir().join(format!("codenav-unit-mig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(INDEX_DIR)).unwrap();
+        let g = sample(&root);
+        // As written by an older codenav, or with a binary copy older than the JSON.
+        fs::write(Graph::index_path(&root), serde_json::to_vec(&g).unwrap()).unwrap();
+        assert!(Graph::load_binary(&root).is_none());
+        let loaded = Graph::load(&root).unwrap();
+        assert_eq!(json(&loaded), json(&g));
+        assert_eq!(loaded.by_id.len(), 2);
+        assert_eq!(
+            json(&Graph::load_binary(&root).expect("migrated")),
+            json(&g)
+        );
+        // A binary copy from another build is ignored.
+        let mut data = fs::read(Graph::binary_path(&root)).unwrap();
+        data[8] ^= 1;
+        fs::write(Graph::binary_path(&root), data).unwrap();
+        assert!(Graph::load_binary(&root).is_none());
+        assert_eq!(json(&Graph::load(&root).unwrap()), json(&g));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_binary_copy_of_a_replaced_json_is_ignored() {
+        let root = std::env::temp_dir().join(format!("codenav-unit-rep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut g = sample(&root);
+        g.save(&root).unwrap();
+        // Another writer (e.g. an older codenav) replaces only the JSON, even in the same
+        // second and with the binary copy newer on disk.
+        let binary = fs::read(Graph::binary_path(&root)).unwrap();
+        g.git_commit = Some("def".into());
+        fs::write(Graph::index_path(&root), serde_json::to_vec(&g).unwrap()).unwrap();
+        fs::write(Graph::binary_path(&root), binary).unwrap();
+        assert!(Graph::load_binary(&root).is_none());
+        assert_eq!(
+            Graph::load(&root).unwrap().git_commit.as_deref(),
+            Some("def")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The binary copy has no field names: a field left out would shift the next ones.
+    /// Every `skip_serializing_if` of a serialized type must use an `omit_` helper.
+    #[test]
+    fn serialized_types_skip_fields_only_through_omit_helpers() {
+        for source in [
+            include_str!("graph.rs"),
+            include_str!("communities.rs"),
+            include_str!("lang.rs"),
+            include_str!("packages.rs"),
+        ] {
+            let pattern = concat!("skip_serializing_if", " = \"");
+            for (i, _) in source.match_indices(pattern) {
+                let helper = &source[i + pattern.len()..];
+                assert!(
+                    helper.starts_with("omit_"),
+                    "{}",
+                    &helper[..30.min(helper.len())]
+                );
+            }
+        }
     }
 }

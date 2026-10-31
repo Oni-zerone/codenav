@@ -93,6 +93,9 @@ pub struct Server {
     /// The active project.
     cur: State,
     auto_refresh: bool,
+    /// `graph_overview` warns about sources changed since the index (without
+    /// auto-refresh, unless told not to look).
+    source_check: bool,
     /// Served repositories; the first is the default, `active` the one in `cur`.
     projects: Vec<Project>,
     active: usize,
@@ -121,6 +124,7 @@ impl Server {
         Server {
             cur: State::new(root, graph, index_options, auto_refresh),
             auto_refresh,
+            source_check: !auto_refresh,
             projects,
             active: 0,
             any_project: false,
@@ -149,6 +153,12 @@ impl Server {
     /// Lets `project` name any repository by path, not only the served ones.
     pub fn allow_any_project(&mut self, yes: bool) {
         self.any_project = yes;
+    }
+
+    /// Skips the walk of the repository `graph_overview` makes to warn about changed
+    /// sources (`tool --no-refresh`).
+    pub fn set_source_check(&mut self, check: bool) {
+        self.source_check = check && !self.auto_refresh;
     }
 
     pub fn set_max_loaded(&mut self, n: usize) {
@@ -224,7 +234,7 @@ impl Server {
     fn load(&self, root: PathBuf) -> Result<State> {
         let opts = self.load_options;
         let (graph, index_options) =
-            indexer::load_or_index(&root, opts.fresh, opts.hub_percentile)?;
+            indexer::load_or_index(&root, opts.fresh, opts.hub_percentile, true)?;
         Ok(State::new(root, graph, index_options, self.auto_refresh))
     }
 
@@ -479,7 +489,7 @@ impl Server {
             "graph_overview" => {
                 let mut v = query::overview(g, uint(a, "top", 15)?);
                 // With auto-refresh, stale sources are re-indexed on their own.
-                v["index"] = vcs::index_state(g, self.cur.root(), !self.auto_refresh);
+                v["index"] = vcs::index_state(g, self.cur.root(), self.source_check);
                 if self.cur.live.reindexing() {
                     v["index"]["reindexing"] = json!(true);
                 }

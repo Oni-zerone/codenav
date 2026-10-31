@@ -116,8 +116,13 @@ quindi una cartella esclusa si può sempre indicizzare passandola direttamente c
 Windows i pattern non distinguono maiuscole e minuscole, come fa git.
 
 L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, quindi non finisce
-nel versionamento). `serve` riusa l'indice se è aggiornato e, mentre gira, lo tiene aggiornato da
-solo (disattivabile con `--no-refresh`): un thread in background controlla ogni pochi secondi se i
+nel versionamento): `graph.cnav` in JSON, letto anche dall'estensione VS Code, e accanto
+`graph.bin`, una copia binaria che codenav carica per prima perché è più veloce (si rigenera da
+sola dal JSON se manca o è più vecchia). `codenav tool` controlla se ci sono sorgenti più recenti
+dell'indice e in quel caso re-indicizza; con `--no-refresh` (o la variabile `CODENAV_NO_REFRESH`)
+salta il controllo, utile negli script che fanno molte chiamate di fila.
+
+`serve` parte subito dall'indice salvato e, mentre gira, lo tiene aggiornato da solo (disattivabile con `--no-refresh`): un thread in background controlla ogni pochi secondi se i
 sorgenti sono cambiati o se HEAD si è spostato, rilegge solo i file modificati (i fatti estratti
 dagli altri restano in memoria), ricalcola i collegamenti e sostituisce il grafo. Le query
 rispondono sempre dal grafo più recente senza aspettare scansioni o reindex; `graph_overview`
