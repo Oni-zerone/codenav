@@ -340,11 +340,6 @@ pub struct Graph {
     /// The same in milliseconds (0 in older indexes), for precise staleness checks.
     #[serde(default)]
     pub indexed_at_ms: u64,
-    pub nodes: Vec<Node>,
-    pub edges: Vec<Edge>,
-    /// Structural communities, largest first (see `communities`).
-    #[serde(default)]
-    pub communities: Vec<Community>,
     /// Git HEAD commit and branch (None: detached) when the graph was built; absent
     /// outside a Git repository.
     #[serde(default, skip_serializing_if = "omit_none")]
@@ -367,6 +362,12 @@ pub struct Graph {
     /// Hub percentile the communities were computed with.
     #[serde(default = "default_hub_percentile")]
     pub hub_percentile: f64,
+    // The large fields last: the ones above are the header `SavedHeader` reads alone.
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    /// Structural communities, largest first (see `communities`).
+    #[serde(default)]
+    pub communities: Vec<Community>,
 
     #[serde(skip)]
     pub out_edges: Vec<Vec<usize>>,
@@ -385,10 +386,71 @@ pub fn dir_of(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
-/// Writes through a temporary file, so readers never see a partial file.
+/// The bincode body of a binary `graph.cnav` (after its magic and a supported version),
+/// or None for JSON (older versions; leading whitespace or a BOM allowed).
+fn binary_body(data: &[u8]) -> Option<Result<&[u8]>> {
+    let text = without_bom(data);
+    if text.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') {
+        return None;
+    }
+    let body = || -> Result<&[u8]> {
+        let body = data
+            .strip_prefix(MAGIC.as_slice())
+            .context("not a codenav graph (.cnav) file")?;
+        let (version, body) = body
+            .split_first_chunk::<4>()
+            .context("truncated codenav graph")?;
+        let version = u32::from_le_bytes(*version);
+        anyhow::ensure!(
+            version == FORMAT_VERSION,
+            "index format v{version} is {}, re-run `codenav index`",
+            if version < FORMAT_VERSION {
+                "outdated"
+            } else {
+                "newer than this codenav"
+            }
+        );
+        Ok(body)
+    };
+    Some(body())
+}
+
+/// JSON text without a leading byte order mark (serde_json does not accept one).
+fn without_bom(data: &[u8]) -> &[u8] {
+    data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data)
+}
+
+/// The fields `Graph` starts with, same order and types, to read them alone (bincode
+/// ignores the rest).
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct SavedHeader {
+    version: u32,
+    root: String,
+    indexed_at: u64,
+    #[serde(default)]
+    indexed_at_ms: u64,
+    #[serde(default)]
+    git_commit: Option<String>,
+    #[serde(default)]
+    git_branch: Option<String>,
+    #[serde(default)]
+    git_dirty: Option<bool>,
+    #[serde(default)]
+    analysis: u32,
+    #[serde(default)]
+    packages: Vec<crate::packages::PackageRef>,
+    #[serde(default)]
+    manifest_files: usize,
+    #[serde(default = "default_hub_percentile")]
+    hub_percentile: f64,
+}
+
+/// Writes through a temporary file named after the process (two writers never share
+/// one), so readers never see a partial file.
 fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     fs::write(&tmp, data)?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -399,20 +461,24 @@ fn default_hub_percentile() -> f64 {
 }
 
 impl Graph {
-    /// The saved graph without its lookup indexes, if there is a readable one.
-    fn read_saved(root: &Path) -> Option<Graph> {
-        Graph::from_bytes(&fs::read(Self::index_path(root)).ok()?).ok()
+    /// The first fields of the saved index, without decoding its nodes and edges.
+    fn saved_header(root: &Path) -> Option<SavedHeader> {
+        let data = fs::read(Self::index_path(root)).ok()?;
+        match binary_body(&data) {
+            Some(body) => bincode::deserialize(body.ok()?).ok(),
+            None => serde_json::from_slice(without_bom(&data)).ok(),
+        }
     }
 
     /// Hub percentile of the saved index.
     pub fn saved_hub_percentile(root: &Path) -> Option<f64> {
-        Self::read_saved(root).map(|g| g.hub_percentile)
+        Self::saved_header(root).map(|h| h.hub_percentile)
     }
 
     /// Packages recorded in the saved index.
     pub fn saved_packages(root: &Path) -> Vec<crate::packages::PackageRef> {
-        Self::read_saved(root)
-            .map(|g| g.packages)
+        Self::saved_header(root)
+            .map(|h| h.packages)
             .unwrap_or_default()
     }
 
@@ -453,8 +519,8 @@ impl Graph {
     /// A graph from the contents of `graph.cnav` (binary, or JSON from older versions),
     /// without its lookup indexes.
     pub fn from_bytes(data: &[u8]) -> Result<Graph> {
-        if data.first() == Some(&b'{') {
-            let mut g: Graph = serde_json::from_slice(data)?;
+        let Some(body) = binary_body(data) else {
+            let mut g: Graph = serde_json::from_slice(without_bom(data))?;
             anyhow::ensure!(
                 g.version == JSON_FORMAT_VERSION,
                 "index format v{} is outdated, re-run `codenav index`",
@@ -462,24 +528,8 @@ impl Graph {
             );
             g.version = FORMAT_VERSION;
             return Ok(g);
-        }
-        let body = data
-            .strip_prefix(MAGIC.as_slice())
-            .context("not a codenav graph (.cnav) file")?;
-        let (version, body) = body
-            .split_first_chunk::<4>()
-            .context("truncated codenav graph")?;
-        let version = u32::from_le_bytes(*version);
-        anyhow::ensure!(
-            version == FORMAT_VERSION,
-            "index format v{version} is {}, re-run `codenav index`",
-            if version < FORMAT_VERSION {
-                "outdated"
-            } else {
-                "newer than this codenav"
-            }
-        );
-        let mut g: Graph = bincode::deserialize(body).context("corrupt codenav graph")?;
+        };
+        let mut g: Graph = bincode::deserialize(body?).context("corrupt codenav graph")?;
         g.version = FORMAT_VERSION;
         Ok(g)
     }
@@ -500,16 +550,13 @@ impl Graph {
         Ok(path)
     }
 
+    /// Loads the saved graph. A JSON index of an older version is read as is: the next
+    /// save rewrites it in binary (loading never writes, so older readers of the same
+    /// repository keep working until then).
     pub fn load(root: &Path) -> Result<Graph> {
         let path = Self::index_path(root);
         let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let mut g = Graph::from_bytes(&data)?;
-        // A JSON index from an older version: rewrite it in the current format.
-        if data.first() == Some(&b'{')
-            && let Err(e) = g.save(root)
-        {
-            eprintln!("codenav: could not convert the index: {e:#}");
-        }
         g.build_indexes();
         Ok(g)
     }
@@ -574,7 +621,11 @@ mod tests {
         assert_eq!(path, root.join(".codenav/graph.cnav"));
         assert!(path.exists());
         assert!(!root.join(".codenav/graph.json").exists());
-        assert!(!root.join(".codenav/graph.cnav.tmp").exists());
+        let leftovers = fs::read_dir(root.join(INDEX_DIR))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension() == Some("tmp".as_ref()))
+            .count();
+        assert_eq!(leftovers, 0);
         assert_eq!(Graph::load(&root).unwrap().version, FORMAT_VERSION);
         fs::remove_dir_all(&root).unwrap();
     }
@@ -615,7 +666,10 @@ mod tests {
         ];
         g.git_commit = Some("abc".into());
         g.git_dirty = Some(false);
+        // Fixed, so that the layout fingerprint follows the layout only.
         g.indexed_at = 1;
+        g.analysis = 1;
+        g.hub_percentile = 99.0;
         g.communities = vec![Community {
             label: "a".into(),
             size: 2,
@@ -648,24 +702,33 @@ mod tests {
     }
 
     #[test]
-    fn a_json_index_loads_and_is_rewritten_in_binary() {
+    fn a_json_index_loads_as_is_and_the_next_save_writes_binary() {
         let root = std::env::temp_dir().join(format!("codenav-unit-mig-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(INDEX_DIR)).unwrap();
         let mut g = sample(&root);
         g.version = JSON_FORMAT_VERSION;
-        fs::write(Graph::index_path(&root), serde_json::to_vec(&g).unwrap()).unwrap();
+        // As older versions wrote it (pretty-printed, even with a BOM).
+        let mut text = b"\xEF\xBB\xBF\n".to_vec();
+        text.extend(serde_json::to_vec_pretty(&g).unwrap());
+        fs::write(Graph::index_path(&root), &text).unwrap();
         fs::write(root.join(INDEX_DIR).join("graph.bin"), "old copy").unwrap();
         let loaded = Graph::load(&root).unwrap();
         g.version = FORMAT_VERSION;
         assert_eq!(json(&loaded), json(&g));
         assert_eq!(loaded.by_id.len(), 2);
+        assert_eq!(Graph::saved_hub_percentile(&root), Some(99.0));
+        // Loading does not write.
+        assert_eq!(fs::read(Graph::index_path(&root)).unwrap(), text);
+        loaded.save(&root).unwrap();
         assert!(
             fs::read(Graph::index_path(&root))
                 .unwrap()
                 .starts_with(MAGIC)
         );
         assert!(!root.join(INDEX_DIR).join("graph.bin").exists());
+        assert_eq!(Graph::saved_packages(&root), g.packages);
+        assert_eq!(Graph::saved_hub_percentile(&root), Some(99.0));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -685,21 +748,57 @@ mod tests {
         assert!(err(&cut).contains("corrupt"));
     }
 
-    /// FNV-1a of the binary file of `sample("/repo")`. It changes when a serialized type
-    /// changes its layout: then bump `FORMAT_VERSION` (older files must not be misread),
-    /// and update this value.
-    const LAYOUT_FINGERPRINT: u64 = 0xdea8_043d_700e_c209;
+    /// FNV-1a of the declarations of the stored types (fields, variants and their order,
+    /// without comments) and of the binary file of `sample("/repo")` (the encoding). It
+    /// changes with the binary layout: then bump `FORMAT_VERSION` (older files must not be
+    /// misread) and update this value. A change that only looks like one (a renamed
+    /// field) needs the new value alone.
+    const LAYOUT_FINGERPRINT: u64 = 0xad19_95b9_174f_dcde;
+
+    /// `pub struct Name { … }` / `pub enum Name { … }` in `source`, without comments.
+    fn declaration(source: &str, name: &str) -> String {
+        let start = ["struct", "enum"]
+            .iter()
+            .find_map(|k| source.find(&format!("pub {k} {name} {{")))
+            .unwrap_or_else(|| panic!("no declaration of {name}"));
+        let end = start + source[start..].find("\n}").unwrap();
+        source[start..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap().trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn the_binary_layout_matches_the_format_version() {
-        let bytes = sample(Path::new("/repo")).to_bytes().unwrap();
+        let mut input = String::new();
+        for (source, names) in [
+            (
+                include_str!("graph.rs"),
+                &["Graph", "Node", "Edge", "SymKind", "EdgeKind", "Confidence"][..],
+            ),
+            (include_str!("communities.rs"), &["Community"][..]),
+            (include_str!("lang.rs"), &["Lang"][..]),
+            (
+                include_str!("packages.rs"),
+                &["PackageRef", "PackageKind"][..],
+            ),
+        ] {
+            for name in names {
+                input.push_str(&declaration(source, name));
+            }
+        }
+        let mut bytes = input.into_bytes();
+        bytes.extend(sample(Path::new("/repo")).to_bytes().unwrap());
         let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         });
         assert_eq!(
             hash, LAYOUT_FINGERPRINT,
-            "the binary layout of the graph changed: bump FORMAT_VERSION (now {FORMAT_VERSION}) \
-             and set LAYOUT_FINGERPRINT to {hash:#x}"
+            "the binary layout of the graph may have changed: bump FORMAT_VERSION (now \
+             {FORMAT_VERSION}) unless the layout is the same, and set LAYOUT_FINGERPRINT to \
+             {hash:#x}"
         );
     }
 

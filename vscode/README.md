@@ -61,10 +61,10 @@ re-indicizza in background).
 
 ```sh
 cd vscode
-rustup target add wasm32-unknown-unknown   # una volta: serve per il decoder dei .cnav
 npm install
-npm run compile      # tsc + copia cytoscape/fcose in media/vendor + decoder wasm in wasm/
-npm test             # test del modello e del decoder (node:test, senza VS Code)
+npm run compile      # tsc + copia cytoscape/fcose in media/vendor
+npm run build:wasm   # decoder dei .cnav in wasm/ (serve Rust: rustup target add wasm32-unknown-unknown)
+npm test             # test del modello, e del decoder se è stato compilato (node:test, senza VS Code)
 ```
 
 Per provarla: apri la cartella `vscode/` in VS Code e premi `F5` (Extension Development Host),

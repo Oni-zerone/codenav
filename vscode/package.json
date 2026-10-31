@@ -99,10 +99,10 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p . && node scripts/copy-vendor.js && npm run build:wasm",
+    "compile": "tsc -p . && node scripts/copy-vendor.js",
     "build:wasm": "node scripts/build-wasm.js",
     "watch": "tsc -watch -p .",
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && npm run build:wasm",
     "test": "npm run compile && node --test out/test/*.test.js",
     "package": "vsce package"
   },

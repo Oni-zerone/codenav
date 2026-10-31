@@ -4,12 +4,14 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
-import { cnavToJson } from '../src/cnavFile';
+import { cnavToJson, WASM_FILE } from '../src/cnavFile';
 import { CodeGraph, GraphError } from '../src/graphModel';
 
 const repo = path.join(__dirname, '..', '..', '..');
+// Needs the decoder (`npm run build:wasm`, which needs Rust) and cargo to write a graph.
+const noDecoder = fs.existsSync(WASM_FILE) ? false : 'no wasm decoder: run `npm run build:wasm`';
 
-test('decodes a graph.cnav written by codenav', () => {
+test('decodes a graph.cnav written by codenav', { skip: noDecoder }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codenav-ext-'));
   try {
     fs.writeFileSync(path.join(dir, 'a.py'), 'def f():\n    g()\n\ndef g():\n    pass\n');
@@ -24,9 +26,13 @@ test('decodes a graph.cnav written by codenav', () => {
   }
 });
 
-test('passes older JSON files through and reports unreadable ones', () => {
+test('passes older JSON files through', () => {
   const json = '{"version":3,"root":"/r","indexed_at":0,"nodes":[],"edges":[]}';
   assert.equal(cnavToJson(Buffer.from(json)), json);
+  assert.equal(cnavToJson(Buffer.from('\uFEFF\n  ' + json)), '\n  ' + json);
+});
+
+test('reports unreadable files', { skip: noDecoder }, () => {
   assert.throws(() => cnavToJson(Buffer.from('CNAV\u0004\u0000\u0000\u0000garbage')), GraphError);
   assert.throws(() => cnavToJson(Buffer.from('not a graph')), /not a codenav graph/);
 });

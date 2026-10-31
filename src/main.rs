@@ -191,15 +191,16 @@ fn main() -> Result<()> {
             let data =
                 std::fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
             let graph = Graph::from_bytes(&data)?;
-            let mut out = std::io::stdout().lock();
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            let written = serde_json::to_writer(&mut out, &graph)
+                .map_err(std::io::Error::from)
+                .and_then(|()| writeln!(out))
+                .and_then(|()| out.flush());
             // A reader that stops early (`| head`) is not an error.
-            match serde_json::to_writer(&mut out, &graph) {
-                Err(e) if e.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) => {}
-                written => {
-                    written?;
-                    use std::io::Write;
-                    let _ = writeln!(out);
-                }
+            match written {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                written => written?,
             }
         }
         Command::Ast { file } => {
