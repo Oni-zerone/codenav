@@ -177,16 +177,30 @@ impl Shared {
         let current = Arc::clone(&lock(&self.graph));
         let tree = indexer::scan(&self.root);
         let scan = started.elapsed();
-        let graph = if indexer::is_stale_tree(&current, &tree) {
-            // Published with the previous Git state; `git status` runs right after.
-            self.reindex(&mut facts, Some(tree), Some(&current))?.0
-        } else if vcs::head_changed(&current, &self.root) {
-            current
+        let stale = indexer::is_stale_tree(&current, &tree);
+        let head_moved = vcs::head_changed(&current, &self.root);
+        let graph = if stale {
+            // After a commit or checkout the Git state is read before publishing, so the
+            // new code never shows with the old commit. Otherwise it is published with
+            // the previous state, and `git status` runs right after.
+            let git_from = (!head_moved).then_some(&*current);
+            let graph = self.reindex(&mut facts, Some(tree), git_from)?.0;
+            drop(facts);
+            if head_moved {
+                graph
+            } else {
+                self.update_git_state(graph).0
+            }
+        } else if head_moved {
+            drop(facts);
+            match self.update_git_state(current) {
+                (graph, true) => graph,
+                // HEAD is back where it was.
+                (_, false) => return Ok((false, scan)),
+            }
         } else {
             return Ok((false, scan));
         };
-        drop(facts);
-        let graph = self.update_git_state(graph);
         self.save(&graph);
         Ok((true, scan))
     }
@@ -217,21 +231,24 @@ impl Shared {
         Ok((self.publish(graph), stats))
     }
 
-    /// Reads the Git state (HEAD, `git status`) and publishes `graph` with it if it
-    /// differs; returns the graph in place.
-    fn update_git_state(&self, graph: Arc<Graph>) -> Arc<Graph> {
+    /// Reads the Git state (HEAD, `git status`) and, if it differs from `graph`'s,
+    /// publishes a copy of `graph` with it. Returns the graph in place and whether it
+    /// published one.
+    fn update_git_state(&self, graph: Arc<Graph>) -> (Arc<Graph>, bool) {
+        let state = vcs::read_state(&graph, &self.root);
+        if state == vcs::RepoState::of(&graph) {
+            return (Arc::clone(&lock(&self.graph)), false);
+        }
+        // Copied outside the lock: tool calls keep reading the graph meanwhile.
         let mut updated = Graph::clone(&graph);
-        vcs::record_state(&mut updated, &self.root);
-        let same = updated.git_commit == graph.git_commit
-            && updated.git_branch == graph.git_branch
-            && updated.git_dirty == graph.git_dirty;
-        // Not over a newer graph published meanwhile.
+        state.apply(&mut updated);
         let mut latest = lock(&self.graph);
-        if same || !Arc::ptr_eq(&latest, &graph) {
-            return Arc::clone(&latest);
+        // Not over a newer graph published meanwhile.
+        if !Arc::ptr_eq(&latest, &graph) {
+            return (Arc::clone(&latest), false);
         }
         *latest = Arc::new(updated);
-        Arc::clone(&latest)
+        (Arc::clone(&latest), true)
     }
 
     fn publish(&self, graph: Graph) -> Arc<Graph> {
@@ -337,6 +354,43 @@ mod tests {
         let after = live.graph();
         assert_ne!(after.git_commit, before.git_commit);
         assert_eq!(after.indexed_at_ms, before.indexed_at_ms, "not re-indexed");
+        assert!(!live.refresh().unwrap());
+    }
+
+    #[test]
+    fn a_commit_changing_code_publishes_code_and_commit_together() {
+        let repo = TempRepo::new("live-commit-code", &[("a.py", "def one():\n    pass\n")]);
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.0)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) || !git(&["add", "."]) || !git(&["commit", "-qm", "one"]) {
+            return; // no git here
+        }
+        let live = live(&repo);
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(repo.0.join("a.py"), "def two():\n    pass\n").unwrap();
+        assert!(git(&["commit", "-qam", "two"]));
+        std::thread::sleep(Duration::from_millis(5));
+        // HEAD moved: the Git state is read before the graph is published.
+        let before = live.graph().git_commit.clone();
+        assert!(live.refresh().unwrap());
+        let after = live.graph();
+        assert!(has(&live, "two"));
+        assert_ne!(after.git_commit, before);
+        assert_eq!(after.git_dirty, Some(false));
         assert!(!live.refresh().unwrap());
     }
 

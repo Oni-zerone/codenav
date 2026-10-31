@@ -146,17 +146,50 @@ fn uncommitted_changes(root: &Path, indexed: &dyn Fn(&str) -> bool) -> Option<bo
     )
 }
 
-/// Records in `g` the repository state for the code it was built from: HEAD and whether
-/// that code had uncommitted changes. Outside a Git repository the fields are cleared.
-pub fn record_state(g: &mut Graph, root: &Path) {
+/// The repository state a graph records: HEAD commit and branch, and whether the
+/// indexed code had uncommitted changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepoState {
+    pub commit: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: Option<bool>,
+}
+
+impl RepoState {
+    /// The state recorded in `g`.
+    pub fn of(g: &Graph) -> RepoState {
+        RepoState {
+            commit: g.git_commit.clone(),
+            branch: g.git_branch.clone(),
+            dirty: g.git_dirty,
+        }
+    }
+
+    pub fn apply(self, g: &mut Graph) {
+        g.git_commit = self.commit;
+        g.git_branch = self.branch;
+        g.git_dirty = self.dirty;
+    }
+}
+
+/// The repository state now, for the code indexed in `g` (`git status`: tens of ms).
+/// Outside a Git repository every field is None.
+pub fn read_state(g: &Graph, root: &Path) -> RepoState {
     let head = head(root);
     let dirty = head
         .is_some()
         .then(|| uncommitted_changes(root, &|p| g.by_file.contains_key(p)))
         .flatten();
-    g.git_commit = head.as_ref().map(|h| h.commit.clone());
-    g.git_branch = head.and_then(|h| h.branch);
-    g.git_dirty = dirty;
+    RepoState {
+        commit: head.as_ref().map(|h| h.commit.clone()),
+        branch: head.and_then(|h| h.branch),
+        dirty,
+    }
+}
+
+/// Records in `g` the repository state for the code it was built from.
+pub fn record_state(g: &mut Graph, root: &Path) {
+    read_state(g, root).apply(g);
 }
 
 /// When only the repository state moved (a commit, checkout of the same files, reset

@@ -380,51 +380,10 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
     index_with(root, &IndexOptions::default())
 }
 
-/// FxHash (as in rustc): much faster than the default SipHash for the short keys of the
-/// resolver's hot maps; their keys come from the repository, not from an adversary.
-#[derive(Default, Clone, Copy)]
-struct FxHasher(u64);
-
-impl std::hash::Hasher for FxHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let (words, rest) = bytes.as_chunks::<8>();
-        for word in words {
-            self.add(u64::from_le_bytes(*word));
-        }
-        for &b in rest {
-            self.add(u64::from(b));
-        }
-    }
-
-    fn write_u8(&mut self, n: u8) {
-        self.add(u64::from(n));
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.add(u64::from(n));
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.add(n);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.add(n as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-impl FxHasher {
-    fn add(&mut self, word: u64) {
-        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-    }
-}
-
-type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
-type FastSet<K> = HashSet<K, std::hash::BuildHasherDefault<FxHasher>>;
+/// FxHash for the resolver's hot maps: much faster than SipHash on short keys, which come
+/// from the repository, not from an adversary.
+type FastMap<K, V> = rustc_hash::FxHashMap<K, V>;
+type FastSet<K> = rustc_hash::FxHashSet<K>;
 /// A reference's name, language family and kind (see `Builder::candidates`).
 type CandidateKey<'a> = (&'a str, u8, u8);
 /// The types whose names a scope uses, sorted (see `Builder::named_types`).
@@ -592,11 +551,7 @@ pub fn index_cached(
     graph.indexed_at_ms = started_at.as_millis() as u64;
     graph.build_indexes();
     match git_from {
-        Some(previous) => {
-            graph.git_commit = previous.git_commit.clone();
-            graph.git_branch = previous.git_branch.clone();
-            graph.git_dirty = previous.git_dirty;
-        }
+        Some(previous) => vcs::RepoState::of(previous).apply(&mut graph),
         None => vcs::record_state(&mut graph, root),
     }
     communities::detect(&mut graph, opts.hub_percentile);
@@ -660,7 +615,7 @@ struct Builder<'a> {
     /// (file, scope) -> the types whose names the scope uses (`scope_names`), sorted
     named_types: RefCell<FastMap<(usize, usize), NamedTypes>>,
     /// (file, specifier) -> what a JS/TS import resolves to
-    js_imports: RefCell<FastMap<(&'a str, &'a str), Vec<Target>>>,
+    js_imports: RefCell<FastMap<(&'a str, &'a str), Targets>>,
     node_dirname: Vec<u32>,
     stem_ids: HashMap<String, u32>,
     dirname_ids: HashMap<String, u32>,
@@ -1179,16 +1134,16 @@ impl<'a> Builder<'a> {
     }
 
     /// Import targets of file `fi` (repo files and external packages).
-    fn import_targets(&self, fi: usize, imp: &'a extract::Import) -> Vec<Target> {
+    fn import_targets(&self, fi: usize, imp: &'a extract::Import) -> Rc<[Target]> {
         let f: &'a FileFacts = self.facts[fi];
         match f.lang {
-            Lang::Rust => self.resolve_rust_import(&f.path, imp),
-            Lang::Python => self.resolve_python_import(&f.path, imp),
+            Lang::Rust => self.resolve_rust_import(&f.path, imp).into(),
+            Lang::Python => self.resolve_python_import(&f.path, imp).into(),
             Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
                 self.resolve_js_import(&f.path, &imp.path)
             }
-            Lang::Go => self.resolve_go_import(&imp.path),
-            Lang::Swift => vec![Target::External(imp.path.clone())],
+            Lang::Go => self.resolve_go_import(&imp.path).into(),
+            Lang::Swift => Rc::new([Target::External(imp.path.clone())]),
         }
     }
 
@@ -1213,8 +1168,8 @@ impl<'a> Builder<'a> {
         for (fi, f) in self.facts.iter().enumerate() {
             let from = self.file_nodes[fi];
             for imp in &f.imports {
-                for t in self.import_targets(fi, imp) {
-                    if let Target::File(n) = t
+                for t in self.import_targets(fi, imp).iter() {
+                    if let Target::File(n) = *t
                         && n != from
                     {
                         self.imported.entry(from).or_default().insert(n);
@@ -1244,14 +1199,14 @@ impl<'a> Builder<'a> {
         for (fi, f) in self.facts.iter().enumerate() {
             let from = self.file_nodes[fi];
             for imp in &f.imports {
-                for t in self.import_targets(fi, imp) {
-                    let to = match t {
+                for t in self.import_targets(fi, imp).iter() {
+                    let to = match *t {
                         Target::File(n) if n == from => continue,
                         Target::File(n) => {
                             self.imported.entry(from).or_default().insert(n);
                             n
                         }
-                        Target::External(name) => self.external(&name),
+                        Target::External(ref name) => self.external(name),
                     };
                     self.add_edge(
                         from,
@@ -1391,14 +1346,14 @@ impl<'a> Builder<'a> {
 
     /// `resolve_js_import_uncached`, once per (file, specifier): imports are resolved
     /// in several passes.
-    fn resolve_js_import(&self, file: &'a str, spec: &'a str) -> Vec<Target> {
+    fn resolve_js_import(&self, file: &'a str, spec: &'a str) -> Rc<[Target]> {
         if let Some(found) = self.js_imports.borrow().get(&(file, spec)) {
-            return found.clone();
+            return Rc::clone(found);
         }
-        let found = self.resolve_js_import_uncached(file, spec);
+        let found: Rc<[Target]> = self.resolve_js_import_uncached(file, spec).into();
         self.js_imports
             .borrow_mut()
-            .insert((file, spec), found.clone());
+            .insert((file, spec), Rc::clone(&found));
         found
     }
 
@@ -1565,7 +1520,10 @@ impl<'a> Builder<'a> {
         self.node_parent_name = nodes
             .iter()
             .map(|node| match node.parent {
-                Some(p) => intern(&mut parent_names, nodes[p].name.clone()),
+                Some(p) => match parent_names.get(nodes[p].name.as_str()) {
+                    Some(&id) => id,
+                    None => intern(&mut parent_names, nodes[p].name.clone()),
+                },
                 None => u32::MAX,
             })
             .collect();
@@ -1956,22 +1914,17 @@ impl<'a> Builder<'a> {
                 || parent_kind.is_type()
                 || self.is_within(scope, parent);
         }
+        if !bare {
+            return self.js_visible_qualified_elsewhere(n);
+        }
+        // A bare name: a top-level definition of a script, or exported and imported. It
+        // never reaches into another file's class or namespace.
         let file = self.node_file[n];
-        if file == NONE {
-            return false;
-        }
-        match parent_kind {
-            SymKind::File => {
-                let imported =
-                    || self.imports_file[file] || self.unresolved_imports[fi].contains(&r.name);
-                self.script_files.contains(&file)
-                    || (!self.hidden.contains(&n) && (!bare || imported()))
-            }
-            // A member: its owners up to the file must be types or namespaces, not
-            // functions. A bare name never reaches into another file's class or namespace.
-            k if k.is_type() || k == SymKind::Module => self.member_reachable[n] && !bare,
-            _ => false,
-        }
+        file != NONE
+            && parent_kind == SymKind::File
+            && (self.script_files.contains(&file)
+                || (!self.hidden.contains(&n)
+                    && (self.imports_file[file] || self.unresolved_imports[fi].contains(&r.name))))
     }
 
     /// `js_visible` for a qualified reference (`x.f()`) from another file than `n`'s.
@@ -1986,6 +1939,7 @@ impl<'a> Builder<'a> {
         }
         match nodes[parent].kind {
             SymKind::File => self.script_files.contains(&file) || !self.hidden.contains(&n),
+            // A member: its owners up to the file must be types or namespaces, not functions.
             k if k.is_type() || k == SymKind::Module => self.member_reachable[n],
             _ => false,
         }
@@ -2046,6 +2000,9 @@ impl<'a> Builder<'a> {
         node.parent.filter(|&p| self.graph.nodes[p].kind.is_type())
     }
 }
+
+/// What an import resolves to, shared by the passes that need it.
+type Targets = Rc<[Target]>;
 
 #[derive(Clone)]
 enum Target {
