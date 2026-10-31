@@ -1,234 +1,235 @@
 # codenav
 
-Tool da terminale in Rust che indicizza una repository, ne costruisce un **grafo della codebase**
-e lo espone via **MCP** (Model Context Protocol) così che un LLM (Claude, ChatGPT/Codex, ecc.)
-possa navigarlo per capire le relazioni tra i componenti.
+A command-line tool written in Rust that indexes a repository, builds a **graph of the codebase**
+and serves it over **MCP** (Model Context Protocol), so that an LLM (Claude, ChatGPT/Codex, etc.)
+can navigate it to understand how the components relate to each other.
 
-## Come funziona
+## How it works
 
 ```
-repo ──walk (.gitignore)──▶ tree-sitter parse (parallelo) ──▶ fatti per file ──▶ risoluzione nomi ──▶ grafo ──▶ .codenav/graph.cnav
+repo ──walk (.gitignore)──▶ tree-sitter parse (parallel) ──▶ facts per file ──▶ name resolution ──▶ graph ──▶ .codenav/graph.cnav
                                                                                                        │
                                                        LLM ◀── MCP stdio (JSON-RPC) ◀── codenav serve ◀┘
 ```
 
-- **Nodi**: file, simboli (`class`, `struct`, `enum`, `interface` = trait/protocol, `type`,
-  `function`, `method`, `module`, `constant`, `macro`), pacchetti esterni (`ext:requests`) e, in
-  JS/TS, le API globali del runtime usate dal codice (`global:localStorage`, `global:fetch`,
-  `document`, `window`, `navigator`, `sessionStorage`, `indexedDB`, `globalThis`, `process`), così
-  "chi usa localStorage" ha una risposta (`get_neighbors`, `explore`).
-- **Archi**: `contains`, `imports`, `calls`, `inherits` (extends/implements/conformance),
-  `references` (uso di un tipo). Ogni arco ha un conteggio delle occorrenze, le righe in cui
-  compare (per le chiamate `call_sites`, mostrate da `get_symbol`, `get_neighbors` ed `explore`)
-  e una confidenza (`exact`, `inferred`, `ambiguous`).
-- **Id stabili** leggibili: `src/graph.rs::Graph::load`, `py/app/models.py::User`.
+- **Nodes**: files, symbols (`class`, `struct`, `enum`, `interface` = trait/protocol, `type`,
+  `function`, `method`, `module`, `constant`, `macro`), external packages (`ext:requests`) and, in
+  JS/TS, the runtime global APIs the code uses (`global:localStorage`, `global:fetch`,
+  `document`, `window`, `navigator`, `sessionStorage`, `indexedDB`, `globalThis`, `process`), so
+  that "who uses localStorage" has an answer (`get_neighbors`, `explore`).
+- **Edges**: `contains`, `imports`, `calls`, `inherits` (extends/implements/conformance),
+  `references` (use of a type). Every edge has an occurrence count, the lines where it occurs
+  (`call_sites` for calls, shown by `get_symbol`, `get_neighbors` and `explore`) and a confidence
+  (`exact`, `inferred`, `ambiguous`).
+- **Stable, readable ids**: `src/graph.rs::Graph::load`, `py/app/models.py::User`.
 
-Linguaggi supportati: **Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Swift**.
+Supported languages: **Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, Swift**.
 
-### Risoluzione dei riferimenti
+### Reference resolution
 
-L'analisi è sintattica (nessun type checker), quindi i riferimenti sono collegati per nome con
-priorità: stesso file → file importati → stessa directory → stesso crate (Rust) → candidati
-globali (al massimo 3). Alcune euristiche riducono i falsi positivi:
+The analysis is syntactic (no type checker), so references are linked by name, in order of
+priority: same file → imported files → same directory → same crate (Rust) → global candidates
+(at most 3). A few heuristics reduce false positives:
 
-- `Vec::new()`, `Math.max()`: qualificatore statico non presente nel repo → scartato;
-- `x.foo()`: può puntare solo a metodi; nomi molto comuni (`get`, `len`, `push`…) non vengono
-  risolti globalmente;
-- `self.foo()` / `this.foo()`: preferisce i membri del tipo corrente;
-- `store.New()` (Go), `utils.helper()` (Python): il qualificatore può essere package/modulo;
-- JS/TS rispettano lo scope dei moduli: un simbolo di un altro file è un candidato solo se è di
-  primo livello ed esportato (`export`, `export { … }`, `export default`) e, per un nome usato da
-  solo (`f()`, `new C()`, `x: T`), se è importato: dal suo file, da un file barile che lo
-  riesporta (`export … from`), oppure con `import { f } from '…'` da una sorgente che il resolver
-  non sa mappare su un file (package del workspace, alias di tsconfig; l'arco resta `inferred`).
-  I membri di classi e namespace sono raggiungibili da un'istanza o da un qualificatore, anche se
-  la classe non è esportata. Una funzione annidata è visibile solo dentro la funzione che la
-  contiene. I file senza `import`, `export` né `module.exports` sono script: le loro definizioni
-  di primo livello sono globali; un file CommonJS senza `export` espone tutto a chi lo importa;
-- monorepo: gli import dei package locali (workspace npm con il loro `package.json`, crate Cargo
-  con il loro `Cargo.toml`) sono collegati ai file del package (punto d'ingresso, o il file di un
-  sottopercorso come `@acme/utils/strings`) invece di restare pacchetti esterni;
-- JSX: solo i tag con iniziale maiuscola (`<Card>`, `<ui.Card>`) sono componenti; `<p>`,
-  `<summary>` sono elementi HTML e non diventano chiamate;
-- JS/TS: le `const` di primo livello che non sono funzioni (oggetti, `Set`, schemi Zod…) sono nodi
-  `constant`, e gli identificatori che le usano diventano archi `references` (non quelli coperti da
-  un parametro o da una variabile locale con lo stesso nome, né i nomi dentro `import`/`export`).
+- `Vec::new()`, `Math.max()`: a static qualifier that is not in the repository → dropped;
+- `x.foo()`: can only target methods; very common names (`get`, `len`, `push`…) are not resolved
+  globally;
+- `self.foo()` / `this.foo()`: members of the current type come first;
+- `store.New()` (Go), `utils.helper()` (Python): the qualifier may be a package/module;
+- JS/TS respect module scope: a symbol from another file is a candidate only if it is top-level
+  and exported (`export`, `export { … }`, `export default`) and, for a bare name (`f()`,
+  `new C()`, `x: T`), if it is imported: from its file, from a barrel file re-exporting it
+  (`export … from`), or with `import { f } from '…'` from a source the resolver cannot map to a
+  file (a workspace package, a tsconfig alias; the edge stays `inferred`). Members of classes and
+  namespaces are reachable through an instance or a qualifier, even when the class is not
+  exported. A nested function is visible only inside the function that contains it. Files with no
+  `import`, `export` or `module.exports` are scripts: their top-level definitions are global; a
+  CommonJS file without `export` exposes everything to whoever imports it;
+- monorepos: imports of local packages (npm workspaces with their `package.json`, Cargo crates
+  with their `Cargo.toml`) are linked to the package's files (its entry point, or the file of a
+  subpath such as `@acme/utils/strings`) instead of staying external packages;
+- JSX: only tags starting with an uppercase letter (`<Card>`, `<ui.Card>`) are components; `<p>`,
+  `<summary>` are HTML elements and do not become calls;
+- JS/TS: top-level `const`s that are not functions (objects, `Set`s, Zod schemas…) are `constant`
+  nodes, and the identifiers using them become `references` edges (except those shadowed by a
+  parameter or a local variable with the same name, and names inside `import`/`export`).
 
-Quando cambia il modo in cui il grafo viene estratto o risolto, gli indici costruiti da versioni
-precedenti vengono considerati da rifare e ricostruiti automaticamente.
+When the way the graph is extracted or resolved changes, indexes built by earlier versions are
+considered out of date and rebuilt automatically.
 
-Ogni arco dice quanto è sicuro il collegamento (`confidence`):
+Every edge says how sure the link is (`confidence`):
 
-| Confidenza | Quando |
+| Confidence | When |
 |---|---|
-| `exact` | contenimento e import; candidato unico nello stesso file, in un file importato, o indicato da un qualificatore (`self.foo()`, `Store::new()`, `store.New()`) |
-| `inferred` | candidato unico trovato per vicinanza (stessa directory o crate) o unico nel repo, oppure metodo unico chiamato su un valore di tipo sconosciuto (`x.save()`) |
-| `ambiguous` | uno tra più candidati con lo stesso nome, o un metodo comune su un valore di tipo sconosciuto: può essere un falso positivo |
+| `exact` | containment and imports; a single candidate in the same file, in an imported file, or named by a qualifier (`self.foo()`, `Store::new()`, `store.New()`) |
+| `inferred` | a single candidate found by proximity (same directory or crate) or unique in the repository, or a unique method called on a value of unknown type (`x.save()`) |
+| `ambiguous` | one of several same-named candidates, or a common method on a value of unknown type: it may be a false positive |
 
-Se la stessa relazione compare più volte, basta un'occorrenza sicura per renderla sicura.
-`graph_overview` riporta la percentuale di ogni livello; `get_neighbors`, `find_paths`,
-`impact_analysis` ed `explore` accettano `min_confidence` (`exact` o `inferred`) per seguire solo
-gli archi più sicuri; `audit_edges` elenca gli archi di un livello con file e riga, per verificarli.
-Nelle risposte la confidenza compare solo quando non è `exact`.
+When the same relation occurs several times, one sure occurrence is enough to make it sure.
+`graph_overview` reports the share of each level; `get_neighbors`, `find_paths`,
+`impact_analysis` and `explore` accept `min_confidence` (`exact` or `inferred`) to follow only the
+surer edges; `audit_edges` lists the edges of one level with file and line, to check them.
+Answers show the confidence only when it is not `exact`.
 
-Gli import sono risolti a file del repo (path relativi, `crate::`/`super::`, moduli Python,
-alias `@/` e `~/`, package Go) oppure a nodi `ext:*`.
+Imports are resolved to files of the repository (relative paths, `crate::`/`super::`, Python
+modules, `@/` and `~/` aliases, Go packages) or to `ext:*` nodes.
 
-## Installazione
+## Installation
 
 ```sh
 cargo install --path .
 ```
 
-## Uso da CLI
+## Command line
 
 ```sh
-codenav index [PATH]              # crea/aggiorna PATH/.codenav/graph.cnav
-codenav serve [PATH]...           # server MCP su stdio (più repository: il primo è il default)
-codenav tool <nome> '<json>' [PATH]  # invoca un tool MCP da terminale (anche --path PATH)
-codenav export [PATH]             # stampa il grafo salvato in JSON (PATH: repo o file .cnav)
-codenav ast <file>                # albero tree-sitter (per scrivere nuove query)
+codenav index [PATH]              # create/update PATH/.codenav/graph.cnav
+codenav serve [PATH]...           # MCP server on stdio (several repositories: the first is the default)
+codenav tool <name> '<json>' [PATH]  # call an MCP tool from the terminal (also --path PATH)
+codenav export [PATH]             # print the saved graph as JSON (PATH: a repository or a .cnav file)
+codenav ast <file>                # tree-sitter syntax tree (to write new queries)
 ```
 
-Esempi:
+Examples:
 
 ```sh
-codenav tool explore '{"question":"come UserService crea gli utenti"}'
+codenav tool explore '{"question":"how UserService creates users"}'
 codenav tool search_symbols '{"query":"UserService"}'
 codenav tool find_paths '{"from":"Server::run","to":"extract","directed":true}'
 codenav tool module_graph '{"depth":2}'
-codenav tool graph_overview ../altro-repo   # path posizionale, come per index e serve
+codenav tool graph_overview ../other-repo   # positional path, as for index and serve
 codenav tool get_community '{"id":"UserService"}'
 ```
 
-### Escludere percorsi: `.codenavignore`
+### Excluding paths: `.codenavignore`
 
-Oltre a `.gitignore` e alle cartelle escluse di default (`node_modules`, `target`, `vendor`,
-`Pods`, `build`, `dist`…), codenav legge i file `.codenavignore`, che hanno la stessa sintassi di
-`.gitignore`. Un file nella root vale per tutto il repo, uno in una sottocartella vale solo lì.
-Serve per escludere fixture di test, codice generato o vendorizzato che non si vuole nel grafo:
+Besides `.gitignore` and the directories excluded by default (`node_modules`, `target`,
+`vendor`, `Pods`, `build`, `dist`…), codenav reads `.codenavignore` files, which use the same
+syntax as `.gitignore`. A file at the root applies to the whole repository, one in a
+subdirectory only there. Use it to leave test fixtures, generated or vendored code out of the
+graph:
 
 ```gitignore
 tests/fixtures/
 **/*.generated.ts
 ```
 
-Le regole possono solo **restringere** l'indice: un `!pattern` crea un'eccezione alle regole di
-`.codenavignore`, ma non reinclude file esclusi da `.gitignore`, cartelle nascoste o cartelle
-escluse di default. Vengono letti solo i `.codenavignore` della root e delle sue sottocartelle,
-quindi una cartella esclusa si può sempre indicizzare passandola direttamente come root. Su macOS e
-Windows i pattern non distinguono maiuscole e minuscole, come fa git.
+The rules can only **narrow** the index: a `!pattern` makes an exception to `.codenavignore`
+rules, but never re-includes files excluded by `.gitignore`, hidden directories or the
+directories excluded by default. Only the `.codenavignore` files of the root and its
+subdirectories are read, so an excluded directory can always be indexed by passing it directly as
+the root. On macOS and Windows patterns are case-insensitive, as in git.
 
-L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, quindi non finisce
-nel versionamento): `graph.cnav`, in un formato binario che si carica in pochi millisecondi. Per
-leggerlo o elaborarlo con altri strumenti, `codenav export` lo stampa in JSON. Gli indici JSON delle
-versioni precedenti vengono letti e riscritti nel nuovo formato al primo uso. `codenav tool` controlla se ci sono sorgenti più recenti
-dell'indice e in quel caso re-indicizza; con `--no-refresh` (o la variabile `CODENAV_NO_REFRESH`)
-salta il controllo, utile negli script che fanno molte chiamate di fila.
+The index is saved in `.codenav/` (which holds its own `.gitignore`, so it stays out of version
+control): `graph.cnav`, in a binary format that loads in a few milliseconds. To read it or process
+it with other tools, `codenav export` prints it as JSON. JSON indexes from earlier versions are
+read as they are and rewritten in the new format by the next save. `codenav tool` checks for
+sources newer than the index and re-indexes if there are any; `--no-refresh` (or the
+`CODENAV_NO_REFRESH` variable) skips the check, which helps scripts making many calls in a row.
 
-`serve` parte subito dall'indice salvato e, mentre gira, lo tiene aggiornato da solo (disattivabile con `--no-refresh`): un thread in background controlla ogni pochi secondi se i
-sorgenti sono cambiati o se HEAD si è spostato, rilegge solo i file modificati (i fatti estratti
-dagli altri restano in memoria), ricalcola i collegamenti e sostituisce il grafo. Le query
-rispondono sempre dal grafo più recente senza aspettare scansioni o reindex; `graph_overview`
-segnala `reindexing` mentre uno è in corso. Il grafo è identico a quello di un `codenav index`
-completo, che resta il modo per ripartire da zero, come il tool `reindex`. `diff_impact` aggiorna
-il grafo prima di rispondere, perché deve corrispondere ai file attuali.
+`serve` starts right away from the saved index and, while it runs, keeps it up to date by itself
+(turn it off with `--no-refresh`): a background thread checks every few seconds whether the
+sources changed or HEAD moved, reads only the modified files again (the facts extracted from the
+others stay in memory), recomputes the links and swaps the graph in. Queries always answer from
+the latest graph without waiting for scans or re-indexing; `graph_overview` reports `reindexing`
+while one is running. The graph is identical to the one a full `codenav index` builds, which
+remains the way to start from scratch, like the `reindex` tool. `diff_impact` updates the graph
+before answering, because it must match the current files.
 
-## Estensione VS Code
+## VS Code extension
 
-In [`vscode/`](vscode/README.md) c'è un'estensione che visualizza `.codenav/graph.cnav` dentro
-VS Code (basta aprire il file): vista per moduli, per file e focus su un simbolo, con apertura del sorgente al clic e
-aggiornamento automatico quando l'indice cambia.
+[`vscode/`](vscode/README.md) holds an extension that shows `.codenav/graph.cnav` inside VS Code
+(just open the file): module, file and symbol-focus views, opening the source on click and
+refreshing by itself when the index changes. It reads the binary file with codenav's own Rust
+code, compiled to WebAssembly (the `wasm/` crate).
 
-## Tool MCP
+## MCP tools
 
-| Tool | A cosa serve |
+| Tool | What it is for |
 |---|---|
-| `explore` | Domanda in linguaggio naturale → sottografo rilevante in una sola chiamata (BFS/DFS, seed espliciti, `token_budget`). I nodi di partenza si scelgono da nomi e doc comment (anche varianti delle parole); se la domanda trova poco riscontro nel codice la risposta lo dice (`low_confidence: true`) |
-| `graph_overview` | Stato dell'indice (commit e branch Git da cui è stato costruito, modifiche non committate, avvisi se HEAD è cambiato o i sorgenti sono stati modificati), linguaggi, conteggi, simboli/file più dipendenti, dipendenze esterne principali, community più grandi |
-| `module_graph` | Architettura: dipendenze aggregate tra directory/componenti |
-| `insights` | Cosa merita un'occhiata: connessioni inattese tra file (confidenza bassa, poche connessioni tra community, codice periferico che raggiunge un hub), nodi ponte tra community (betweenness approssimata) e domande suggerite |
-| `diff_impact` | Impatto di un insieme di modifiche Git (non committate, in stage, o `base...HEAD`): simboli modificati, file nuovi/cancellati, tutto ciò che ne dipende, community e moduli toccati |
-| `tests_for` | Test da eseguire dopo una modifica: file di test (per convenzione di percorso, mai per somiglianza di nome) che dipendono dal simbolo o file, diretti e indiretti con distanza e percorso |
-| `find_cycles` | Cicli di dipendenze tra file o moduli: componenti fortemente connesse e cicli più corti (default: import, archi almeno `inferred`) |
-| `get_community` | Community strutturale di un nodo (o per numero): file, membri più collegati, community da cui dipende e che la usano |
-| `search_symbols` | Ricerca per nome, frammento di id o testo della doc; filtri per kind e path. Ogni risultato dice come corrisponde (`exact`, `prefix`, `fragment`, `id`, `doc`), e una nota avvisa quando nessun simbolo ha il nome cercato |
-| `get_symbol` | Dettaglio di un nodo: firma, doc, relazioni in/out per tipo, codice sorgente |
-| `get_neighbors` | BFS attorno a un nodo (es. chi chiama X: `direction=in`, `edge_kinds=[calls]`) |
-| `find_paths` | Catene di relazioni più brevi tra due nodi ("come sono collegati A e B?") |
-| `file_outline` | Simboli di un file (annidati), import, importatori, file più correlati |
-| `audit_edges` | Verifica del resolver: archi per tipo e confidenza, poi quelli di un livello (default `ambiguous`) con file e riga |
-| `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base). Se il testo supera il budget parte da un riepilogo (conteggi per directory, file di test, tutti i dipendenti diretti) e si taglia solo il dettaglio degli indiretti |
-| `read_code` | Legge un intervallo di righe di un file del repo |
-| `list_projects` | Repository serviti (nome da passare come `project` a ogni tool), quale è il default e quali sono caricati |
-| `reindex` | Ricostruisce il grafo da zero (rilegge tutti i file) |
+| `explore` | A natural-language question → the relevant subgraph in one call (BFS/DFS, explicit seeds, `token_budget`). Starting nodes are picked from names and doc comments (word variants included); when the question barely matches the code, the answer says so (`low_confidence: true`) |
+| `graph_overview` | State of the index (the Git commit and branch it was built from, uncommitted changes, warnings when HEAD moved or sources changed), languages, counts, most depended-on symbols/files, main external dependencies, largest communities |
+| `module_graph` | Architecture: dependencies aggregated between directories/components |
+| `insights` | What deserves a look: surprising connections between files (low confidence, few links between communities, peripheral code reaching a hub), bridge nodes between communities (approximate betweenness) and suggested questions |
+| `diff_impact` | Impact of a set of Git changes (uncommitted, staged, or `base...HEAD`): changed symbols, new/deleted files, everything that depends on them, communities and modules touched |
+| `tests_for` | Tests to run after a change: test files (by path convention, never by name similarity) that depend on the symbol or file, direct and indirect, with distance and path |
+| `find_cycles` | Dependency cycles between files or modules: strongly connected components and shortest cycles (default: imports, edges at least `inferred`) |
+| `get_community` | The structural community of a node (or by number): files, most connected members, communities it depends on and that use it |
+| `search_symbols` | Search by name, id fragment or doc text; filters by kind and path. Each result says how it matched (`exact`, `prefix`, `fragment`, `id`, `doc`), and a note warns when no symbol has the name searched for |
+| `get_symbol` | Details of a node: signature, doc, incoming/outgoing relations by kind, source code |
+| `get_neighbors` | BFS around a node (e.g. who calls X: `direction=in`, `edge_kinds=[calls]`) |
+| `find_paths` | Shortest chains of relations between two nodes ("how are A and B connected?") |
+| `file_outline` | Symbols of a file (nested), imports, importers, most related files |
+| `audit_edges` | Checking the resolver: edges by kind and confidence, then those of one level (default `ambiguous`) with file and line |
+| `impact_analysis` | Everything that transitively depends on a symbol/file: what breaks if it changes. For a method it also counts callers of the methods it overrides (interfaces, base classes). When the text exceeds the budget it starts with a summary (counts per directory, test files, every direct dependent) and only the detail of indirect dependents is cut |
+| `read_code` | Reads a range of lines of a file of the repository |
+| `list_projects` | The repositories served (the name to pass as `project` to any tool), which one is the default and which are loaded |
+| `reindex` | Rebuilds the graph from scratch (reads every file again) |
 
-Tutti i tool che restituiscono dati strutturati rispondono di default in **testo compatto**
-(simile a YAML, senza virgolette e parentesi) tagliato a `token_budget` (default 2000, da 200 a
-100000). Se l'output viene tagliato, la prima riga lo dice e indica il `token_budget` necessario
-per vedere tutto, più un suggerimento per restringere la richiesta. Con `format: "json"` si ottiene
-invece il risultato JSON completo, senza budget.
+Every tool returning structured data answers by default in **compact text** (YAML-like, without
+quotes or braces) cut to `token_budget` (default 2000, from 200 to 100000). When the output is
+cut, the first line says so and gives the `token_budget` needed to see everything, plus a hint to
+narrow the request. With `format: "json"` you get the full JSON result instead, with no budget.
 
-### Sinonimi in `explore` (opzionale)
+### Synonyms in `explore` (optional)
 
-`codenav serve --embeddings parole.vec` (o `codenav tool … --embeddings parole.vec`) carica una
-tabella di embedding statici nel formato testo di word2vec, fastText e GloVe (`token v1 … vN`,
-con o senza la riga `conteggio dimensioni`). `explore` usa allora anche i sinonimi: una parola
-della domanda corrisponde a una parola di un nome o di un doc comment con significato simile
-(similarità coseno ≥ 0,6), quindi trova il codice anche quando la domanda non ne usa i termini
-(altre parole, altra lingua se il modello è multilingue). Senza file tutto funziona come prima.
-I modelli più piccoli bastano (vocabolario della lingua del codice e dei commenti); il file va
-scaricato a parte, codenav non ne include uno.
+`codenav serve --embeddings words.vec` (or `codenav tool … --embeddings words.vec`) loads a table
+of static word embeddings in the word2vec, fastText and GloVe text format (`token v1 … vN`, with
+or without a `count dimensions` header line). `explore` then also uses synonyms: a word of the
+question matches a word of a name or of a doc comment with a similar meaning (cosine similarity
+≥ 0.6), so it finds the code even when the question does not use its terms (other words, or
+another language if the model is multilingual). Without the file everything works as before.
+Small models are enough (the vocabulary of the code's and comments' language); the file must be
+downloaded separately, codenav does not ship one.
 
-### Più repository
+### Several repositories
 
-`codenav serve repo-a repo-b …` serve più repository da un solo server: ogni tool accetta
-`project` (il nome mostrato da `list_projects`, o il path), e senza `project` risponde sul primo.
-I grafi si caricano al primo uso; al massimo `--max-loaded` (default 4) restano in memoria, i meno
-usati di recente vengono scaricati e ricaricati dal loro indice quando servono.
-`list_projects` elenca anche i package dichiarati da ogni progetto, e `get_symbol` su un pacchetto
-esterno indica quale progetto servito lo fornisce (`provided_by_project`). Con
-`--any-project` i tool possono aprire anche altri repository indicandone il path assoluto (solo
-cartelle con `.git` o con un indice codenav). `--fresh` e `--hub-percentile` valgono per tutti i
-repository.
+`codenav serve repo-a repo-b …` serves several repositories from one server: every tool accepts
+`project` (the name shown by `list_projects`, or the path), and without `project` it answers
+about the first. Graphs load on first use; at most `--max-loaded` (default 4) stay in memory, the
+least recently used are dropped and reloaded from their index when needed. Each loaded project
+is kept up to date only while it is the active one. `list_projects` also lists the packages each
+project declares, and `get_symbol` on an external package says which served project provides it
+(`provided_by_project`). With `--any-project` tools can also open other repositories by absolute
+path (only directories with `.git` or a codenav index). `--fresh` and `--hub-percentile` apply to
+every repository.
 
-### Risorse e prompt MCP
+### MCP resources and prompts
 
-Oltre ai tool, il server espone **risorse** di sola lettura, utili come contesto iniziale (testo
-compatto, budget di 8000 token): `codenav://overview`, `codenav://modules`, `codenav://insights`,
-`codenav://cycles` e `codenav://audit`. Il prompt **`architecture-review`** (argomento opzionale
-`focus`: una cartella, un file o un simbolo) guida l'LLM in una revisione dell'architettura con i
-tool di codenav: componenti, cicli, punti critici e collegamenti da verificare.
+Besides tools, the server exposes read-only **resources**, useful as initial context (compact
+text, 8000-token budget): `codenav://overview`, `codenav://modules`, `codenav://insights`,
+`codenav://cycles` and `codenav://audit`. The **`architecture-review`** prompt (optional
+argument `focus`: a directory, a file or a symbol) guides the LLM through an architecture review
+with codenav's tools: components, cycles, hot spots and links to verify.
 
-### Community
+### Communities
 
-Durante l'indicizzazione il grafo viene diviso in **community**: gruppi di file e simboli che
-dipendono tra loro più che dal resto del repo (algoritmo di Louvain sugli archi `calls`,
-`references`, `inherits`, `imports` e `contains`). Mostrano i componenti reali anche quando la
-struttura delle cartelle non li riflette. Ogni community ha un numero (0 è la più grande) e
-un'etichetta automatica: la cartella dominante, oppure il file o il simbolo dominante quando la
-cartella è condivisa. Il calcolo è deterministico, quindi lo stesso codice dà sempre gli stessi
-numeri.
+While indexing, the graph is split into **communities**: groups of files and symbols that depend
+on each other more than on the rest of the repository (the Louvain algorithm on `calls`,
+`references`, `inherits`, `imports` and `contains` edges). They show the actual components even
+when the directory layout does not. Each community has a number (0 is the largest) and an
+automatic label: the dominant directory, or the dominant file or symbol when the directory is
+shared. The computation is deterministic, so the same code always gives the same numbers.
 
-Gli archi di dipendenza degli *hub* (i nodi più collegati, sopra il 99° percentile) non contano,
-così le utility usate ovunque non uniscono parti che non c'entrano. La soglia si cambia con
-`codenav index --hub-percentile N` (o `serve --hub-percentile N`); `100` disattiva l'esclusione.
-Il valore viene salvato nell'indice e riusato dai re-index successivi (anche quelli automatici di
-`serve`) finché non se ne passa un altro. I pacchetti esterni non hanno community, e gli archi
-`ambiguous` pesano la metà; `get_community` li conta a parte (`ambiguous_edges`).
+The dependency edges of *hubs* (the most connected nodes, above the 99th percentile) do not
+count, so utilities used everywhere do not glue unrelated parts together. Change the threshold
+with `codenav index --hub-percentile N` (or `serve --hub-percentile N`); `100` turns the exclusion
+off. The value is saved in the index and reused by later re-indexing (including `serve`'s
+automatic one) until another is passed. External packages have no community, and `ambiguous`
+edges weigh half; `get_community` counts them separately (`ambiguous_edges`).
 
-Dove serve un id si può passare anche un nome univoco (`Graph::load`, `UserService`) o un path:
-se è ambiguo il tool risponde con la lista degli id candidati.
+Wherever an id is expected you can also pass a unique name (`Graph::load`, `UserService`) or a
+path: when it is ambiguous the tool answers with the list of candidate ids.
 
-## Configurazione dei client
+## Client configuration
 
-**Claude Code** (per la repo corrente):
+**Claude Code** (for the current repository):
 
 ```sh
 claude mcp add codenav -- codenav serve "$(pwd)"
 ```
 
-oppure, condiviso col team, un `.mcp.json` nella root del progetto:
+or, shared with the team, a `.mcp.json` at the root of the project:
 
 ```json
 { "mcpServers": { "codenav": { "command": "codenav", "args": ["serve", "."] } } }
@@ -237,7 +238,7 @@ oppure, condiviso col team, un `.mcp.json` nella root del progetto:
 **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
-{ "mcpServers": { "codenav": { "command": "/Users/<tu>/.cargo/bin/codenav", "args": ["serve", "/percorso/repo"] } } }
+{ "mcpServers": { "codenav": { "command": "/Users/<you>/.cargo/bin/codenav", "args": ["serve", "/path/to/repo"] } } }
 ```
 
 **OpenAI Codex CLI** (`~/.codex/config.toml`):
@@ -245,43 +246,48 @@ oppure, condiviso col team, un `.mcp.json` nella root del progetto:
 ```toml
 [mcp_servers.codenav]
 command = "codenav"
-args = ["serve", "/percorso/repo"]
+args = ["serve", "/path/to/repo"]
 ```
 
-Qualsiasi altro client MCP che supporti il trasporto **stdio** funziona allo stesso modo.
-ChatGPT web accetta solo server MCP remoti (HTTP): serve un trasporto HTTP (vedi roadmap) o un
-bridge stdio→HTTP.
+Any other MCP client supporting the **stdio** transport works the same way. ChatGPT on the web
+accepts only remote (HTTP) MCP servers: that needs an HTTP transport (see the roadmap) or a
+stdio→HTTP bridge.
 
-## Struttura del codice
+## Code layout
 
-| File | Ruolo |
+| File | Role |
 |---|---|
-| `src/lang.rs` | Linguaggi supportati, grammatiche e query tree-sitter (convenzione dei capture documentata in testa) |
-| `src/extract.rs` | Parsing di un file → definizioni, blocchi impl/extension, chiamate, import, tipi |
-| `src/indexer.rs` | Walk della repo, estrazione parallela (rayon), risoluzione cross-file, costruzione del grafo |
-| `src/graph.rs` | Modello dati (nodi, archi), persistenza, indici in memoria |
-| `src/query.rs` | Analisi sul grafo: ricerca, vicini, cammini, outline, impatto, grafo dei moduli |
-| `src/mcp.rs` | Server MCP JSON-RPC su stdio e definizione dei tool |
+| `src/lang.rs` | Supported languages, tree-sitter grammars and queries (the capture convention is documented at the top) |
+| `src/extract.rs` | Parsing a file → definitions, impl/extension blocks, calls, imports, types |
+| `src/indexer.rs` | Repository walk, parallel extraction (rayon), cross-file resolution, graph construction, facts cache for incremental updates |
+| `src/graph.rs` | Data model (nodes, edges), the `graph.cnav` format, in-memory indexes |
+| `src/query.rs` | Graph analyses: search, neighbours, paths, outline, impact, module graph |
+| `src/live.rs` | The served graph kept up to date in the background |
+| `src/mcp.rs` | MCP JSON-RPC server on stdio and tool definitions |
+| `src/lib.rs` | The library: the graph format always, everything else with the default `indexer` feature |
+| `wasm/` | `graph.cnav` decoder in WebAssembly, built from the same code (for the VS Code extension) |
 
-Aggiungere un linguaggio: grammatica in `Cargo.toml`, variante in `Lang`, una query che segue la
-convenzione dei capture in `lang.rs`, ed eventualmente la risoluzione degli import in `indexer.rs`.
-`codenav ast file.ext` aiuta a scoprire i nomi dei nodi.
+Adding a language: the grammar in `Cargo.toml`, a variant in `Lang`, a query following the
+capture convention in `lang.rs`, and possibly import resolution in `indexer.rs`.
+`codenav ast file.ext` helps to find the node names.
 
-## Limiti noti e roadmap
+## Known limits and roadmap
 
-- Risoluzione per nome: con nomi molto ripetuti alcune chiamate restano non risolte o `ambiguous`.
-  Un'integrazione opzionale con i language server (LSP/SCIP) darebbe precisione da compilatore.
-- Re-indicizzazione completa a ogni cambio (veloce: ~1.200 file in ~1.5s); possibile versione
-  incrementale per file modificati.
-- Trasporto MCP HTTP (streamable) per client remoti come ChatGPT.
-- Ricerca semantica (embedding) sui simboli e sulla doc.
-- Altri linguaggi: Java/Kotlin, C#, C/C++, Ruby, PHP.
+- Resolution by name: with very common names some calls stay unresolved or `ambiguous`. An
+  optional integration with language servers (LSP/SCIP) would give compiler precision.
+- An update re-parses only the modified files, but recomputes the links of the whole repository
+  (tens of milliseconds on a few hundred files, in the background); resolving only what a change
+  affects would make it faster on large repositories.
+- HTTP (streamable) MCP transport for remote clients such as ChatGPT.
+- Semantic search over symbols and docs beyond word synonyms.
+- More languages: Java/Kotlin, C#, C/C++, Ruby, PHP.
 
-## Test
+## Tests
 
 ```sh
-cargo test
+cargo test --workspace
 ```
 
-I test d'integrazione (`tests/graph.rs`) indicizzano la fixture multi-linguaggio in
-`tests/fixtures/poly` e verificano archi attesi e handshake MCP.
+The integration tests (`tests/graph.rs`) index the multi-language fixture in
+`tests/fixtures/poly` and check the expected edges and the MCP handshake. The extension's tests
+run with `npm test` in `vscode/` (see its README).
