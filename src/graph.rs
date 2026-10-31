@@ -295,7 +295,7 @@ impl Edge {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Graph {
     pub version: u32,
     pub root: String,

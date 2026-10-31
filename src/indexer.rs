@@ -1930,14 +1930,14 @@ fn to_unix(p: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A throwaway repository with the given files, removed on drop.
-    struct TempRepo(PathBuf);
+    pub(crate) struct TempRepo(pub(crate) PathBuf);
 
     impl TempRepo {
-        fn new(name: &str, files: &[(&str, &str)]) -> TempRepo {
+        pub(crate) fn new(name: &str, files: &[(&str, &str)]) -> TempRepo {
             let dir =
                 std::env::temp_dir().join(format!("codenav-unit-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);

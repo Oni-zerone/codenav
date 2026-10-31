@@ -209,6 +209,7 @@ impl Server {
             .filter(|c| c.join(".git").exists() || Graph::index_path(c).exists())
             .ok_or_else(|| anyhow!("`{p}` is not a repository (no .git and no codenav index)"))?;
         let state = self.load(root.clone())?;
+        state.live.set_active(false);
         let taken: Vec<&str> = self.projects.iter().map(|x| x.name.as_str()).collect();
         let name = project_name(&root, &taken);
         self.projects.push(Project {
@@ -265,10 +266,10 @@ impl Server {
     /// Packages a project declares, from its graph (loaded, or its saved index).
     fn project_packages(&self, i: usize) -> Vec<packages::PackageRef> {
         if i == self.active {
-            return self.cur.graph.packages.clone();
+            return self.cur.live.graph().packages.clone();
         }
         match &self.projects[i].parked {
-            Some(state) => state.graph.packages.clone(),
+            Some(state) => state.live.graph().packages.clone(),
             None => Graph::saved_packages(&self.projects[i].root),
         }
     }

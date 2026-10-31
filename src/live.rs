@@ -1,11 +1,12 @@
 //! A served graph kept up to date in the background: a worker thread looks for changed
-//! sources (and a moved Git HEAD) every few seconds, re-indexes incrementally and swaps
-//! the new graph in. Tool calls read the latest graph and never wait for a scan.
+//! sources (and a moved Git HEAD) every few seconds while its project is active,
+//! re-indexes incrementally and swaps the new graph in. Tool calls read the latest graph
+//! and never wait for a scan.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -22,7 +23,6 @@ const SCAN_SHARE: u32 = 50;
 
 pub struct Live {
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
 }
 
 struct Shared {
@@ -31,38 +31,49 @@ struct Shared {
     /// The latest graph.
     graph: Mutex<Arc<Graph>>,
     /// Facts of every file, so a refresh only parses changed files. Held while
-    /// re-indexing and saving: one re-index at a time.
+    /// checking and re-indexing: one at a time.
     facts: Mutex<FactsCache>,
+    /// Held while writing the index to disk.
+    saving: Mutex<()>,
     reindexing: AtomicBool,
     /// Checks run only while the project is the active one.
     active: AtomicBool,
-    stop: Mutex<bool>,
+    signal: Mutex<Signal>,
     wake: Condvar,
     /// Test hook: runs after a re-index read the files, before its graph is published.
     #[cfg(test)]
     after_read: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
+#[derive(Default)]
+struct Signal {
+    stop: bool,
+    /// Check now rather than at the end of the pause.
+    poke: bool,
+}
+
 impl Live {
-    /// `watch`: start the background worker (it first parses every file into the cache).
+    /// `watch`: keep the graph up to date with a background worker (it first parses
+    /// every file into the cache, once the project is active).
     pub fn new(root: PathBuf, graph: Graph, index_options: IndexOptions, watch: bool) -> Live {
         let shared = Arc::new(Shared {
             root,
             index_options,
             graph: Mutex::new(Arc::new(graph)),
             facts: Mutex::new(FactsCache::default()),
+            saving: Mutex::new(()),
             reindexing: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            stop: Mutex::new(false),
+            signal: Mutex::new(Signal::default()),
             wake: Condvar::new(),
             #[cfg(test)]
             after_read: Mutex::new(None),
         });
-        let worker = watch.then(|| {
+        if watch {
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || shared.watch())
-        });
-        Live { shared, worker }
+            std::thread::spawn(move || shared.watch());
+        }
+        Live { shared }
     }
 
     pub fn root(&self) -> &Path {
@@ -79,22 +90,30 @@ impl Live {
         self.shared.reindexing.load(Ordering::Relaxed)
     }
 
-    /// Pauses the background checks while another project is active.
+    /// Pauses the background checks while another project is active; on activation,
+    /// checks right away.
     pub fn set_active(&self, active: bool) {
         self.shared.active.store(active, Ordering::Relaxed);
+        if active {
+            lock(&self.shared.signal).poke = true;
+            self.shared.wake.notify_all();
+        }
     }
 
-    /// Re-indexes now if sources changed or HEAD moved (waiting for a running re-index
-    /// first); returns whether the graph changed.
+    /// Updates the graph now if sources changed or HEAD moved (after a check already
+    /// running); returns whether it changed.
     pub fn refresh(&self) -> Result<bool> {
-        self.shared.refresh()
+        Ok(self.shared.update()?.0)
     }
 
     /// Re-indexes every file from scratch.
     pub fn reindex_full(&self) -> Result<IndexStats> {
         let mut facts = lock_facts(&self.shared.facts);
         *facts = FactsCache::default();
-        self.shared.reindex(&mut facts, None)
+        let (graph, stats) = self.shared.reindex(&mut facts, None)?;
+        drop(facts);
+        self.shared.save(&graph);
+        Ok(stats)
     }
 
     #[cfg(test)]
@@ -104,73 +123,109 @@ impl Live {
 }
 
 impl Drop for Live {
+    /// Stops the worker without waiting: it may be parsing a whole repository. A
+    /// re-index it is running still completes and saves.
     fn drop(&mut self) {
-        *lock(&self.shared.stop) = true;
+        lock(&self.shared.signal).stop = true;
         self.shared.wake.notify_all();
-        // Lets a running re-index finish its save.
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
 impl Shared {
     fn watch(&self) {
-        lock_facts(&self.facts).fill(&self.root);
+        let mut filled = false;
         let mut interval = MIN_INTERVAL;
         loop {
-            {
-                let stop = lock(&self.stop);
-                let (stop, _) = self
-                    .wake
-                    .wait_timeout_while(stop, interval, |stop| !*stop)
-                    .unwrap_or_else(|e| e.into_inner());
-                if *stop {
-                    return;
+            if self.active.load(Ordering::Relaxed) {
+                let run = catch_unwind(AssertUnwindSafe(|| {
+                    if !filled {
+                        lock_facts(&self.facts).fill(&self.root);
+                        filled = true;
+                    }
+                    self.update()
+                }));
+                match run {
+                    Ok(Ok((_, scan))) => {
+                        interval = (scan * SCAN_SHARE).clamp(MIN_INTERVAL, MAX_INTERVAL);
+                    }
+                    Ok(Err(e)) => eprintln!("codenav: re-index failed: {e:#}"),
+                    Err(_) => eprintln!("codenav: re-index panicked; retrying later"),
                 }
             }
-            if !self.active.load(Ordering::Relaxed) {
-                continue;
+            let signal = lock(&self.signal);
+            let mut signal = self
+                .wake
+                .wait_timeout_while(signal, interval, |s| !s.stop && !s.poke)
+                .map_or_else(|e| e.into_inner().0, |(s, _)| s);
+            if signal.stop {
+                return;
             }
-            let started = Instant::now();
-            if let Err(e) = self.refresh() {
-                eprintln!("codenav: re-index failed: {e:#}");
-            }
-            interval = (started.elapsed() * SCAN_SHARE).clamp(MIN_INTERVAL, MAX_INTERVAL);
+            signal.poke = false;
         }
     }
 
-    fn refresh(&self) -> Result<bool> {
+    /// Re-indexes if sources changed, or updates the Git state if only HEAD moved.
+    /// Returns whether the graph changed, and how long the scan took.
+    fn update(&self) -> Result<(bool, Duration)> {
         let mut facts = lock_facts(&self.facts);
+        let started = Instant::now();
         let current = Arc::clone(&lock(&self.graph));
         let tree = indexer::scan(&self.root);
-        if !indexer::is_stale_tree(&current, &tree) && !vcs::head_changed(&current, &self.root) {
-            return Ok(false);
-        }
-        self.reindex(&mut facts, Some(tree))?;
-        Ok(true)
+        let scan = started.elapsed();
+        let graph = if indexer::is_stale_tree(&current, &tree) {
+            self.reindex(&mut facts, Some(tree))?.0
+        } else if vcs::head_changed(&current, &self.root) {
+            // Same code, new commit: only the Git fields change.
+            let mut graph = Graph::clone(&current);
+            vcs::record_state(&mut graph, &self.root);
+            self.publish(graph)
+        } else {
+            return Ok((false, scan));
+        };
+        drop(facts);
+        self.save(&graph);
+        Ok((true, scan))
     }
 
-    /// Re-indexes from the cached facts (parsing changed files), publishes the graph and
-    /// saves it. A file changed meanwhile is newer than the graph: the next check sees it.
-    fn reindex(&self, facts: &mut FactsCache, tree: Option<indexer::Tree>) -> Result<IndexStats> {
+    /// Re-indexes from the cached facts (parsing changed files) and publishes the graph.
+    /// A file changed meanwhile is newer than the graph: the next check sees it.
+    fn reindex(
+        &self,
+        facts: &mut FactsCache,
+        tree: Option<indexer::Tree>,
+    ) -> Result<(Arc<Graph>, IndexStats)> {
+        struct Reindexing<'a>(&'a AtomicBool);
+        impl Drop for Reindexing<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
         self.reindexing.store(true, Ordering::Relaxed);
-        let result = indexer::index_cached(&self.root, &self.index_options, facts, tree);
+        let _reindexing = Reindexing(&self.reindexing);
+        let (graph, stats) = indexer::index_cached(&self.root, &self.index_options, facts, tree)?;
         #[cfg(test)]
         if let Some(hook) = lock(&self.after_read).as_mut() {
             hook();
         }
-        let result = result.map(|(graph, stats)| {
-            let graph = Arc::new(graph);
-            *lock(&self.graph) = Arc::clone(&graph);
-            (graph, stats)
-        });
-        self.reindexing.store(false, Ordering::Relaxed);
-        let (graph, stats) = result?;
+        Ok((self.publish(graph), stats))
+    }
+
+    fn publish(&self, graph: Graph) -> Arc<Graph> {
+        let graph = Arc::new(graph);
+        *lock(&self.graph) = Arc::clone(&graph);
+        graph
+    }
+
+    /// Writes `graph` to disk unless a newer one was published meanwhile (it is saved
+    /// in its turn).
+    fn save(&self, graph: &Arc<Graph>) {
+        let _saving = lock(&self.saving);
+        if !Arc::ptr_eq(graph, &lock(&self.graph)) {
+            return;
+        }
         if let Err(e) = graph.save(&self.root) {
             eprintln!("codenav: could not save index: {e:#}");
         }
-        Ok(stats)
     }
 }
 
@@ -191,29 +246,8 @@ fn lock_facts(facts: &Mutex<FactsCache>) -> MutexGuard<'_, FactsCache> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexer::tests::TempRepo;
     use std::fs;
-
-    struct TempRepo(PathBuf);
-
-    impl TempRepo {
-        fn new(name: &str, files: &[(&str, &str)]) -> TempRepo {
-            let dir =
-                std::env::temp_dir().join(format!("codenav-live-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            for (path, src) in files {
-                let p = dir.join(path);
-                fs::create_dir_all(p.parent().unwrap()).unwrap();
-                fs::write(p, src).unwrap();
-            }
-            TempRepo(dir.canonicalize().unwrap())
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn live(repo: &TempRepo) -> Live {
         // Written in the millisecond the index starts, a file would count as changed.
@@ -229,11 +263,13 @@ mod tests {
 
     #[test]
     fn refresh_reindexes_only_when_sources_changed() {
-        let repo = TempRepo::new("refresh", &[("a.py", "def one():\n    pass\n")]);
+        let repo = TempRepo::new("live-refresh", &[("a.py", "def one():\n    pass\n")]);
         let live = live(&repo);
         assert!(!live.refresh().unwrap());
         std::thread::sleep(Duration::from_millis(10));
         fs::write(repo.0.join("a.py"), "def two():\n    pass\n").unwrap();
+        // An edit in the millisecond a re-index starts makes the next check re-index too.
+        std::thread::sleep(Duration::from_millis(5));
         assert!(live.refresh().unwrap());
         assert!(has(&live, "two") && !has(&live, "one"));
         assert!(!live.refresh().unwrap());
@@ -248,8 +284,41 @@ mod tests {
     }
 
     #[test]
+    fn a_new_commit_only_updates_the_git_state() {
+        let repo = TempRepo::new("live-commit", &[("a.py", "def one():\n    pass\n")]);
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.0)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q"]) || !git(&["add", "."]) || !git(&["commit", "-qm", "one"]) {
+            return; // no git here
+        }
+        let live = live(&repo);
+        let before = live.graph();
+        assert!(!live.refresh().unwrap());
+        assert!(git(&["commit", "-q", "--allow-empty", "-m", "two"]));
+        assert!(live.refresh().unwrap());
+        let after = live.graph();
+        assert_ne!(after.git_commit, before.git_commit);
+        assert_eq!(after.indexed_at_ms, before.indexed_at_ms, "not re-indexed");
+        assert!(!live.refresh().unwrap());
+    }
+
+    #[test]
     fn a_file_changed_during_a_reindex_triggers_another() {
-        let repo = TempRepo::new("during", &[("a.py", "def one():\n    pass\n")]);
+        let repo = TempRepo::new("live-during", &[("a.py", "def one():\n    pass\n")]);
         let live = live(&repo);
         std::thread::sleep(Duration::from_millis(10));
         fs::write(repo.0.join("a.py"), "def two():\n    pass\n").unwrap();
@@ -272,7 +341,7 @@ mod tests {
 
     #[test]
     fn the_worker_picks_up_changes_by_itself() {
-        let repo = TempRepo::new("worker", &[("a.py", "def one():\n    pass\n")]);
+        let repo = TempRepo::new("live-worker", &[("a.py", "def one():\n    pass\n")]);
         let opts = IndexOptions::default();
         let (graph, _) = indexer::index_with(&repo.0, &opts).unwrap();
         let live = Live::new(repo.0.clone(), graph, opts, true);
