@@ -28,6 +28,8 @@ use crate::vcs;
 pub const IGNORE_FILE: &str = ".codenavignore";
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_AMBIGUOUS: usize = 3;
+/// No node (a node without a file).
+const NONE: usize = usize::MAX;
 const SKIP_DIRS: &[&str] = &[
     INDEX_DIR,
     "node_modules",
@@ -246,11 +248,15 @@ impl CodenavIgnore {
 /// True when some source file changed after the graph was built (or files were added/removed),
 /// or the graph was built by an indexer with a different analysis.
 pub fn is_stale(root: &Path, graph: &Graph) -> bool {
+    is_stale_tree(graph, &scan(root))
+}
+
+/// `is_stale` on a scan the caller already made (to reuse it for re-indexing).
+pub fn is_stale_tree(graph: &Graph, tree: &Tree) -> bool {
     if graph.analysis != crate::graph::ANALYSIS_VERSION {
         return true;
     }
-    let tree = scan(root);
-    let files = tree.sources;
+    let files = &tree.sources;
     if files.len() != graph.by_file.len() || tree.manifests.len() != graph.manifest_files {
         return true;
     }
@@ -357,26 +363,128 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
 }
 
 pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats)> {
+    index_cached(root, opts, &mut FactsCache::default(), None, GitState::Full)
+}
+
+/// Facts extracted from each file, kept between indexing runs by the server so that only
+/// changed files are parsed again. Resolution and communities always run on every file's
+/// facts, so the graph is the same as a full index.
+#[derive(Default)]
+pub struct FactsCache {
+    files: HashMap<String, CachedFile>,
+}
+
+struct CachedFile {
+    modified: SystemTime,
+    len: u64,
+    facts: Result<FileFacts, String>,
+}
+
+impl FactsCache {
+    /// Parses every source file of `root` into the cache (used to warm it in the
+    /// background, so that the first incremental update only parses changed files).
+    pub fn fill(&mut self, root: &Path) {
+        let tree = scan(root);
+        let files = &tree.sources;
+        let parsed: Vec<(String, CachedFile)> = files
+            .par_iter()
+            .filter(|f| !self.files.contains_key(&f.rel))
+            .filter_map(|f| {
+                let meta = fs::metadata(&f.abs).ok()?;
+                let facts = fs::read(&f.abs)
+                    .map_err(|e| format!("{}: {e}", f.rel))
+                    .and_then(|src| {
+                        extract::extract(&f.rel, f.lang, &src)
+                            .map_err(|e| format!("{}: {e:#}", f.rel))
+                    });
+                Some((
+                    f.rel.clone(),
+                    CachedFile {
+                        modified: meta.modified().ok()?,
+                        len: meta.len(),
+                        facts,
+                    },
+                ))
+            })
+            .collect();
+        self.files.extend(parsed);
+    }
+}
+
+/// How to record the repository's Git state in a new graph.
+pub enum GitState<'g> {
+    /// Ask git (HEAD, uncommitted changes): a few tens of ms.
+    Full,
+    /// Incremental update of `previous`: if HEAD did not move, keep its Git fields, and
+    /// mark uncommitted changes when sources changed since (no `git status`).
+    Since(&'g Graph),
+}
+
+/// Indexes `root`, parsing only files that are new or changed since `cache` saw them (by
+/// modification time and size); `tree` is a scan of `root` if the caller already has one.
+pub fn index_cached(
+    root: &Path,
+    opts: &IndexOptions,
+    cache: &mut FactsCache,
+    tree: Option<Tree>,
+    git: GitState,
+) -> Result<(Graph, IndexStats)> {
     let started = Instant::now();
     // Timestamp taken before reading, so edits made during indexing count as stale.
     let started_at = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let tree = scan(root);
-    let files = tree.sources;
+    let tree = tree.unwrap_or_else(|| scan(root));
+    let files = &tree.sources;
 
-    let results: Vec<Result<FileFacts, String>> = files
-        .par_iter()
+    let stamps: Vec<Option<(SystemTime, u64)>> = files
+        .iter()
         .map(|f| {
-            let src = fs::read(&f.abs).map_err(|e| format!("{}: {e}", f.rel))?;
-            extract::extract(&f.rel, f.lang, &src).map_err(|e| format!("{}: {e:#}", f.rel))
+            fs::metadata(&f.abs)
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len())))
         })
         .collect();
+    let stale: Vec<usize> = (0..files.len())
+        .filter(|&k| {
+            let cached = cache.files.get(&files[k].rel);
+            !matches!((cached, stamps[k]), (Some(c), Some((m, l))) if c.modified == m && c.len == l)
+        })
+        .collect();
+    let parsed: Vec<(usize, Result<FileFacts, String>)> = stale
+        .par_iter()
+        .map(|&k| {
+            let f = &files[k];
+            let facts = fs::read(&f.abs)
+                .map_err(|e| format!("{}: {e}", f.rel))
+                .and_then(|src| {
+                    extract::extract(&f.rel, f.lang, &src).map_err(|e| format!("{}: {e:#}", f.rel))
+                });
+            (k, facts)
+        })
+        .collect();
+    let changed = !parsed.is_empty() || cache.files.len() != files.len();
+    for (k, facts) in parsed {
+        let (modified, len) = stamps[k].unwrap_or((UNIX_EPOCH, 0));
+        cache.files.insert(
+            files[k].rel.clone(),
+            CachedFile {
+                modified,
+                len,
+                facts,
+            },
+        );
+    }
+    // Forget removed files.
+    let present: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+    cache
+        .files
+        .retain(|path, _| present.contains(path.as_str()));
 
-    let mut facts = Vec::new();
+    let mut facts: Vec<&FileFacts> = Vec::with_capacity(files.len());
     let mut errors = Vec::new();
-    for r in results {
-        match r {
-            Ok(f) => facts.push(f),
-            Err(e) => errors.push(e),
+    for f in files {
+        match &cache.files[&f.rel].facts {
+            Ok(x) => facts.push(x),
+            Err(e) => errors.push(e.clone()),
         }
     }
 
@@ -385,7 +493,16 @@ pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats
     graph.indexed_at = started_at.as_secs();
     graph.indexed_at_ms = started_at.as_millis() as u64;
     graph.build_indexes();
-    vcs::record_state(&mut graph, root);
+    match git {
+        GitState::Since(previous) => {
+            graph.git_commit = previous.git_commit.clone();
+            graph.git_branch = previous.git_branch.clone();
+            graph.git_dirty = previous.git_dirty.map(|d| d || changed);
+            // HEAD moved (a commit, a checkout): ask git again.
+            vcs::refresh_state(&mut graph, root);
+        }
+        GitState::Full => vcs::record_state(&mut graph, root),
+    }
     communities::detect(&mut graph, opts.hub_percentile);
 
     let mut by_lang = HashMap::new();
@@ -409,13 +526,15 @@ pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats
 }
 
 struct Builder<'a> {
-    facts: &'a [FileFacts],
+    facts: &'a [&'a FileFacts],
     graph: Graph,
     /// file index -> file node
     file_nodes: Vec<usize>,
     file_by_path: HashMap<String, usize>,
     /// file index -> def index -> node
     def_nodes: Vec<Vec<usize>>,
+    /// file index -> def index -> index of the def it is nested in (syntactically)
+    def_parents: Vec<Vec<Option<usize>>>,
     /// file index -> impl index -> resolved owner type node and how sure that is
     impl_owner: Vec<Vec<Option<(usize, Confidence)>>>,
     /// member node -> confidence of its owner type, when the owner was not certain
@@ -424,10 +543,23 @@ struct Builder<'a> {
     names: HashMap<String, Vec<usize>>,
     /// definition node -> its byte range in its file
     def_ranges: HashMap<usize, (usize, usize)>,
+    /// node -> its file node, directory id and Rust crate id (`NONE` without a file),
+    /// so that resolution compares integers instead of paths
+    node_file: Vec<usize>,
+    node_dir: Vec<u32>,
+    node_crate: Vec<u32>,
+    /// node -> ids of its file's stem (`utils` for `src/utils.py`) and directory name,
+    /// with the maps from those names to ids (module qualifiers are compared by id)
+    node_stem: Vec<u32>,
+    node_dirname: Vec<u32>,
+    stem_ids: HashMap<String, u32>,
+    dirname_ids: HashMap<String, u32>,
     /// node (definition or file) -> byte ranges of the definitions nested directly in it
     child_ranges: HashMap<usize, Vec<(usize, usize)>>,
     /// file index -> name or qualifier -> byte offsets of the refs using it
-    mentions: Vec<HashMap<String, Vec<usize>>>,
+    /// file index -> (byte, name or qualifier) of its refs, sorted by byte; built on
+    /// first use (only files with common-method calls need it)
+    mentions: Vec<std::cell::OnceCell<Vec<(usize, &'a str)>>>,
     /// local npm packages: name -> index in `packages`, entry file
     npm_packages: HashMap<String, (usize, Option<usize>)>,
     /// local crates: name -> (module root directory, lib file)
@@ -443,6 +575,8 @@ struct Builder<'a> {
     dir_suffixes: HashMap<String, Vec<String>>,
     /// file node -> files it imports
     imported: HashMap<usize, HashSet<usize>>,
+    /// While resolving the references of one file: node -> is a file it imports
+    imports_file: Vec<bool>,
     externals: HashMap<String, usize>,
     edge_index: HashMap<(usize, usize, EdgeKind), usize>,
     lang_of_node: Vec<Lang>,
@@ -459,7 +593,7 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(root: &Path, facts: &'a [FileFacts], manifests: &[PathBuf]) -> Self {
+    fn new(root: &Path, facts: &'a [&'a FileFacts], manifests: &[PathBuf]) -> Self {
         Builder {
             facts,
             graph: Graph::new(root),
@@ -474,11 +608,20 @@ impl<'a> Builder<'a> {
             dirs: HashMap::new(),
             dir_suffixes: HashMap::new(),
             imported: HashMap::new(),
+            imports_file: Vec::new(),
             externals: HashMap::new(),
             edge_index: HashMap::new(),
             lang_of_node: Vec::new(),
             hidden: HashSet::new(),
             def_ranges: HashMap::new(),
+            node_file: Vec::new(),
+            node_dir: Vec::new(),
+            node_crate: Vec::new(),
+            node_stem: Vec::new(),
+            node_dirname: Vec::new(),
+            stem_ids: HashMap::new(),
+            dirname_ids: HashMap::new(),
+            def_parents: Vec::new(),
             child_ranges: HashMap::new(),
             mentions: Vec::new(),
             npm_packages: HashMap::new(),
@@ -493,7 +636,6 @@ impl<'a> Builder<'a> {
     fn build(mut self) -> Graph {
         self.add_files_and_defs();
         self.map_packages();
-        // Owners and base types are looked up in imported files too.
         self.collect_imported_files();
         self.resolve_owners();
         self.assign_ids();
@@ -548,12 +690,14 @@ impl<'a> Builder<'a> {
 
             // Defs are sorted by (start, -end): a stack yields the innermost container.
             let mut nodes = Vec::with_capacity(f.defs.len());
-            let mut stack: Vec<(usize, usize)> = Vec::new(); // (end_byte, node)
-            for d in &f.defs {
-                while stack.last().is_some_and(|&(end, _)| end <= d.start_byte) {
+            let mut stack: Vec<(usize, usize, usize)> = Vec::new(); // (end_byte, node, def index)
+            let mut parents = Vec::with_capacity(f.defs.len());
+            for (di, d) in f.defs.iter().enumerate() {
+                while stack.last().is_some_and(|&(end, _, _)| end <= d.start_byte) {
                     stack.pop();
                 }
-                let parent = stack.last().map(|&(_, n)| n).unwrap_or(file_node);
+                let parent = stack.last().map(|&(_, n, _)| n).unwrap_or(file_node);
+                parents.push(stack.last().map(|&(_, _, i)| i));
                 let mut kind = d.kind;
                 if kind == SymKind::Function
                     && (self.graph.nodes[parent].kind.is_type() || d.owner.is_some())
@@ -586,10 +730,11 @@ impl<'a> Builder<'a> {
                 if is_js && f.has_exports && !d.exported {
                     self.hidden.insert(node);
                 }
-                stack.push((d.end_byte, node));
+                stack.push((d.end_byte, node, di));
                 nodes.push(node);
             }
             self.def_nodes.push(nodes);
+            self.def_parents.push(parents);
             self.impl_owner.push(vec![None; f.impls.len()]);
         }
     }
@@ -1165,31 +1310,85 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Where each name and qualifier is used, per file, for `scope_mentions`.
+    /// Resets the per-file mention lists (built on first use by `names_in`).
     fn index_mentions(&mut self) {
-        self.mentions = self
-            .facts
-            .iter()
-            .map(|f| {
-                let mut m: HashMap<String, Vec<usize>> = HashMap::new();
-                for r in &f.refs {
-                    m.entry(r.name.clone()).or_default().push(r.byte);
-                    if let Some(q) = &r.qualifier {
-                        m.entry(q.clone()).or_default().push(r.byte);
-                    }
-                }
-                for v in m.values_mut() {
-                    v.sort_unstable();
-                }
-                m
-            })
+        self.mentions = (0..self.facts.len())
+            .map(|_| std::cell::OnceCell::new())
             .collect();
     }
 
+    /// Names and qualifiers used in file `fi` within `range`, outside `excluded`.
+    fn names_in<'s>(
+        &'s self,
+        fi: usize,
+        range: (usize, usize),
+        excluded: &'s [(usize, usize)],
+    ) -> impl Iterator<Item = &'a str> + 's {
+        let all = self.mentions[fi].get_or_init(|| {
+            let f: &'a FileFacts = self.facts[fi];
+            let mut v: Vec<(usize, &'a str)> = Vec::with_capacity(f.refs.len());
+            for r in &f.refs {
+                v.push((r.byte, r.name.as_str()));
+                if let Some(q) = &r.qualifier {
+                    v.push((r.byte, q.as_str()));
+                }
+            }
+            v.sort_unstable();
+            v
+        });
+        let from = all.partition_point(|&(b, _)| b < range.0);
+        all[from..]
+            .iter()
+            .take_while(move |&&(b, _)| b < range.1)
+            .filter(move |&&(b, _)| !excluded.iter().any(|&(s, e)| s <= b && b < e))
+            .map(|&(_, name)| name)
+    }
+
+    /// Fills `node_file`, `node_dir` and `node_crate` for every node.
+    fn locate_nodes(&mut self) {
+        let mut dirs: HashMap<String, u32> = HashMap::new();
+        let mut crates: HashMap<String, u32> = HashMap::new();
+        let intern = |map: &mut HashMap<String, u32>, key: String| -> u32 {
+            let next = map.len() as u32;
+            *map.entry(key).or_insert(next)
+        };
+        let mut stems: HashMap<String, u32> = HashMap::new();
+        let mut dirnames: HashMap<String, u32> = HashMap::new();
+        let n = self.graph.nodes.len();
+        let (mut file, mut dir, mut krate) = (vec![NONE; n], vec![u32::MAX; n], vec![u32::MAX; n]);
+        let (mut stem, mut dirname) = (vec![u32::MAX; n], vec![u32::MAX; n]);
+        for i in 0..n {
+            let path = &self.graph.nodes[i].file;
+            let Some(&f) = self.file_by_path.get(path) else {
+                continue;
+            };
+            file[i] = f;
+            dir[i] = intern(&mut dirs, parent_dir(path));
+            krate[i] = intern(&mut crates, crate_root(path));
+            let mut parts = path.rsplit('/');
+            let file_stem = parts.next().and_then(|f| f.split('.').next()).unwrap_or("");
+            stem[i] = intern(&mut stems, file_stem.to_string());
+            dirname[i] = intern(&mut dirnames, parts.next().unwrap_or("").to_string());
+        }
+        self.node_file = file;
+        self.node_dir = dir;
+        self.node_crate = krate;
+        self.node_stem = stem;
+        self.node_dirname = dirname;
+        self.stem_ids = stems;
+        self.dirname_ids = dirnames;
+    }
+
     fn resolve_refs(&mut self) {
+        self.locate_nodes();
         self.index_mentions();
+        self.imports_file = vec![false; self.graph.nodes.len()];
         for fi in 0..self.facts.len() {
-            let f = &self.facts[fi];
+            let f = self.facts[fi];
+            let imported = self.imported.get(&self.file_nodes[fi]).cloned();
+            for &file in imported.iter().flatten() {
+                self.imports_file[file] = true;
+            }
             for r in &f.refs {
                 // Most identifiers name nothing in the repo: skip them before the scope scan.
                 let Some(named) = self.names.get(&r.name) else {
@@ -1223,6 +1422,9 @@ impl<'a> Builder<'a> {
                     self.add_edge(scope, t, kind, r.line, conf, Some(fi));
                 }
             }
+            for &file in imported.iter().flatten() {
+                self.imports_file[file] = false;
+            }
         }
     }
 
@@ -1230,13 +1432,19 @@ impl<'a> Builder<'a> {
     /// block, else the file itself.
     fn scope_of(&self, fi: usize, byte: usize, kind: RefKind) -> Option<usize> {
         let f = &self.facts[fi];
-        let def = f
+        // Innermost def containing `byte`: the last one starting at or before it, or one
+        // of that def's ancestors (defs are sorted by start and properly nested).
+        let mut cand = f
             .defs
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.start_byte <= byte && byte < d.end_byte)
-            .max_by_key(|(_, d)| d.start_byte)
-            .map(|(i, d)| (self.def_nodes[fi][i], d.start_byte));
+            .partition_point(|d| d.start_byte <= byte)
+            .checked_sub(1);
+        while let Some(i) = cand {
+            if byte < f.defs[i].end_byte {
+                break;
+            }
+            cand = self.def_parents[fi][i];
+        }
+        let def = cand.map(|i| (self.def_nodes[fi][i], f.defs[i].start_byte));
         let imp = f
             .impls
             .iter()
@@ -1267,6 +1475,7 @@ impl<'a> Builder<'a> {
     ) -> (Vec<usize>, Confidence) {
         let none = (vec![], Confidence::Ambiguous);
         let family = self.facts[fi].lang.family();
+        let family_id = self.facts[fi].lang.family_id();
         let Some(all) = self.names.get(&r.name) else {
             return none;
         };
@@ -1274,7 +1483,7 @@ impl<'a> Builder<'a> {
             .iter()
             .copied()
             .filter(|&n| accept(self.graph.nodes[n].kind))
-            .filter(|&n| self.lang_of_node[n].family() == family)
+            .filter(|&n| self.lang_of_node[n].family_id() == family_id)
             .collect();
         if family == Lang::JavaScript.family() {
             cands.retain(|&n| self.js_visible(fi, scope, n, r));
@@ -1301,10 +1510,22 @@ impl<'a> Builder<'a> {
                 cands.retain(|&n| self.graph.nodes[n].kind == SymKind::Method);
                 risky = true;
             } else {
+                let path = r.qualifier_path.as_deref().unwrap_or(q);
+                let module_like = (
+                    // Rust: `crate::store::load()` is a path; `s.communities.len()` a field.
+                    r.is_static,
+                    // Others: `utils.f()`, or a dotted path the file imports (`pkg.utils.f()`).
+                    !path.contains(['.', ':', '(', '[', '-'])
+                        || self.facts[fi].imports.iter().any(|i| i.path == path),
+                );
+                let q_ids = (
+                    self.stem_ids.get(q).copied(),
+                    self.dirname_ids.get(q).copied(),
+                );
                 let matched: Vec<usize> = cands
                     .iter()
                     .copied()
-                    .filter(|&n| self.qualifier_matches(fi, n, q, r))
+                    .filter(|&n| self.qualifier_matches(n, q, module_like, q_ids))
                     .collect();
                 if !matched.is_empty() {
                     cands = matched;
@@ -1327,19 +1548,29 @@ impl<'a> Builder<'a> {
         // `x.len()`, `it.filter(…)` on an unknown receiver are almost always library
         // methods: link a same-named repo method only when the calling code names its
         // type (an annotation, `WGraph::new()`, a reference).
-        let mut evidenced = false;
-        if unknown_receiver && common {
-            evidenced = true;
-            cands.retain(|&n| {
+        // Applied to the few candidates each tier keeps, not to all of them (the result
+        // is the same: both are per-candidate filters).
+        // The evidence: the types (by node) whose names the scope uses.
+        let evidence: Option<Vec<usize>> = (unknown_receiver && common).then(|| {
+            let mut types: Vec<usize> = self
+                .scope_names(fi, scope)
+                .into_iter()
+                .filter_map(|name| self.names.get(name))
+                .flatten()
+                .copied()
+                .filter(|&t| self.graph.nodes[t].kind.is_type())
+                .collect();
+            types.sort_unstable();
+            types
+        });
+        let evidenced = evidence.is_some();
+        let named_nearby = |n: usize| -> bool {
+            evidence.as_ref().is_none_or(|types| {
                 self.graph.nodes[n]
                     .parent
-                    .filter(|&p| self.graph.nodes[p].kind.is_type())
-                    .is_some_and(|p| self.scope_mentions(fi, scope, &self.graph.nodes[p].name))
-            });
-            if cands.is_empty() {
-                return none;
-            }
-        }
+                    .is_some_and(|p| types.binary_search(&p).is_ok())
+            })
+        };
         // A unique match: `sure` when found where it should be (same or imported file) or
         // named by a qualifier; an unknown receiver lowers it, a common method name on an
         // unknown receiver is a guess.
@@ -1355,49 +1586,52 @@ impl<'a> Builder<'a> {
             }
         };
 
-        let file = &self.facts[fi].path;
         let file_node = self.file_nodes[fi];
-        let dir = parent_dir(file);
-        let imported = self.imported.get(&file_node);
+        let (dir, krate) = (self.node_dir[file_node], self.node_crate[file_node]);
         let is_rust = self.facts[fi].lang == Lang::Rust;
-        let krate = crate_root(file);
-        // (filter, a unique hit here is exact)
-        type Tier<'t> = (Box<dyn Fn(usize) -> bool + 't>, bool);
-        let tiers: [Tier; 4] = [
-            (Box::new(|n| &self.graph.nodes[n].file == file), true),
-            (
-                Box::new(|n| {
-                    imported.is_some_and(|set| {
-                        self.file_by_path
-                            .get(&self.graph.nodes[n].file)
-                            .is_some_and(|f| set.contains(f))
-                    })
-                }),
-                true,
-            ),
-            (
-                Box::new(|n| parent_dir(&self.graph.nodes[n].file) == dir),
-                false,
-            ),
-            (
-                Box::new(|n| is_rust && crate_root(&self.graph.nodes[n].file) == krate),
-                false,
-            ),
-        ];
-        for (tier, sure) in &tiers {
-            let hits: Vec<usize> = cands.iter().copied().filter(|&n| tier(n)).collect();
-            match hits.len() {
-                0 => continue,
-                1 => return (hits, unique(*sure, risky)),
-                k if k <= MAX_AMBIGUOUS => return (hits, Confidence::Ambiguous),
-                _ => return none,
+        // The nearest of: same file, an imported file (a unique hit there is exact), same
+        // directory, same Rust crate.
+        let tier_of = |n: usize| -> u8 {
+            let file = self.node_file[n];
+            if file == file_node {
+                0
+            } else if file != NONE && self.imports_file[file] {
+                1
+            } else if self.node_dir[n] == dir {
+                2
+            } else if is_rust && self.node_crate[n] == krate {
+                3
+            } else {
+                4
             }
+        };
+        let tiers: Vec<u8> = cands
+            .iter()
+            .map(|&n| if named_nearby(n) { tier_of(n) } else { 4 })
+            .collect();
+        let nearest = tiers.iter().copied().min().unwrap_or(4);
+        if nearest < 4 {
+            let hits: Vec<usize> = (0..cands.len())
+                .filter(|&k| tiers[k] == nearest)
+                .map(|k| cands[k])
+                .collect();
+            return match hits.len() {
+                1 => (hits, unique(nearest <= 1, risky)),
+                k if k <= MAX_AMBIGUOUS => (hits, Confidence::Ambiguous),
+                _ => none,
+            };
         }
 
         // Global fallback. Rust crates only see each other through imports, which we
         // resolve to externals, so a match in another crate is only a guess.
         if is_rust {
             risky = true;
+        }
+        if evidenced {
+            cands.retain(|&n| named_nearby(n));
+            if cands.is_empty() {
+                return none;
+            }
         }
         if risky && (common || cands.len() > 1) {
             return none;
@@ -1411,57 +1645,39 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Whether `name` is used in file `fi` within `range`, outside the `excluded` ranges.
-    fn mentioned_in(
-        &self,
-        fi: usize,
-        name: &str,
-        range: (usize, usize),
-        excluded: &[(usize, usize)],
-    ) -> bool {
-        let Some(bytes) = self.mentions[fi].get(name) else {
-            return false;
-        };
-        let from = bytes.partition_point(|&b| b < range.0);
-        bytes[from..]
-            .iter()
-            .take_while(|&&b| b < range.1)
-            .any(|&b| !excluded.iter().any(|&(s, e)| s <= b && b < e))
-    }
-
-    /// Code that belongs to `node` itself: its range without the definitions nested in it
-    /// (the whole file without its functions, a type without its methods: its fields).
-    fn own_code_mentions(&self, fi: usize, node: usize, name: &str) -> bool {
+    /// Names used in the code that belongs to `node` itself: its range without the
+    /// definitions nested in it (the whole file without its functions, a type without its
+    /// methods: its fields).
+    fn own_code_names(&self, fi: usize, node: usize, out: &mut HashSet<&'a str>) {
         let range = if node == self.file_nodes[fi] {
             (0, usize::MAX)
         } else if let Some(&r) = self.def_ranges.get(&node) {
             r
         } else {
-            return false;
+            return;
         };
         let excluded = self.child_ranges.get(&node).map_or(&[][..], Vec::as_slice);
-        self.mentioned_in(fi, name, range, excluded)
+        out.extend(self.names_in(fi, range, excluded));
     }
 
-    /// Whether the code around a reference in `scope` names `name` (as a type, a value, a
-    /// call or a qualifier like `Name::new()`): the scope's whole body when it is a
-    /// definition of this file (else its file's top-level code), and the fields of the
-    /// type it belongs to. Not the type's other methods.
-    fn scope_mentions(&self, fi: usize, scope: usize, name: &str) -> bool {
-        let in_scope = match self.def_ranges.get(&scope) {
-            Some(&r) if self.graph.nodes[scope].file == self.facts[fi].path => {
-                self.mentioned_in(fi, name, r, &[])
+    /// Names the code around a reference in `scope` uses (types, values, calls,
+    /// qualifiers like `Name::new()`): the scope's whole body when it is a definition of
+    /// this file (else its file's top-level code), and the fields of the type it belongs
+    /// to. Not the type's other methods.
+    fn scope_names(&self, fi: usize, scope: usize) -> HashSet<&'a str> {
+        let mut names = HashSet::new();
+        match self.def_ranges.get(&scope) {
+            Some(&r) if self.node_file[scope] == self.file_nodes[fi] => {
+                names.extend(self.names_in(fi, r, &[]));
             }
-            _ => self.own_code_mentions(fi, self.file_nodes[fi], name),
-        };
-        in_scope
-            || self.graph.nodes[scope]
-                .parent
-                .filter(|&p| {
-                    self.graph.nodes[p].kind.is_type()
-                        && self.graph.nodes[p].file == self.facts[fi].path
-                })
-                .is_some_and(|t| self.own_code_mentions(fi, t, name))
+            _ => self.own_code_names(fi, self.file_nodes[fi], &mut names),
+        }
+        if let Some(t) = self.graph.nodes[scope].parent.filter(|&p| {
+            self.graph.nodes[p].kind.is_type() && self.node_file[p] == self.file_nodes[fi]
+        }) {
+            self.own_code_names(fi, t, &mut names);
+        }
+        names
     }
 
     /// JS/TS module scoping: can code in file `fi`, inside `scope`, see definition `n`
@@ -1478,24 +1694,21 @@ impl<'a> Builder<'a> {
             return true;
         };
         let parent_kind = nodes[parent].kind;
-        if nodes[n].file == self.facts[fi].path {
+        if self.node_file[n] == self.file_nodes[fi] {
             return parent_kind == SymKind::File
                 || parent_kind.is_type()
                 || self.is_within(scope, parent);
         }
-        let Some(&file) = self.file_by_path.get(&nodes[n].file) else {
+        let file = self.node_file[n];
+        if file == NONE {
             return false;
-        };
-        let script = self.script_files.contains(&file);
+        }
         match parent_kind {
             SymKind::File => {
-                let imported = || {
-                    self.imported
-                        .get(&self.file_nodes[fi])
-                        .is_some_and(|set| set.contains(&file))
-                        || self.unresolved_imports[fi].contains(&r.name)
-                };
-                script || (!self.hidden.contains(&n) && (!bare || imported()))
+                let imported =
+                    || self.imports_file[file] || self.unresolved_imports[fi].contains(&r.name);
+                self.script_files.contains(&file)
+                    || (!self.hidden.contains(&n) && (!bare || imported()))
             }
             // A member: its owners up to the file must be types or namespaces, not functions.
             k if k.is_type() || k == SymKind::Module => {
@@ -1531,28 +1744,30 @@ impl<'a> Builder<'a> {
     /// (file) `q`, or in Go package (directory) `q`.
     /// A module or package qualifier is a single name: `utils.f()` (Python/JS), `store.F()`
     /// (Go), or a `::` path in Rust; `self.graph.len()` or a Rust field `x.items.len()`
-    /// names a value, whatever the file it happens to share its name with.
-    fn qualifier_matches(&self, fi: usize, n: usize, q: &str, r: &extract::Ref) -> bool {
+    /// names a value, whatever the file it happens to share its name with. `module_like`
+    /// is that judgement for the reference, computed once: (for Rust, for other languages).
+    /// `q_ids`: the ids of `q` as a file stem and as a directory name, if any file has one.
+    fn qualifier_matches(
+        &self,
+        n: usize,
+        q: &str,
+        module_like: (bool, bool),
+        q_ids: (Option<u32>, Option<u32>),
+    ) -> bool {
         let node = &self.graph.nodes[n];
         if node.parent.is_some_and(|p| self.graph.nodes[p].name == q) {
             return true;
         }
-        let path = r.qualifier_path.as_deref().unwrap_or(q);
         let module_like = if self.lang_of_node[n] == Lang::Rust {
-            // `crate::store::load()` is a path; `s.communities.len()` is a field.
-            r.is_static
+            module_like.0
         } else {
-            // `utils.f()`, or a dotted path the file imports (`pkg.utils.f()`).
-            !path.contains(['.', ':', '(', '[', '-'])
-                || self.facts[fi].imports.iter().any(|i| i.path == path)
+            module_like.1
         };
         if !module_like {
             return false;
         }
-        let mut parts = node.file.rsplit('/');
-        let file_stem = parts.next().and_then(|f| f.split('.').next());
-        let dir_name = parts.next();
-        file_stem == Some(q) || (self.facts_lang(n) == Some(Lang::Go) && dir_name == Some(q))
+        q_ids.0 == Some(self.node_stem[n])
+            || (self.facts_lang(n) == Some(Lang::Go) && q_ids.1 == Some(self.node_dirname[n]))
     }
 
     fn facts_lang(&self, n: usize) -> Option<Lang> {
@@ -1740,6 +1955,110 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The graph as JSON, without what depends on when it was built.
+    fn comparable(g: &Graph) -> serde_json::Value {
+        let mut v = serde_json::to_value(g).unwrap();
+        for key in [
+            "indexed_at",
+            "indexed_at_ms",
+            "git_commit",
+            "git_branch",
+            "git_dirty",
+        ] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        v
+    }
+
+    #[test]
+    fn incremental_index_equals_a_full_one() {
+        let repo = TempRepo::new(
+            "incremental",
+            &[
+                (
+                    "a.py",
+                    "def helper():\n    pass\n\ndef moved():\n    pass\n",
+                ),
+                (
+                    "b.py",
+                    "from a import helper, moved\n\ndef user():\n    helper()\n    moved()\n",
+                ),
+                ("c.py", "def gone():\n    pass\n"),
+                (
+                    "d.py",
+                    "from c import gone\n\ndef uses_gone():\n    gone()\n",
+                ),
+                ("old_name.py", "def renamed():\n    pass\n"),
+            ],
+        );
+        let opts = IndexOptions::default();
+        let mut cache = FactsCache::default();
+        index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
+
+        // Modify, add, remove, rename a file; move a symbol from a.py to e.py, whose
+        // callers in other files must follow.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(repo.0.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        fs::write(repo.0.join("e.py"), "def moved():\n    pass\n").unwrap();
+        fs::write(
+            repo.0.join("b.py"),
+            "from a import helper\nfrom e import moved\n\ndef user():\n    helper()\n    moved()\n",
+        )
+        .unwrap();
+        fs::remove_file(repo.0.join("c.py")).unwrap();
+        fs::rename(repo.0.join("old_name.py"), repo.0.join("new_name.py")).unwrap();
+
+        let (incremental, _) =
+            index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
+        let (full, _) = index_with(&repo.0, &opts).unwrap();
+        assert_eq!(comparable(&incremental), comparable(&full));
+        assert!(full.by_id.contains_key("e.py::moved") && !full.by_id.contains_key("c.py::gone"));
+        assert_eq!(cache.files.len(), 5, "removed files leave the cache");
+    }
+
+    #[test]
+    fn incremental_update_of_one_file_is_fast() {
+        // About the size of the repository in the issue: 360 files, thousands of edges.
+        let mut files: Vec<(String, String)> = Vec::new();
+        for i in 0..360 {
+            let mut src = format!(
+                "import {{ f{} }} from './m{}';\n",
+                (i + 1) % 360,
+                (i + 1) % 360
+            );
+            for j in 0..6 {
+                src.push_str(&format!(
+                    "export function f{i}_{j}(x: number) {{\n  return f{}(x) + {j};\n}}\n",
+                    (i + 1) % 360
+                ));
+            }
+            src.push_str(&format!(
+                "export function f{i}(x: number) {{ return x; }}\n"
+            ));
+            files.push((format!("src/m{i}.ts"), src));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let repo = TempRepo::new("incremental-speed", &refs);
+        let opts = IndexOptions::default();
+        let mut cache = FactsCache::default();
+        let (first, _) = index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(repo.0.join("src/m7.ts"), files[7].1.replace("+ 0", "+ 100")).unwrap();
+        let started = Instant::now();
+        let (_, stats) =
+            index_cached(&repo.0, &opts, &mut cache, None, GitState::Since(&first)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(stats.files, 360);
+        eprintln!("incremental update of one file in 360: {elapsed:?}");
+        // The target is for release builds; debug builds are several times slower.
+        let limit = if cfg!(debug_assertions) { 400 } else { 20 };
+        assert!(elapsed.as_millis() < limit, "{elapsed:?}");
     }
 
     #[test]

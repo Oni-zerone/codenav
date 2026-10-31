@@ -80,6 +80,17 @@ impl Lang {
         }
     }
 
+    /// `family()` as a number, for hot comparisons.
+    pub fn family_id(self) -> u8 {
+        match self {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => 0,
+            Lang::Rust => 1,
+            Lang::Python => 2,
+            Lang::Go => 3,
+            Lang::Swift => 4,
+        }
+    }
+
     pub const ALL: [Lang; 7] = [
         Lang::Rust,
         Lang::Python,
