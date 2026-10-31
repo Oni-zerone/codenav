@@ -1,6 +1,7 @@
 //! Which repository state an index was built from: the Git HEAD commit and branch, read
 //! straight from `.git` (no library), and whether there were uncommitted changes.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -159,18 +160,30 @@ pub fn record_state(g: &mut Graph, root: &Path) {
     g.git_dirty = dirty;
 }
 
+/// Whether the files `indexed` (paths relative to `root`) differ from HEAD, as recorded by
+/// `record_state` (git status: tens of ms, so the server runs it in the background after
+/// an incremental update). None outside a Git repository.
+pub fn dirty(root: &Path, indexed: &HashSet<String>) -> Option<bool> {
+    head(root)?;
+    uncommitted_changes(root, &|p| indexed.contains(p))
+}
+
 /// When only the repository state moved (a commit, checkout of the same files, reset
 /// --soft) the graph still matches the code: update its Git fields instead of re-indexing.
 /// Returns whether they changed (so the caller can save the graph).
 pub fn refresh_state(g: &mut Graph, root: &Path) -> bool {
-    let now = head(root);
-    let unchanged = now.as_ref().map(|h| &h.commit) == g.git_commit.as_ref()
-        && now.as_ref().and_then(|h| h.branch.as_ref()) == g.git_branch.as_ref();
-    if unchanged {
+    if !head_changed(g, root) {
         return false;
     }
     record_state(g, root);
     true
+}
+
+/// Whether HEAD (commit or branch) differs from the one recorded in `g` (reads `.git`).
+pub fn head_changed(g: &Graph, root: &Path) -> bool {
+    let now = head(root);
+    now.as_ref().map(|h| &h.commit) != g.git_commit.as_ref()
+        || now.as_ref().and_then(|h| h.branch.as_ref()) != g.git_branch.as_ref()
 }
 
 /// When and from which repository state the graph was built. `check_sources` also

@@ -117,7 +117,11 @@ Windows i pattern non distinguono maiuscole e minuscole, come fa git.
 
 L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, quindi non finisce
 nel versionamento). `serve` riusa l'indice se è aggiornato e, mentre gira, re-indicizza da solo
-quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`).
+quando i sorgenti cambiano (controllo ogni 20s; disattivabile con `--no-refresh`). Il re-index
+automatico rilegge solo i file modificati (i fatti estratti dagli altri restano in memoria) e
+ricalcola i collegamenti: il grafo è identico a quello di un `codenav index` completo, che resta
+il modo per ripartire da zero, come il tool `reindex`. Il salvataggio su disco avviene in
+background, così la prima chiamata dopo una modifica non lo aspetta.
 
 ## Estensione VS Code
 
@@ -146,7 +150,7 @@ aggiornamento automatico quando l'indice cambia.
 | `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base) |
 | `read_code` | Legge un intervallo di righe di un file del repo |
 | `list_projects` | Repository serviti (nome da passare come `project` a ogni tool), quale è il default e quali sono caricati |
-| `reindex` | Ricostruisce il grafo |
+| `reindex` | Ricostruisce il grafo da zero (rilegge tutti i file) |
 
 Tutti i tool che restituiscono dati strutturati rispondono di default in **testo compatto**
 (simile a YAML, senza virgolette e parentesi) tagliato a `token_budget` (default 2000, da 200 a
