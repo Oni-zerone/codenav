@@ -378,6 +378,22 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
     index_with(root, &IndexOptions::default())
 }
 
+/// JS/TS runtime objects whose uses become `references` edges to a node of their own,
+/// so "who uses localStorage" has an answer. Only names rarely given to local values
+/// (not `history`, `location`, nor `console`, used everywhere).
+const JS_GLOBAL_OBJECTS: &[&str] = &[
+    "localStorage",
+    "sessionStorage",
+    "indexedDB",
+    "document",
+    "window",
+    "navigator",
+    "globalThis",
+    "process",
+];
+/// JS/TS runtime functions whose calls become `calls` edges.
+const JS_GLOBAL_FUNCTIONS: &[&str] = &["fetch"];
+
 pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats)> {
     index_cached(root, opts, &mut FactsCache::default(), None)
 }
@@ -967,6 +983,49 @@ impl<'a> Builder<'a> {
         });
     }
 
+    /// Node of a runtime global (`localStorage`, `fetch`), created on first use.
+    fn runtime_global(&mut self, name: &str) -> usize {
+        let key = format!("global:{name}");
+        if let Some(&n) = self.externals.get(&key) {
+            return n;
+        }
+        let n = self.graph.nodes.len();
+        self.graph.nodes.push(Node {
+            id: key.clone(),
+            kind: SymKind::External,
+            name: name.to_string(),
+            file: String::new(),
+            lang: None,
+            line: 0,
+            end_line: 0,
+            signature: "runtime global".into(),
+            doc: None,
+            parent: None,
+            community: None,
+        });
+        self.lang_of_node.push(Lang::JavaScript); // unused for externals
+        self.externals.insert(key, n);
+        n
+    }
+
+    /// The JS/TS runtime global `r` uses, if any: `localStorage.getItem()`,
+    /// `window.localStorage.setItem()` (the most specific one), `fetch()`. Not when the
+    /// repository defines that name itself.
+    fn global_used<'r>(&self, r: &'r extract::Ref) -> Option<(&'r str, EdgeKind)> {
+        let (name, kind) = match r.qualifier_path.as_deref() {
+            Some(path) => (
+                path.rsplit('.')
+                    .find(|seg| JS_GLOBAL_OBJECTS.contains(seg))?,
+                EdgeKind::References,
+            ),
+            None => (
+                Some(r.name.as_str()).filter(|n| JS_GLOBAL_FUNCTIONS.contains(n))?,
+                EdgeKind::Calls,
+            ),
+        };
+        (!self.names.contains_key(name)).then_some((name, kind))
+    }
+
     fn external(&mut self, name: &str) -> usize {
         if let Some(&n) = self.externals.get(name) {
             return n;
@@ -1401,6 +1460,7 @@ impl<'a> Builder<'a> {
         self.imports_file = vec![false; self.graph.nodes.len()];
         for fi in 0..self.facts.len() {
             let f = self.facts[fi];
+            let is_js = f.lang.family() == Lang::JavaScript.family();
             let imported: Vec<usize> = self
                 .imported
                 .get(&self.file_nodes[fi])
@@ -1409,6 +1469,14 @@ impl<'a> Builder<'a> {
                 self.imports_file[file] = true;
             }
             for r in &f.refs {
+                if is_js
+                    && r.kind == RefKind::Call
+                    && let Some((global, kind)) = self.global_used(r)
+                    && let Some(scope) = self.scope_of(fi, r.byte, r.kind)
+                {
+                    let target = self.runtime_global(global);
+                    self.add_edge(scope, target, kind, r.line, Confidence::Exact, Some(fi));
+                }
                 // Most identifiers name nothing in the repo: skip them before the scope scan.
                 let Some(named) = self.names.get(&r.name) else {
                     continue;

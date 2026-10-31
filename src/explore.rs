@@ -108,7 +108,12 @@ impl Options<'_> {
 
 pub fn explore(g: &Graph, question: &str, seeds: &[String], opts: &Options) -> Result<String> {
     let terms = query_terms(question);
-    let scores = score_nodes(g, &symbol_terms(&terms), opts.embeddings);
+    let scores = score_nodes(
+        g,
+        &symbol_terms(&terms),
+        &identifier_terms(question),
+        opts.embeddings,
+    );
 
     let seeds: Vec<&str> = seeds
         .iter()
@@ -138,6 +143,25 @@ fn symbol_terms(terms: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
+
+/// Words of the question written as identifiers (`sessionStorage`, `user_id`), lowercase:
+/// the question names that exact thing.
+fn identifier_terms(question: &str) -> HashSet<String> {
+    question
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| {
+            let chars: Vec<char> = w.chars().collect();
+            w.trim_matches('_').contains('_')
+                || chars
+                    .windows(2)
+                    .any(|p| p[0].is_lowercase() && p[1].is_uppercase())
+        })
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// A name match of a term the question writes as an identifier weighs this much more.
+const IDENTIFIER_BOOST: f64 = 2.0;
 
 /// Lowercase terms of the question, without stop words.
 fn query_terms(question: &str) -> Vec<String> {
@@ -187,16 +211,18 @@ const NAME_MATCH: f64 = 2.0;
 /// A term matching a whole word of the doc comment.
 const DOC_WORD: f64 = 1.5;
 
-/// Two forms of one word: equal, or at least 5 letters long and alike up to the last
-/// letter of the shorter (`propagate` / `propagated`, `schede` / `scheda`), but not words
-/// that merely start alike (`context` / `content`, `interval` / `internal`).
+/// Two forms of one word: equal, or at least 5 letters long, alike up to the last letter
+/// of the shorter and at most 3 letters apart in length (`propagate` / `propagated`,
+/// `schede` / `scheda`), but not words that merely start alike (`context` / `content`,
+/// `interval` / `internal`) nor a word and a compound starting with it (`session` /
+/// `sessionstorage`).
 fn same_word(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
     let (la, lb) = (a.chars().count(), b.chars().count());
     let shorter = la.min(lb);
-    if shorter < 5 {
+    if shorter < 5 || la.abs_diff(lb) > 3 {
         return false;
     }
     let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
@@ -294,7 +320,12 @@ fn synonym_sets(g: &Graph, terms: &[String], embeddings: &Embeddings) -> Vec<Has
         .collect()
 }
 
-fn score_nodes(g: &Graph, terms: &[String], embeddings: Option<&Embeddings>) -> Scores {
+fn score_nodes(
+    g: &Graph,
+    terms: &[String],
+    identifiers: &HashSet<String>,
+    embeddings: Option<&Embeddings>,
+) -> Scores {
     let synonyms: Vec<HashSet<String>> = match embeddings {
         Some(e) => synonym_sets(g, terms, e),
         None => vec![HashSet::new(); terms.len()],
@@ -336,10 +367,13 @@ fn score_nodes(g: &Graph, terms: &[String], embeddings: Option<&Embeddings>) -> 
                     w = SYNONYM_IN_DOC;
                 }
             }
-            per_term[t][i] = w;
             if w >= DOC_WORD {
                 strong_terms[i].push(t);
             }
+            if w >= NAME_MATCH && identifiers.contains(term) {
+                w *= IDENTIFIER_BOOST;
+            }
+            per_term[t][i] = w;
         }
     }
     let mut best_by_term = Vec::new();
@@ -477,6 +511,17 @@ fn pick_seeds(
     for &best in scores.best_by_term.iter().flatten() {
         if !seeds.contains(&best) && seeds.len() < MAX_SEEDS {
             seeds.push(best);
+        }
+    }
+    // A runtime global (`localStorage`) stands for the code using it: start there too.
+    let users: Vec<usize> = seeds
+        .iter()
+        .filter(|&&s| g.nodes[s].id.starts_with("global:"))
+        .flat_map(|&s| g.in_edges[s].iter().map(|&e| g.edges[e].from))
+        .collect();
+    for user in users {
+        if !seeds.contains(&user) && seeds.len() < MAX_SEEDS {
+            seeds.push(user);
         }
     }
     // Say so when the starting points cover few of the question's terms.
@@ -794,6 +839,7 @@ mod tests {
         for (a, b) in [
             ("context", "content"),
             ("interval", "internal"),
+            ("session", "sessionstorage"),
             ("construct", "constant"),
             ("plan", "plans"),
         ] {

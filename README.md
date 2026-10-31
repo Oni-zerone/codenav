@@ -13,7 +13,10 @@ repo ──walk (.gitignore)──▶ tree-sitter parse (parallelo) ──▶ fa
 ```
 
 - **Nodi**: file, simboli (`class`, `struct`, `enum`, `interface` = trait/protocol, `type`,
-  `function`, `method`, `module`, `constant`, `macro`) e pacchetti esterni (`ext:requests`).
+  `function`, `method`, `module`, `constant`, `macro`), pacchetti esterni (`ext:requests`) e, in
+  JS/TS, le API globali del runtime usate dal codice (`global:localStorage`, `global:fetch`,
+  `document`, `window`, `navigator`, `sessionStorage`, `indexedDB`, `globalThis`, `process`), così
+  "chi usa localStorage" ha una risposta (`get_neighbors`, `explore`).
 - **Archi**: `contains`, `imports`, `calls`, `inherits` (extends/implements/conformance),
   `references` (uso di un tipo). Ogni arco ha un conteggio delle occorrenze, le righe in cui
   compare (per le chiamate `call_sites`, mostrate da `get_symbol`, `get_neighbors` ed `explore`)
