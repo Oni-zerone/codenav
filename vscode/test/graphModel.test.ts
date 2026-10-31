@@ -42,7 +42,8 @@ const all = (over: Partial<ViewParams>): ViewParams => ({
 test('parse rejects bad input and unsupported versions', () => {
   assert.throws(() => CodeGraph.parse('{'), GraphError);
   assert.throws(() => CodeGraph.parse('{"version":1}'), GraphError);
-  assert.throws(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 4 })), /version 4/);
+  assert.throws(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 5 })), /version 5/);
+  assert.doesNotThrow(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 4 })));
   assert.doesNotThrow(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 3 })));
   assert.doesNotThrow(() => CodeGraph.parse(JSON.stringify({ ...sample(), version: 2 })));
   assert.equal(CodeGraph.parse(JSON.stringify(sample())).size.files, 3);

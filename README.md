@@ -86,6 +86,7 @@ cargo install --path .
 codenav index [PATH]              # crea/aggiorna PATH/.codenav/graph.cnav
 codenav serve [PATH]...           # server MCP su stdio (più repository: il primo è il default)
 codenav tool <nome> '<json>' [PATH]  # invoca un tool MCP da terminale (anche --path PATH)
+codenav export [PATH]             # stampa il grafo salvato in JSON (PATH: repo o file .cnav)
 codenav ast <file>                # albero tree-sitter (per scrivere nuove query)
 ```
 
@@ -119,9 +120,9 @@ quindi una cartella esclusa si può sempre indicizzare passandola direttamente c
 Windows i pattern non distinguono maiuscole e minuscole, come fa git.
 
 L'indice viene salvato in `.codenav/` (che contiene un proprio `.gitignore`, quindi non finisce
-nel versionamento): `graph.cnav` in JSON, letto anche dall'estensione VS Code, e accanto
-`graph.bin`, una copia binaria che codenav carica per prima perché è più veloce (si rigenera da
-sola dal JSON se manca o è più vecchia). `codenav tool` controlla se ci sono sorgenti più recenti
+nel versionamento): `graph.cnav`, in un formato binario che si carica in pochi millisecondi. Per
+leggerlo o elaborarlo con altri strumenti, `codenav export` lo stampa in JSON. Gli indici JSON delle
+versioni precedenti vengono letti e riscritti nel nuovo formato al primo uso. `codenav tool` controlla se ci sono sorgenti più recenti
 dell'indice e in quel caso re-indicizza; con `--no-refresh` (o la variabile `CODENAV_NO_REFRESH`)
 salta il controllo, utile negli script che fanno molte chiamate di fila.
 

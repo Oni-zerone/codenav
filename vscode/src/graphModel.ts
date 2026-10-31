@@ -1,8 +1,8 @@
-// Pure model of `.codenav/graph.cnav` (JSON) and the views drawn by the webview.
+// Pure model of `.codenav/graph.cnav` (as JSON: see cnavFile.ts) and the views drawn by the webview.
 // No `vscode` import here, so it can be unit-tested with plain Node.
 
 /** Graph format versions this extension reads (v2 adds communities, v3 edge confidence). */
-export const SUPPORTED_VERSIONS = [1, 2, 3];
+export const SUPPORTED_VERSIONS = [1, 2, 3, 4];
 
 export type SymKind =
   | 'file' | 'external' | 'module' | 'class' | 'struct' | 'enum'

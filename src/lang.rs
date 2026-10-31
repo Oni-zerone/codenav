@@ -16,6 +16,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "indexer")]
 use tree_sitter::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,6 +46,7 @@ impl Lang {
         })
     }
 
+    #[cfg(feature = "indexer")]
     pub fn grammar(self) -> Language {
         match self {
             Lang::Rust => tree_sitter_rust::LANGUAGE.into(),

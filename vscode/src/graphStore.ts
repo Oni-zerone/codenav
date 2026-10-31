@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { cnavToJson } from './cnavFile';
 import { CodeGraph } from './graphModel';
 
 export const GRAPH_FILE = '.codenav/graph.cnav';
@@ -67,7 +68,7 @@ export class GraphStore implements vscode.Disposable {
     if (!p) {
       p = (async () => {
         const bytes = await vscode.workspace.fs.readFile(uri);
-        return CodeGraph.parse(Buffer.from(bytes).toString('utf8'));
+        return CodeGraph.parse(cnavToJson(bytes));
       })();
       this.cache.set(key, p);
       p.catch(() => this.cache.delete(key));

@@ -30,6 +30,17 @@ fn tool(name: &str, mut args: Value) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+/// The saved graph of `root`, through `codenav export`.
+fn exported(root: &Path) -> Value {
+    let out = codenav().arg("export").arg(root).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
 fn tool_text(name: &str, args: Value) -> (bool, String) {
     tool_text_in(fixture(), name, args)
 }
@@ -261,9 +272,7 @@ fn fixture_communities() -> (Value, Vec<(String, u64)>) {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let g: Value =
-        serde_json::from_slice(&std::fs::read(fixture().join(".codenav/graph.cnav")).unwrap())
-            .unwrap();
+    let g = exported(fixture());
     let mut nodes = Vec::new();
     for n in g["nodes"].as_array().unwrap() {
         match n["community"].as_u64() {
@@ -356,12 +365,7 @@ fn hub_percentile_is_kept_across_reindexing() {
         "hubpct",
         &[("a.py", "def f():\n    g()\n\ndef g():\n    pass\n".into())],
     );
-    let saved = || -> Value {
-        let g: Value =
-            serde_json::from_slice(&std::fs::read(repo.0.join(".codenav/graph.cnav")).unwrap())
-                .unwrap();
-        g["hub_percentile"].clone()
-    };
+    let saved = || -> Value { exported(&repo.0)["hub_percentile"].clone() };
     let run = |args: &[&str]| -> String {
         let out = codenav()
             .args(args)
@@ -990,7 +994,9 @@ fn indexes_from_an_older_analysis_are_rebuilt() {
     let out = codenav().arg("index").arg(&repo.0).output().unwrap();
     assert!(out.status.success());
     let path = repo.0.join(".codenav/graph.cnav");
-    let mut g: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Written back as JSON (version 3), the format older codenav versions saved.
+    let mut g = exported(&repo.0);
+    g["version"] = json!(3);
     assert!(g["analysis"].as_u64().unwrap() >= 1, "{}", g["analysis"]);
     g.as_object_mut().unwrap().remove("analysis");
     std::fs::write(&path, g.to_string()).unwrap();
