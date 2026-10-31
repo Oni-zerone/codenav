@@ -110,7 +110,7 @@ impl Live {
     pub fn reindex_full(&self) -> Result<IndexStats> {
         let mut facts = lock_facts(&self.shared.facts);
         *facts = FactsCache::default();
-        let (graph, stats) = self.shared.reindex(&mut facts, None)?;
+        let (graph, stats) = self.shared.reindex(&mut facts, None, None)?;
         drop(facts);
         self.shared.save(&graph);
         Ok(stats)
@@ -178,26 +178,27 @@ impl Shared {
         let tree = indexer::scan(&self.root);
         let scan = started.elapsed();
         let graph = if indexer::is_stale_tree(&current, &tree) {
-            self.reindex(&mut facts, Some(tree))?.0
+            // Published with the previous Git state; `git status` runs right after.
+            self.reindex(&mut facts, Some(tree), Some(&current))?.0
         } else if vcs::head_changed(&current, &self.root) {
-            // Same code, new commit: only the Git fields change.
-            let mut graph = Graph::clone(&current);
-            vcs::record_state(&mut graph, &self.root);
-            self.publish(graph)
+            current
         } else {
             return Ok((false, scan));
         };
         drop(facts);
+        let graph = self.update_git_state(graph);
         self.save(&graph);
         Ok((true, scan))
     }
 
     /// Re-indexes from the cached facts (parsing changed files) and publishes the graph.
     /// A file changed meanwhile is newer than the graph: the next check sees it.
+    /// `git_from`: copy the Git state from this graph instead of reading it.
     fn reindex(
         &self,
         facts: &mut FactsCache,
         tree: Option<indexer::Tree>,
+        git_from: Option<&Graph>,
     ) -> Result<(Arc<Graph>, IndexStats)> {
         struct Reindexing<'a>(&'a AtomicBool);
         impl Drop for Reindexing<'_> {
@@ -207,12 +208,30 @@ impl Shared {
         }
         self.reindexing.store(true, Ordering::Relaxed);
         let _reindexing = Reindexing(&self.reindexing);
-        let (graph, stats) = indexer::index_cached(&self.root, &self.index_options, facts, tree)?;
+        let (graph, stats) =
+            indexer::index_cached(&self.root, &self.index_options, facts, tree, git_from)?;
         #[cfg(test)]
         if let Some(hook) = lock(&self.after_read).as_mut() {
             hook();
         }
         Ok((self.publish(graph), stats))
+    }
+
+    /// Reads the Git state (HEAD, `git status`) and publishes `graph` with it if it
+    /// differs; returns the graph in place.
+    fn update_git_state(&self, graph: Arc<Graph>) -> Arc<Graph> {
+        let mut updated = Graph::clone(&graph);
+        vcs::record_state(&mut updated, &self.root);
+        let same = updated.git_commit == graph.git_commit
+            && updated.git_branch == graph.git_branch
+            && updated.git_dirty == graph.git_dirty;
+        // Not over a newer graph published meanwhile.
+        let mut latest = lock(&self.graph);
+        if same || !Arc::ptr_eq(&latest, &graph) {
+            return Arc::clone(&latest);
+        }
+        *latest = Arc::new(updated);
+        Arc::clone(&latest)
     }
 
     fn publish(&self, graph: Graph) -> Arc<Graph> {

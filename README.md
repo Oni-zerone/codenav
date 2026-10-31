@@ -275,9 +275,10 @@ capture convention in `lang.rs`, and possibly import resolution in `indexer.rs`.
 
 - Resolution by name: with very common names some calls stay unresolved or `ambiguous`. An
   optional integration with language servers (LSP/SCIP) would give compiler precision.
-- An update re-parses only the modified files, but recomputes the links of the whole repository
-  (tens of milliseconds on a few hundred files, in the background); resolving only what a change
-  affects would make it faster on large repositories.
+- An update re-parses only the modified files, but recomputes the links and communities of the
+  whole repository (about 17 ms for one file in a 360-file repository, 50 ms with 13k symbols, in
+  the background); resolving only what a change affects would make it faster on large
+  repositories.
 - HTTP (streamable) MCP transport for remote clients such as ChatGPT.
 - Semantic search over symbols and docs beyond word synonyms.
 - More languages: Java/Kotlin, C#, C/C++, Ruby, PHP.
