@@ -107,6 +107,8 @@ pub struct Server {
     clock: u64,
     /// Static word embeddings for explore's synonym matching (`--embeddings`).
     embeddings: Option<Embeddings>,
+    /// A shorter view of the last tool's result, for a text answer over its budget.
+    summary: Option<Value>,
 }
 
 impl Server {
@@ -133,6 +135,7 @@ impl Server {
             load_options: LoadOptions::default(),
             clock: 0,
             embeddings: None,
+            summary: None,
         }
     }
 
@@ -451,16 +454,17 @@ impl Server {
             anyhow::bail!("`{name}` always returns text; format=json is not supported");
         }
         let budget = token_budget(a)?;
-        Ok(match self.run_tool(name, a)? {
+        self.summary = None;
+        let v = self.run_tool(name, a)?;
+        let summary = self.summary.take();
+        Ok(match v {
             Value::String(text) => text,
             v if format == "json" => serde_json::to_string(&v)?,
-            // Too long: a summary first, so that what gets cut is the least important.
-            v if name == "impact_analysis" && !output::fits(&v, budget) => {
-                let (i, depth, limit, min) = impact_args(&self.cur.graph, a)?;
-                let summary = query::impact_summary(&self.cur.graph, i, depth, limit, min);
-                output::fit_value(&summary, budget, hint)
-            }
-            v => output::fit_value(&v, budget, hint),
+            v => match output::whole_value(&v, budget) {
+                Some(text) => text,
+                // Too long: the tool's summary, if it has one, so what gets cut matters least.
+                None => output::fit_value(summary.as_ref().unwrap_or(&v), budget, hint),
+            },
         })
     }
 
@@ -651,8 +655,12 @@ impl Server {
                 Ok(query::file_outline(g, file))
             }
             "impact_analysis" => {
-                let (i, depth, limit, min) = impact_args(g, a)?;
-                Ok(query::impact(g, i, depth, limit, min))
+                let i = query::resolve(g, &string(a, "id")?)?;
+                let depth = uint(a, "depth", 3)?.clamp(1, 8) as u32;
+                let limit = uint(a, "limit", 200)?;
+                let impact = query::impact_of(g, i, depth, min_confidence(a)?);
+                self.summary = Some(impact.summary(g, limit));
+                Ok(impact.full(g, limit))
             }
             "diff_impact" => {
                 let staged = opt_bool(a, "staged")?.unwrap_or(false);
@@ -758,16 +766,6 @@ impl Server {
             _ => Err(anyhow!("unknown tool `{name}`")),
         }
     }
-}
-
-/// impact_analysis arguments: target, depth, limit, minimum confidence.
-fn impact_args(g: &Graph, a: &Value) -> Result<(usize, u32, usize, Confidence)> {
-    Ok((
-        query::resolve(g, &string(a, "id")?)?,
-        uint(a, "depth", 3)?.clamp(1, 8) as u32,
-        uint(a, "limit", 200)?,
-        min_confidence(a)?,
-    ))
 }
 
 fn token_budget(a: &Value) -> Result<usize> {

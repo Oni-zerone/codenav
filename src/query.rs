@@ -724,165 +724,229 @@ fn dependent_label(g: &Graph, &(n, d, k, conf): &Dependent) -> String {
 }
 
 /// Directories listed at most in an impact summary: deeper ones are merged into their
-/// parents (`src/app/**`) until they fit.
+/// parents (`src/app/**`) until they fit, then the smallest go into `others`.
 const MAX_SUMMARY_DIRS: usize = 20;
 
-/// `impact` for a text answer too long for its budget: the whole picture first (counts
-/// per directory, the tests involved, every direct dependent), then the detail per file,
-/// closest first, which is what gets cut.
-pub fn impact_summary(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
+/// What depends on a target: the seeds considered and every dependent, closest first.
+pub struct Impact {
+    start: usize,
+    members: usize,
+    overridden: Vec<(usize, Confidence)>,
+    hits: Vec<Dependent>,
+}
+
+pub fn impact_of(g: &Graph, start: usize, depth: u32, min: Confidence) -> Impact {
     let (mut seeds, overridden) = change_seeds(g, start, min);
     seeds.extend(&overridden);
-    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
-    let hits = dependents(g, &seeds, depth, min);
-    let files: BTreeSet<&str> = hits.iter().map(|h| g.nodes[h.0].file.as_str()).collect();
-    let mut out = json!({
-        "target": summary(g, start),
-        "members_considered": seed_set.len(),
-    });
-    if !overridden.is_empty() {
-        out["overridden_members"] = json!(
-            overridden
-                .iter()
-                .map(|&(m, conf)| match conf.label() {
-                    Some(l) => format!("{} ({l})", g.nodes[m].id),
-                    None => g.nodes[m].id.clone(),
-                })
-                .collect::<Vec<_>>()
-        );
+    let members = seeds.iter().map(|&(s, _)| s).collect::<HashSet<_>>().len();
+    Impact {
+        start,
+        members,
+        overridden,
+        hits: dependents(g, &seeds, depth, min),
     }
-    out["affected_symbols"] = json!(
-        hits.iter()
-            .filter(|h| g.nodes[h.0].kind != SymKind::File)
-            .count()
-    );
-    out["affected_files"] = json!(files.len());
-    out["truncated"] = json!(hits.len() > limit);
-    out["note"] = json!(
-        "summary first (too long for the budget): directories, tests and direct dependents are \
-         complete; the per-file detail after them is cut"
-    );
+}
 
-    // Directories, at the deepest level that keeps them few.
+impl Impact {
+    /// The fields both views share; files are those of the first `limit` dependents.
+    fn head(&self, g: &Graph, limit: usize) -> Value {
+        let mut out = json!({
+            "target": summary(g, self.start),
+            "members_considered": self.members,
+        });
+        if !self.overridden.is_empty() {
+            out["overridden_members"] = json!(
+                self.overridden
+                    .iter()
+                    .map(|&(m, conf)| match conf.label() {
+                        Some(l) => format!("{} ({l})", g.nodes[m].id),
+                        None => g.nodes[m].id.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        out["affected_symbols"] = json!(
+            self.hits
+                .iter()
+                .filter(|h| g.nodes[h.0].kind != SymKind::File)
+                .count()
+        );
+        let files: HashSet<&str> = self
+            .hits
+            .iter()
+            .take(limit)
+            .map(|h| g.nodes[h.0].file.as_str())
+            .collect();
+        out["affected_files"] = json!(files.len());
+        out["truncated"] = json!(self.hits.len() > limit);
+        out
+    }
+
+    /// Every dependent (up to `limit`), grouped by file.
+    pub fn full(&self, g: &Graph, limit: usize) -> Value {
+        let mut out = self.head(g, limit);
+        out["by_file"] = json!(dependents_by_file(g, &self.hits, limit));
+        out
+    }
+
+    /// For a text answer too long for its budget: the whole picture first (counts per
+    /// directory, the tests involved, the direct dependents), then the indirect ones
+    /// file by file, closest first, which is what gets cut. Over the same first `limit`
+    /// dependents as `full`.
+    pub fn summary(&self, g: &Graph, limit: usize) -> Value {
+        let hits = &self.hits[..self.hits.len().min(limit)];
+        let mut out = self.head(g, limit);
+        out["note"] = json!(
+            "summary first (too long for the budget): directories, tests, then direct and \
+             indirect dependents; what is cut is at the end"
+        );
+        out["by_directory"] = by_directory(g, hits);
+        let mut tests: Vec<&str> = hits
+            .iter()
+            .map(|h| g.nodes[h.0].file.as_str())
+            .filter(|f| crate::tests_for::is_test_file(f))
+            .collect();
+        tests.sort_unstable();
+        tests.dedup();
+        out["test_files"] = json!(tests);
+
+        // Direct dependents one line per file, by relation: `called_by: f, g; imported_by:
+        // (file)`, grouped by directory so its path is not repeated.
+        let (direct, indirect): (Vec<&Dependent>, Vec<&Dependent>) =
+            hits.iter().partition(|h| h.1 == 1);
+        // An import of the file says nothing more when symbols of that file are listed.
+        let with_symbols: HashSet<&str> = direct
+            .iter()
+            .filter(|h| g.nodes[h.0].kind != SymKind::File)
+            .map(|h| g.nodes[h.0].file.as_str())
+            .collect();
+        let mut by_how: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for &&(n, _, kind, conf) in &direct {
+            let node = &g.nodes[n];
+            if node.kind == SymKind::File && with_symbols.contains(node.file.as_str()) {
+                continue;
+            }
+            let name = if node.kind == SymKind::File {
+                "(file)".to_string()
+            } else {
+                g.qualified_name(n)
+            };
+            let how = match conf.label() {
+                Some(l) => format!("{} ({l})", kind.inverse_str()),
+                None => kind.inverse_str().to_string(),
+            };
+            by_how
+                .entry(node.file.as_str())
+                .or_default()
+                .entry(how)
+                .or_default()
+                .push(name);
+        }
+        let mut direct_by_dir: BTreeMap<&str, BTreeMap<&str, String>> = BTreeMap::new();
+        for (file, hows) in by_how {
+            let line: Vec<String> = hows
+                .into_iter()
+                .map(|(how, names)| format!("{how}: {}", names.join(", ")))
+                .collect();
+            let (dir, name) = file.rsplit_once('/').unwrap_or((".", file));
+            direct_by_dir
+                .entry(dir)
+                .or_default()
+                .insert(name, line.join("; "));
+        }
+        out["direct_dependents"] = json!(direct_by_dir);
+        let mut indirect_by_file = serde_json::Map::new();
+        for h in indirect {
+            if let Some(list) = indirect_by_file
+                .entry(g.nodes[h.0].file.clone())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+            {
+                list.push(json!(dependent_label(g, h)));
+            }
+        }
+        out["indirect_by_file"] = Value::Object(indirect_by_file);
+        out
+    }
+}
+
+/// Files and symbols per directory, at the deepest level that keeps the directories at
+/// most `MAX_SUMMARY_DIRS` (`dir/**` when a group holds deeper files too), largest first.
+fn by_directory(g: &Graph, hits: &[Dependent]) -> Value {
+    let files: BTreeSet<&str> = hits.iter().map(|h| g.nodes[h.0].file.as_str()).collect();
     let max_depth = files
         .iter()
         .map(|f| f.matches('/').count())
         .max()
         .unwrap_or(0);
-    let mut level = max_depth;
-    let group = |file: &str, level: usize| -> String {
-        let dir = component(file, level);
-        if level < file.matches('/').count() {
-            format!("{dir}/**")
-        } else {
-            dir
-        }
-    };
-    while level > 1
-        && files
+    let groups_at = |level: usize| {
+        files
             .iter()
-            .map(|f| group(f, level))
+            .map(|f| component(f, level))
             .collect::<HashSet<_>>()
             .len()
-            > MAX_SUMMARY_DIRS
-    {
+    };
+    let mut level = max_depth.max(1);
+    while level > 1 && groups_at(level) > MAX_SUMMARY_DIRS {
         level -= 1;
     }
-    let mut dirs: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // Per group: files, symbols, whether it holds files deeper than the group.
+    let mut groups: BTreeMap<String, (usize, usize, bool)> = BTreeMap::new();
     for f in &files {
-        dirs.entry(group(f, level)).or_default().0 += 1;
+        let group = groups.entry(component(f, level)).or_default();
+        group.0 += 1;
+        group.2 |= f.matches('/').count() > level;
     }
     for h in hits.iter().filter(|h| g.nodes[h.0].kind != SymKind::File) {
-        dirs.entry(group(&g.nodes[h.0].file, level)).or_default().1 += 1;
+        groups
+            .entry(component(&g.nodes[h.0].file, level))
+            .or_default()
+            .1 += 1;
     }
-    let mut dirs: Vec<(String, (usize, usize))> = dirs.into_iter().collect();
-    dirs.sort_by(|a, b| (b.1).0.cmp(&(a.1).0).then(a.0.cmp(&b.0)));
-    let mut by_dir = serde_json::Map::new();
-    for (dir, (nf, ns)) in dirs {
-        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
-        by_dir.insert(
-            dir,
-            json!(format!("{}, {}", plural(nf, "file"), plural(ns, "symbol"))),
+    let mut groups: Vec<(String, (usize, usize, bool))> = groups.into_iter().collect();
+    groups.sort_by(|a, b| (b.1).0.cmp(&(a.1).0).then(a.0.cmp(&b.0)));
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let mut out = serde_json::Map::new();
+    let shown = if groups.len() > MAX_SUMMARY_DIRS {
+        MAX_SUMMARY_DIRS - 1
+    } else {
+        groups.len()
+    };
+    for (dir, (nf, ns, deeper)) in &groups[..shown] {
+        let label = if *deeper {
+            format!("{dir}/**")
+        } else {
+            dir.clone()
+        };
+        out.insert(
+            label,
+            json!(format!(
+                "{}, {}",
+                plural(*nf, "file"),
+                plural(*ns, "symbol")
+            )),
         );
     }
-    out["by_directory"] = Value::Object(by_dir);
-    let tests: Vec<&str> = files
-        .iter()
-        .copied()
-        .filter(|f| crate::tests_for::is_test_file(f))
-        .collect();
-    out["test_files"] = json!(tests);
-
-    // Direct dependents in full; then the rest, file by file, closest first.
-    let (direct, deeper): (Vec<&Dependent>, Vec<&Dependent>) = hits.iter().partition(|h| h.1 == 1);
-    // One line per file, names only: `(file)` for an import of it.
-    let mut direct_by_file: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for &&(n, _, _, conf) in &direct {
-        let node = &g.nodes[n];
-        let mut name = if node.kind == SymKind::File {
-            "(file)".to_string()
-        } else {
-            g.qualified_name(n)
-        };
-        if let Some(l) = conf.label() {
-            name.push_str(&format!(" ({l})"));
-        }
-        direct_by_file
-            .entry(node.file.as_str())
-            .or_default()
-            .push(name);
+    if groups.len() > shown {
+        let rest = &groups[shown..];
+        let nf: usize = rest.iter().map(|(_, (f, _, _))| f).sum();
+        let ns: usize = rest.iter().map(|(_, (_, s, _))| s).sum();
+        out.insert(
+            "others".into(),
+            json!(format!(
+                "{} in {} directories, {}",
+                plural(nf, "file"),
+                rest.len(),
+                plural(ns, "symbol")
+            )),
+        );
     }
-    out["direct_dependents"] = json!(
-        direct_by_file
-            .into_iter()
-            .map(|(f, names)| (f, names.join(", ")))
-            .collect::<BTreeMap<_, _>>()
-    );
-    let mut deeper_by_file = serde_json::Map::new();
-    for h in deeper.into_iter().take(limit.saturating_sub(direct.len())) {
-        let file = &g.nodes[h.0].file;
-        if !deeper_by_file.contains_key(file) {
-            deeper_by_file.insert(file.clone(), json!([]));
-        }
-        if let Some(Value::Array(list)) = deeper_by_file.get_mut(file) {
-            list.push(json!(dependent_label(g, h)));
-        }
-    }
-    out["indirect_by_file"] = Value::Object(deeper_by_file);
-    out
+    Value::Object(out)
 }
 
-pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
-    let (mut seeds, overridden) = change_seeds(g, start, min);
-    seeds.extend(&overridden);
-    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
-    let hits = dependents(g, &seeds, depth, min);
-    let by_file = dependents_by_file(g, &hits, limit);
-    let mut out = json!({
-        "target": summary(g, start),
-        "members_considered": seed_set.len(),
-    });
-    // Listed before `by_file` so a text output cut to the budget keeps it.
-    if !overridden.is_empty() {
-        out["overridden_members"] = json!(
-            overridden
-                .iter()
-                .map(|&(m, conf)| match conf.label() {
-                    Some(l) => format!("{} ({l})", g.nodes[m].id),
-                    None => g.nodes[m].id.clone(),
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-    out["affected_symbols"] = json!(
-        hits.iter()
-            .filter(|h| g.nodes[h.0].kind != SymKind::File)
-            .count()
-    );
-    out["affected_files"] = json!(by_file.len());
-    out["truncated"] = json!(hits.len() > limit);
-    out["by_file"] = json!(by_file);
-    out
+#[cfg(test)]
+fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
+    impact_of(g, start, depth, min).full(g, limit)
 }
 
 /// Methods with the same name as method `m` in the supertypes of its type, nearest

@@ -2722,10 +2722,18 @@ fn impact_too_long_for_the_budget_starts_with_a_summary() {
     assert!(text.contains("test_files: [test/dates.test.ts]"), "{text}");
     for i in 0..96 {
         assert!(
-            text.contains(&format!("renderPage{i}")),
+            text.contains(&format!("called_by: renderPage{i}")),
             "renderPage{i}: {text}"
         );
     }
+    // `limit` bounds the summary too.
+    let (_, limited) = tool_text_in(
+        &repo.0,
+        "impact_analysis",
+        json!({ "id": "src/lib/dates.ts", "limit": 10, "token_budget": 200 }),
+    );
+    assert!(limited.contains("truncated: true"), "{limited}");
+    assert!(!limited.contains("renderPage20 "), "{limited}");
     // JSON keeps its shape.
     let (ok, json_text) = tool_text_in(
         &repo.0,
