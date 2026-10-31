@@ -8,6 +8,7 @@ mod graph;
 mod indexer;
 mod insights;
 mod lang;
+mod live;
 mod mcp;
 mod output;
 mod packages;
