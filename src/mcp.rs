@@ -1,6 +1,7 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0), exposing the code
 //! graph as tools. Logs go to stderr: stdout is reserved for protocol messages.
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -58,6 +59,9 @@ struct State {
     facts: Arc<Mutex<FactsCache>>,
     /// The last background save, joined before the next one and on drop.
     saving: Option<JoinHandle<()>>,
+    /// `git status` after an incremental update (whose `git_dirty` is an estimate):
+    /// applied to the graph once done.
+    git_check: Option<JoinHandle<Option<bool>>>,
 }
 
 impl State {
@@ -65,12 +69,12 @@ impl State {
     fn new(root: PathBuf, graph: Graph, index_options: IndexOptions, warm: bool) -> State {
         let facts = Arc::new(Mutex::new(FactsCache::default()));
         // Warm the cache: the first refresh then parses only what changed. A refresh
-        // started meanwhile waits for the lock.
+        // started meanwhile waits for the lock. Skipped if the project is dropped first.
         if warm {
-            let (facts, root) = (Arc::clone(&facts), root.clone());
+            let (facts, root) = (Arc::downgrade(&facts), root.clone());
             std::thread::spawn(move || {
-                if let Ok(mut cache) = facts.lock() {
-                    cache.fill(&root);
+                if let Some(facts) = facts.upgrade() {
+                    lock_facts(&facts).fill(&root);
                 }
             });
         }
@@ -82,6 +86,29 @@ impl State {
             last_stale_check: Instant::now(),
             facts,
             saving: None,
+            git_check: None,
+        }
+    }
+
+    /// Applies a finished background `git status` to the graph (and saves it) if it
+    /// changes `git_dirty`.
+    fn apply_git_check(&mut self) {
+        if !self.git_check.as_ref().is_some_and(JoinHandle::is_finished) {
+            return;
+        }
+        let Some(Ok(dirty)) = self.git_check.take().map(JoinHandle::join) else {
+            return;
+        };
+        if dirty == self.graph.git_dirty {
+            return;
+        }
+        if let Some(saving) = self.saving.take() {
+            let _ = saving.join();
+        }
+        // Only the save thread shares the graph, and it is done.
+        if let Some(graph) = Arc::get_mut(&mut self.graph) {
+            graph.git_dirty = dirty;
+            self.save_in_background();
         }
     }
 
@@ -101,10 +128,7 @@ impl State {
     /// Re-indexes, parsing only files changed since the cached facts (all of them when
     /// `full`), and saves in the background.
     fn reindex(&mut self, tree: Option<indexer::Tree>, full: bool) -> Result<indexer::IndexStats> {
-        let mut cache = self
-            .facts
-            .lock()
-            .map_err(|_| anyhow!("facts cache poisoned"))?;
+        let mut cache = lock_facts(&self.facts);
         if full {
             *cache = FactsCache::default();
         }
@@ -118,8 +142,23 @@ impl State {
         drop(cache);
         self.graph = Arc::new(graph);
         self.save_in_background();
+        if !full {
+            let root = self.root.clone();
+            let files: HashSet<String> = self.graph.by_file.keys().cloned().collect();
+            self.git_check = Some(std::thread::spawn(move || vcs::dirty(&root, &files)));
+        }
         Ok(stats)
     }
+}
+
+/// The facts cache, emptied if a panic left it poisoned (it may be partly updated).
+fn lock_facts(facts: &Mutex<FactsCache>) -> std::sync::MutexGuard<'_, FactsCache> {
+    facts.lock().unwrap_or_else(|poisoned| {
+        facts.clear_poison();
+        let mut cache = poisoned.into_inner();
+        *cache = FactsCache::default();
+        cache
+    })
 }
 
 impl Drop for State {
@@ -460,22 +499,22 @@ impl Server {
         })
     }
 
-    fn refresh_if_stale(&mut self) {
+    /// Refreshes if the last check is old enough; returns whether it checked.
+    fn refresh_if_stale(&mut self) -> Result<bool> {
         if !self.auto_refresh || self.cur.last_stale_check.elapsed() < STALE_CHECK_INTERVAL {
-            return;
+            return Ok(false);
         }
         self.cur.last_stale_check = Instant::now();
-        self.refresh_now();
+        self.refresh_now()?;
+        Ok(true)
     }
 
     /// Re-indexes the active project incrementally if its sources changed (one scan, only
     /// changed files parsed), else updates its Git state if HEAD moved.
-    fn refresh_now(&mut self) {
+    fn refresh_now(&mut self) -> Result<()> {
         let tree = indexer::scan(&self.cur.root);
         if indexer::is_stale_tree(&self.cur.graph, &tree) {
-            if let Err(e) = self.cur.reindex(Some(tree), false) {
-                eprintln!("codenav: re-index failed: {e:#}");
-            }
+            self.cur.reindex(Some(tree), false)?;
         } else if vcs::head_changed(&self.cur.graph, &self.cur.root) {
             // Same code, new commit: update the Git fields in place (after any save).
             if let Some(saving) = self.cur.saving.take() {
@@ -487,12 +526,11 @@ impl Server {
                     self.cur.save_in_background();
                 }
                 None => {
-                    if let Err(e) = self.cur.reindex(Some(tree), false) {
-                        eprintln!("codenav: re-index failed: {e:#}");
-                    }
+                    self.cur.reindex(Some(tree), false)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn reindex(&mut self) -> Result<Value> {
@@ -543,11 +581,16 @@ impl Server {
         if name == "list_projects" {
             return Ok(json!({ "projects": self.list_projects() }));
         }
-        self.refresh_if_stale();
+        self.cur.apply_git_check();
+        let checked = self.refresh_if_stale();
         // diff_impact matches diff lines to the graph's: it must reflect the current files.
         if name == "diff_impact" {
-            self.cur.last_stale_check = Instant::now();
-            self.refresh_now();
+            if !checked? {
+                self.cur.last_stale_check = Instant::now();
+                self.refresh_now()?;
+            }
+        } else if let Err(e) = checked {
+            eprintln!("codenav: re-index failed: {e:#}");
         }
         if name == "insights" {
             let key = (

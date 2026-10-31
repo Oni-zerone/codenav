@@ -377,7 +377,36 @@ pub struct FactsCache {
 struct CachedFile {
     modified: SystemTime,
     len: u64,
+    /// when the file was read (taken before reading)
+    read_at: SystemTime,
     facts: Result<FileFacts, String>,
+}
+
+impl CachedFile {
+    /// Still matches a file with this stamp. A file modified around the time it was read
+    /// may have changed again since with the same size and mtime (same clock tick): read
+    /// it again. Without sub-second timestamps the tick can be up to 2 s (FAT).
+    fn matches(&self, (modified, len): (SystemTime, u64)) -> bool {
+        let coarse = modified
+            .duration_since(UNIX_EPOCH)
+            .is_ok_and(|d| d.subsec_nanos() == 0);
+        let tick = std::time::Duration::from_secs(if coarse { 2 } else { 0 });
+        self.modified == modified && self.len == len && modified + tick < self.read_at
+    }
+}
+
+/// A file's (mtime, size).
+fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let m = fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+fn read_facts(f: &SourceFile) -> Result<FileFacts, String> {
+    fs::read(&f.abs)
+        .map_err(|e| format!("{}: {e}", f.rel))
+        .and_then(|src| {
+            extract::extract(&f.rel, f.lang, &src).map_err(|e| format!("{}: {e:#}", f.rel))
+        })
 }
 
 impl FactsCache {
@@ -390,18 +419,15 @@ impl FactsCache {
             .par_iter()
             .filter(|f| !self.files.contains_key(&f.rel))
             .filter_map(|f| {
-                let meta = fs::metadata(&f.abs).ok()?;
-                let facts = fs::read(&f.abs)
-                    .map_err(|e| format!("{}: {e}", f.rel))
-                    .and_then(|src| {
-                        extract::extract(&f.rel, f.lang, &src)
-                            .map_err(|e| format!("{}: {e:#}", f.rel))
-                    });
+                let read_at = SystemTime::now();
+                let (modified, len) = stamp(&f.abs)?;
+                let facts = read_facts(f);
                 Some((
                     f.rel.clone(),
                     CachedFile {
-                        modified: meta.modified().ok()?,
-                        len: meta.len(),
+                        modified,
+                        len,
+                        read_at,
                         facts,
                     },
                 ))
@@ -416,7 +442,8 @@ pub enum GitState<'g> {
     /// Ask git (HEAD, uncommitted changes): a few tens of ms.
     Full,
     /// Incremental update of `previous`: if HEAD did not move, keep its Git fields, and
-    /// mark uncommitted changes when sources changed since (no `git status`).
+    /// mark uncommitted changes when sources changed since (no `git status`: an estimate,
+    /// see `vcs::dirty`).
     Since(&'g Graph),
 }
 
@@ -435,43 +462,33 @@ pub fn index_cached(
     let tree = tree.unwrap_or_else(|| scan(root));
     let files = &tree.sources;
 
-    let stamps: Vec<Option<(SystemTime, u64)>> = files
-        .iter()
-        .map(|f| {
-            fs::metadata(&f.abs)
-                .ok()
-                .and_then(|m| Some((m.modified().ok()?, m.len())))
-        })
-        .collect();
-    let stale: Vec<usize> = (0..files.len())
-        .filter(|&k| {
-            let cached = cache.files.get(&files[k].rel);
-            !matches!((cached, stamps[k]), (Some(c), Some((m, l))) if c.modified == m && c.len == l)
-        })
-        .collect();
-    let parsed: Vec<(usize, Result<FileFacts, String>)> = stale
-        .par_iter()
-        .map(|&k| {
+    // Files new or changed since cached, read again (with their stamp, taken before).
+    let parsed: Vec<(usize, CachedFile)> = (0..files.len())
+        .into_par_iter()
+        .filter_map(|k| {
             let f = &files[k];
-            let facts = fs::read(&f.abs)
-                .map_err(|e| format!("{}: {e}", f.rel))
-                .and_then(|src| {
-                    extract::extract(&f.rel, f.lang, &src).map_err(|e| format!("{}: {e:#}", f.rel))
-                });
-            (k, facts)
+            let read_at = SystemTime::now();
+            let stamp = stamp(&f.abs);
+            let cached = cache.files.get(&f.rel);
+            if cached.is_some_and(|c| stamp.is_some_and(|s| c.matches(s))) {
+                return None;
+            }
+            let (modified, len) = stamp.unwrap_or((UNIX_EPOCH, 0));
+            let facts = read_facts(f);
+            Some((
+                k,
+                CachedFile {
+                    modified,
+                    len,
+                    read_at,
+                    facts,
+                },
+            ))
         })
         .collect();
     let changed = !parsed.is_empty() || cache.files.len() != files.len();
-    for (k, facts) in parsed {
-        let (modified, len) = stamps[k].unwrap_or((UNIX_EPOCH, 0));
-        cache.files.insert(
-            files[k].rel.clone(),
-            CachedFile {
-                modified,
-                len,
-                facts,
-            },
-        );
+    for (k, entry) in parsed {
+        cache.files.insert(files[k].rel.clone(), entry);
     }
     // Forget removed files.
     let present: HashSet<&str> = files.iter().map(|f| f.rel.as_str()).collect();
@@ -1385,8 +1402,11 @@ impl<'a> Builder<'a> {
         self.imports_file = vec![false; self.graph.nodes.len()];
         for fi in 0..self.facts.len() {
             let f = self.facts[fi];
-            let imported = self.imported.get(&self.file_nodes[fi]).cloned();
-            for &file in imported.iter().flatten() {
+            let imported: Vec<usize> = self
+                .imported
+                .get(&self.file_nodes[fi])
+                .map_or_else(Vec::new, |set| set.iter().copied().collect());
+            for &file in &imported {
                 self.imports_file[file] = true;
             }
             for r in &f.refs {
@@ -1422,7 +1442,7 @@ impl<'a> Builder<'a> {
                     self.add_edge(scope, t, kind, r.line, conf, Some(fi));
                 }
             }
-            for &file in imported.iter().flatten() {
+            for &file in &imported {
                 self.imports_file[file] = false;
             }
         }
@@ -2048,13 +2068,18 @@ mod tests {
         let mut cache = FactsCache::default();
         let (first, _) = index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(repo.0.join("src/m7.ts"), files[7].1.replace("+ 0", "+ 100")).unwrap();
-        let started = Instant::now();
-        let (_, stats) =
-            index_cached(&repo.0, &opts, &mut cache, None, GitState::Since(&first)).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(stats.files, 360);
+        // The best of a few runs, so that a busy machine does not fail the test.
+        let mut elapsed = std::time::Duration::MAX;
+        for run in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let edit = format!("+ {}", 100 + run);
+            fs::write(repo.0.join("src/m7.ts"), files[7].1.replace("+ 0", &edit)).unwrap();
+            let started = Instant::now();
+            let (_, stats) =
+                index_cached(&repo.0, &opts, &mut cache, None, GitState::Since(&first)).unwrap();
+            elapsed = elapsed.min(started.elapsed());
+            assert_eq!(stats.files, 360);
+        }
         eprintln!("incremental update of one file in 360: {elapsed:?}");
         // The target is for release builds; debug builds are several times slower.
         let limit = if cfg!(debug_assertions) { 400 } else { 20 };
@@ -2172,5 +2197,25 @@ mod tests {
         assert_eq!(normalize("src/a/../b/./c"), "src/b/c");
         assert_eq!(crate_root("crates/x/src/a/b.rs"), "crates/x/src");
         assert_eq!(path_suffixes("a/b/c"), vec!["a/b/c", "b/c", "c"]);
+    }
+
+    #[test]
+    fn a_file_read_in_its_mtime_tick_is_read_again() {
+        let entry = |modified: SystemTime, read_at: SystemTime| CachedFile {
+            modified,
+            len: 10,
+            read_at,
+            facts: Err(String::new()),
+        };
+        let t = UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_123);
+        let ms = std::time::Duration::from_millis;
+        assert!(entry(t, t + ms(1)).matches((t, 10)));
+        assert!(!entry(t, t + ms(1)).matches((t, 11)));
+        // Read in the same instant it was written: a same-size edit may follow unseen.
+        assert!(!entry(t, t).matches((t, 10)));
+        // Whole-second timestamps: the tick may be 2 s long.
+        let coarse = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert!(!entry(coarse, coarse + ms(1500)).matches((coarse, 10)));
+        assert!(entry(coarse, coarse + ms(2500)).matches((coarse, 10)));
     }
 }

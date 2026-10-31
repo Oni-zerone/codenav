@@ -1,6 +1,7 @@
 //! Which repository state an index was built from: the Git HEAD commit and branch, read
 //! straight from `.git` (no library), and whether there were uncommitted changes.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -157,6 +158,14 @@ pub fn record_state(g: &mut Graph, root: &Path) {
     g.git_commit = head.as_ref().map(|h| h.commit.clone());
     g.git_branch = head.and_then(|h| h.branch);
     g.git_dirty = dirty;
+}
+
+/// Whether the files `indexed` (paths relative to `root`) differ from HEAD, as recorded by
+/// `record_state` (git status: tens of ms, so the server runs it in the background after
+/// an incremental update). None outside a Git repository.
+pub fn dirty(root: &Path, indexed: &HashSet<String>) -> Option<bool> {
+    head(root)?;
+    uncommitted_changes(root, &|p| indexed.contains(p))
 }
 
 /// When only the repository state moved (a commit, checkout of the same files, reset
