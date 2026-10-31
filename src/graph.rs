@@ -16,17 +16,21 @@ const GRAPH_FILE: &str = "graph.cnav";
 /// Name used before the switch to `.cnav`; removed on save so stale copies don't linger.
 const LEGACY_GRAPH_FILE: &str = "graph.json";
 /// Binary copy of `graph.cnav`, saved next to it and read first: it loads several times
-/// faster. `graph.cnav` stays JSON for other readers (the VS Code extension).
+/// faster. `graph.cnav` stays JSON for other readers (the VS Code extension). The copy
+/// records the size and modification time of the JSON file it was made with, and is
+/// used only while that file is still the one in place.
 const BINARY_FILE: &str = "graph.bin";
 const BINARY_MAGIC: &[u8; 8] = b"CNAVBIN\0";
-/// Changes with the sources of the serialized types, so a binary copy written by another
-/// build is never misread (the JSON is read instead, and the copy rewritten).
+/// Changes with the sources of the serialized types and the dependency versions (the
+/// encoding), so a binary copy written by another build is never misread: the JSON is
+/// read instead, and the copy rewritten.
 const BINARY_LAYOUT: u64 = {
-    let sources: [&str; 4] = [
+    let sources: [&str; 5] = [
         include_str!("graph.rs"),
         include_str!("communities.rs"),
         include_str!("lang.rs"),
         include_str!("packages.rs"),
+        include_str!("../Cargo.lock"),
     ];
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut s = 0;
@@ -402,13 +406,30 @@ pub fn dir_of(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
-/// Writes through a temporary file, so readers never see a partial file.
-fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
+/// Writes through a temporary file, so readers never see a partial file. Returns the
+/// file's stamp (taken before the rename, so it is this content's).
+fn write_atomically(path: &Path, data: &[u8]) -> Result<Option<[u8; 20]>> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     fs::write(&tmp, data)?;
+    let stamp = file_stamp(Path::new(&tmp));
     fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(stamp)
+}
+
+/// Size and modification time (to the nanosecond) of a file.
+fn file_stamp(path: &Path) -> Option<[u8; 20]> {
+    let meta = fs::metadata(path).ok()?;
+    let since = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut stamp = [0; 20];
+    stamp[..8].copy_from_slice(&meta.len().to_le_bytes());
+    stamp[8..16].copy_from_slice(&since.as_secs().to_le_bytes());
+    stamp[16..].copy_from_slice(&since.subsec_nanos().to_le_bytes());
+    Some(stamp)
 }
 
 fn default_hub_percentile() -> f64 {
@@ -424,6 +445,9 @@ impl Graph {
             #[serde(default = "default_hub_percentile")]
             hub_percentile: f64,
         }
+        if let Some(g) = Self::load_binary(root) {
+            return Some(g.hub_percentile);
+        }
         let data = fs::read(Self::index_path(root)).ok()?;
         let h: Header = serde_json::from_slice(&data).ok()?;
         (h.version == FORMAT_VERSION).then_some(h.hub_percentile)
@@ -436,6 +460,9 @@ impl Graph {
             version: u32,
             #[serde(default)]
             packages: Vec<crate::packages::PackageRef>,
+        }
+        if let Some(g) = Self::load_binary(root) {
+            return g.packages;
         }
         fs::read(Self::index_path(root))
             .ok()
@@ -472,9 +499,13 @@ impl Graph {
             fs::write(&ignore, "*\n")?;
         }
         let path = Self::index_path(root);
-        write_atomically(&path, &serde_json::to_vec(self)?)?;
-        // After the JSON: a binary copy older than it is ignored.
-        self.save_binary(root)?;
+        let stamp = write_atomically(&path, &serde_json::to_vec(self)?)?;
+        // Only an optimization: the JSON is the index.
+        if let Some(stamp) = stamp
+            && let Err(e) = self.save_binary(root, stamp)
+        {
+            eprintln!("codenav: could not save the binary index: {e:#}");
+        }
         let _ = fs::remove_file(dir.join(LEGACY_GRAPH_FILE));
         Ok(path)
     }
@@ -483,7 +514,8 @@ impl Graph {
         root.join(INDEX_DIR).join(BINARY_FILE)
     }
 
-    fn save_binary(&self, root: &Path) -> Result<()> {
+    /// `json`: the stamp of the JSON file this graph was written to or read from.
+    fn save_binary(&self, root: &Path, json: [u8; 20]) -> Result<()> {
         struct Writing;
         impl Drop for Writing {
             fn drop(&mut self) {
@@ -494,22 +526,21 @@ impl Graph {
         let writing = Writing;
         let mut data = BINARY_MAGIC.to_vec();
         data.extend(BINARY_LAYOUT.to_le_bytes());
+        data.extend(json);
         bincode::serialize_into(&mut data, self)?;
         drop(writing);
-        write_atomically(&Self::binary_path(root), &data)
+        write_atomically(&Self::binary_path(root), &data)?;
+        Ok(())
     }
 
-    /// The binary copy, if it is as recent as the JSON and written by this build.
+    /// The binary copy, if it was made from the JSON file in place, by this build.
     fn load_binary(root: &Path) -> Option<Graph> {
-        let json_time = fs::metadata(Self::index_path(root)).ok()?.modified().ok()?;
-        let path = Self::binary_path(root);
-        if fs::metadata(&path).ok()?.modified().ok()? < json_time {
-            return None;
-        }
-        let data = fs::read(&path).ok()?;
+        let json = file_stamp(&Self::index_path(root))?;
+        let data = fs::read(Self::binary_path(root)).ok()?;
         let body = data
             .strip_prefix(BINARY_MAGIC.as_slice())?
-            .strip_prefix(BINARY_LAYOUT.to_le_bytes().as_slice())?;
+            .strip_prefix(BINARY_LAYOUT.to_le_bytes().as_slice())?
+            .strip_prefix(json.as_slice())?;
         bincode::deserialize::<Graph>(body)
             .ok()
             .filter(|g| g.version == FORMAT_VERSION)
@@ -520,6 +551,9 @@ impl Graph {
             Some(g) => g,
             None => {
                 let path = Self::index_path(root);
+                // Before reading: if the file is replaced meanwhile, the stamp is the old
+                // one's and the binary copy made below is not used.
+                let stamp = file_stamp(&path);
                 let data =
                     fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
                 let g: Graph = serde_json::from_slice(&data)?;
@@ -529,7 +563,9 @@ impl Graph {
                     g.version
                 );
                 // Next time, load the binary copy.
-                if let Err(e) = g.save_binary(root) {
+                if let Some(stamp) = stamp
+                    && let Err(e) = g.save_binary(root, stamp)
+                {
                     eprintln!("codenav: could not save the binary index: {e:#}");
                 }
                 g
@@ -685,5 +721,47 @@ mod tests {
         assert!(Graph::load_binary(&root).is_none());
         assert_eq!(json(&Graph::load(&root).unwrap()), json(&g));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_binary_copy_of_a_replaced_json_is_ignored() {
+        let root = std::env::temp_dir().join(format!("codenav-unit-rep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut g = sample(&root);
+        g.save(&root).unwrap();
+        // Another writer (e.g. an older codenav) replaces only the JSON, even in the same
+        // second and with the binary copy newer on disk.
+        let binary = fs::read(Graph::binary_path(&root)).unwrap();
+        g.git_commit = Some("def".into());
+        fs::write(Graph::index_path(&root), serde_json::to_vec(&g).unwrap()).unwrap();
+        fs::write(Graph::binary_path(&root), binary).unwrap();
+        assert!(Graph::load_binary(&root).is_none());
+        assert_eq!(
+            Graph::load(&root).unwrap().git_commit.as_deref(),
+            Some("def")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The binary copy has no field names: a field left out would shift the next ones.
+    /// Every `skip_serializing_if` of a serialized type must use an `omit_` helper.
+    #[test]
+    fn serialized_types_skip_fields_only_through_omit_helpers() {
+        for source in [
+            include_str!("graph.rs"),
+            include_str!("communities.rs"),
+            include_str!("lang.rs"),
+            include_str!("packages.rs"),
+        ] {
+            let pattern = concat!("skip_serializing_if", " = \"");
+            for (i, _) in source.match_indices(pattern) {
+                let helper = &source[i + pattern.len()..];
+                assert!(
+                    helper.starts_with("omit_"),
+                    "{}",
+                    &helper[..30.min(helper.len())]
+                );
+            }
+        }
     }
 }

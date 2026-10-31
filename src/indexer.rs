@@ -303,11 +303,11 @@ pub fn load_or_index(
     check_sources: bool,
 ) -> Result<(Graph, IndexOptions)> {
     let index_path = Graph::index_path(root);
-    let opts = if force || !index_path.exists() {
+    let (opts, tree) = if force || !index_path.exists() {
         if !force {
             eprintln!("codenav: no index found, indexing {}…", root.display());
         }
-        index_options(root, requested)
+        (index_options(root, requested), None)
     } else {
         // The scan for changed sources runs while the graph loads.
         let (loaded, tree) = std::thread::scope(|s| {
@@ -339,15 +339,15 @@ pub fn load_or_index(
                     }
                     return Ok((g, opts));
                 }
-                opts
+                (opts, tree)
             }
             Err(e) => {
                 eprintln!("codenav: cannot use the saved index ({e:#}), re-indexing…");
-                index_options(root, requested)
+                (index_options(root, requested), tree)
             }
         }
     };
-    let (graph, stats) = index_with(root, &opts)?;
+    let (graph, stats) = index_cached(root, &opts, &mut FactsCache::default(), tree)?;
     eprintln!(
         "codenav: {} files, {} symbols, {} edges, {} communities ({:.2?})",
         stats.files, stats.symbols, stats.edges, stats.communities, stats.elapsed
@@ -426,6 +426,10 @@ fn read_facts(f: &SourceFile) -> Result<FileFacts, String> {
 }
 
 impl FactsCache {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
     /// Parses every source file of `root` into the cache (used to warm it in the
     /// background, so that the first incremental update only parses changed files).
     pub fn fill(&mut self, root: &Path) {

@@ -156,10 +156,8 @@ fn main() -> Result<()> {
                 fresh,
                 hub_percentile: opts.hub_percentile,
             };
-            // With auto-refresh, changes since the last index are picked up in the
-            // background right after startup.
             let (graph, opts) =
-                indexer::load_or_index(&roots[0], fresh, opts.hub_percentile, no_refresh)?;
+                indexer::load_or_index(&roots[0], fresh, opts.hub_percentile, true)?;
             let mut server = mcp::Server::new(roots[0].clone(), graph, !no_refresh, opts);
             server.set_load_options(load);
             for root in &roots[1..] {
@@ -188,6 +186,7 @@ fn main() -> Result<()> {
             let no_refresh = no_refresh || std::env::var_os("CODENAV_NO_REFRESH").is_some();
             let (graph, opts) = indexer::load_or_index(&root, false, None, !no_refresh)?;
             let mut server = mcp::Server::new(root, graph, false, opts);
+            server.set_source_check(!no_refresh);
             // Only explore uses them, and only after the arguments are known to be valid.
             if name == "explore" {
                 server.set_embeddings(load_embeddings(embeddings.as_deref())?);
