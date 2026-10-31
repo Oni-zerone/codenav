@@ -379,8 +379,8 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
 }
 
 /// JS/TS runtime objects whose uses become `references` edges to a node of their own,
-/// so "who uses localStorage" has an answer. Only names rarely given to local values
-/// (not `history`, `location`, nor `console`, used everywhere).
+/// so "who uses localStorage" has an answer. Not `history`, `location` (often names of
+/// other things) nor `console` (used everywhere).
 const JS_GLOBAL_OBJECTS: &[&str] = &[
     "localStorage",
     "sessionStorage",
@@ -391,6 +391,8 @@ const JS_GLOBAL_OBJECTS: &[&str] = &[
     "globalThis",
     "process",
 ];
+/// Objects holding the globals: `window.localStorage` is `localStorage`.
+const JS_GLOBAL_HOSTS: &[&str] = &["window", "globalThis", "self"];
 /// JS/TS runtime functions whose calls become `calls` edges.
 const JS_GLOBAL_FUNCTIONS: &[&str] = &["fetch"];
 
@@ -985,66 +987,76 @@ impl<'a> Builder<'a> {
 
     /// Node of a runtime global (`localStorage`, `fetch`), created on first use.
     fn runtime_global(&mut self, name: &str) -> usize {
-        let key = format!("global:{name}");
-        if let Some(&n) = self.externals.get(&key) {
+        let id = format!("global:{name}");
+        if let Some(&n) = self.externals.get(&id) {
             return n;
         }
-        let n = self.graph.nodes.len();
-        self.graph.nodes.push(Node {
-            id: key.clone(),
-            kind: SymKind::External,
-            name: name.to_string(),
-            file: String::new(),
-            lang: None,
-            line: 0,
-            end_line: 0,
-            signature: "runtime global".into(),
-            doc: None,
-            parent: None,
-            community: None,
-        });
-        self.lang_of_node.push(Lang::JavaScript); // unused for externals
-        self.externals.insert(key, n);
+        let n = self.external_node(id.clone(), name, "runtime global");
+        self.externals.insert(id, n);
         n
     }
 
-    /// The JS/TS runtime global `r` uses, if any: `localStorage.getItem()`,
-    /// `window.localStorage.setItem()` (the most specific one), `fetch()`. Not when the
-    /// repository defines that name itself.
-    fn global_used<'r>(&self, r: &'r extract::Ref) -> Option<(&'r str, EdgeKind)> {
-        let (name, kind) = match r.qualifier_path.as_deref() {
-            Some(path) => (
-                path.rsplit('.')
-                    .find(|seg| JS_GLOBAL_OBJECTS.contains(seg))?,
-                EdgeKind::References,
-            ),
-            None => (
-                Some(r.name.as_str()).filter(|n| JS_GLOBAL_FUNCTIONS.contains(n))?,
-                EdgeKind::Calls,
-            ),
+    /// The JS/TS runtime global the call `r` in file `fi` uses, if any, and the edge to
+    /// it: `localStorage.getItem()`, `window.sessionStorage.setItem()` (references to the
+    /// object), `fetch()` or `window.fetch()` (a call). Only from the root of the chain
+    /// (`vscode.window.show()` is no use of `window`), and not when that root is a local
+    /// binding, an import or a top-level definition of the file.
+    fn global_used<'r>(&self, fi: usize, r: &'r extract::Ref) -> Option<(&'r str, EdgeKind)> {
+        if r.local_root {
+            return None;
+        }
+        let path: Vec<&str> = r
+            .qualifier_path
+            .as_deref()
+            .map(|p| p.split('.').map(|s| s.trim_end_matches('?')).collect())
+            .unwrap_or_default();
+        let host = |s: &str| JS_GLOBAL_HOSTS.contains(&s);
+        let object = |s: &str| JS_GLOBAL_OBJECTS.contains(&s);
+        let function = |s: &str| JS_GLOBAL_FUNCTIONS.contains(&s);
+        let (global, kind) = match path.as_slice() {
+            [] if function(&r.name) => (r.name.as_str(), EdgeKind::Calls),
+            [h] if host(h) && function(&r.name) => (r.name.as_str(), EdgeKind::Calls),
+            [h, o, ..] if host(h) && object(o) => (*o, EdgeKind::References),
+            [o, ..] if object(o) => (*o, EdgeKind::References),
+            _ => return None,
         };
-        (!self.names.contains_key(name)).then_some((name, kind))
+        let root = path.first().copied().unwrap_or(global);
+        let f = self.facts[fi];
+        let file_node = self.file_nodes[fi];
+        let shadowed = f.import_bindings.iter().any(|(name, _)| name == root)
+            || f.imports.iter().any(|i| i.names.iter().any(|n| n == root))
+            || self.names.get(root).is_some_and(|defs| {
+                defs.iter()
+                    .any(|&d| self.graph.nodes[d].parent == Some(file_node))
+            });
+        (!shadowed).then_some((global, kind))
+    }
+
+    /// A node outside the repository (a package, a runtime global).
+    fn external_node(&mut self, id: String, name: &str, signature: &str) -> usize {
+        self.push_node(
+            Node {
+                id,
+                kind: SymKind::External,
+                name: name.to_string(),
+                file: String::new(),
+                lang: None,
+                line: 0,
+                end_line: 0,
+                signature: signature.to_string(),
+                doc: None,
+                parent: None,
+                community: None,
+            },
+            Lang::Rust, // unused for externals
+        )
     }
 
     fn external(&mut self, name: &str) -> usize {
         if let Some(&n) = self.externals.get(name) {
             return n;
         }
-        let n = self.graph.nodes.len();
-        self.graph.nodes.push(Node {
-            id: format!("ext:{name}"),
-            kind: SymKind::External,
-            name: name.to_string(),
-            file: String::new(),
-            lang: None,
-            line: 0,
-            end_line: 0,
-            signature: String::new(),
-            doc: None,
-            parent: None,
-            community: None,
-        });
-        self.lang_of_node.push(Lang::Rust); // unused for externals
+        let n = self.external_node(format!("ext:{name}"), name, "");
         self.externals.insert(name.to_string(), n);
         n
     }
@@ -1471,7 +1483,7 @@ impl<'a> Builder<'a> {
             for r in &f.refs {
                 if is_js
                     && r.kind == RefKind::Call
-                    && let Some((global, kind)) = self.global_used(r)
+                    && let Some((global, kind)) = self.global_used(fi, r)
                     && let Some(scope) = self.scope_of(fi, r.byte, r.kind)
                 {
                     let target = self.runtime_global(global);

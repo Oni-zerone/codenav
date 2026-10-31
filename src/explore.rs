@@ -211,18 +211,16 @@ const NAME_MATCH: f64 = 2.0;
 /// A term matching a whole word of the doc comment.
 const DOC_WORD: f64 = 1.5;
 
-/// Two forms of one word: equal, or at least 5 letters long, alike up to the last letter
-/// of the shorter and at most 3 letters apart in length (`propagate` / `propagated`,
-/// `schede` / `scheda`), but not words that merely start alike (`context` / `content`,
-/// `interval` / `internal`) nor a word and a compound starting with it (`session` /
-/// `sessionstorage`).
+/// Two forms of one word: equal, or at least 5 letters long and alike up to the last
+/// letter of the shorter (`propagate` / `propagated`, `schede` / `scheda`), but not words
+/// that merely start alike (`context` / `content`, `interval` / `internal`).
 fn same_word(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
     let (la, lb) = (a.chars().count(), b.chars().count());
     let shorter = la.min(lb);
-    if shorter < 5 || la.abs_diff(lb) > 3 {
+    if shorter < 5 {
         return false;
     }
     let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
@@ -231,8 +229,11 @@ fn same_word(a: &str, b: &str) -> bool {
 
 /// How strongly a term matches a node, best first: exact name (4), name token (3), part of
 /// the name or another form of a name token (2), a whole word of the doc (1.5), the
-/// id/path or another form of a doc word (1), a substring of the doc (0.5).
+/// id/path or another form of a doc word (1), a substring of the doc (0.5). `forms`:
+/// whether other forms of a word count; not for a term written as an identifier
+/// (`sessionStorage` names that thing, not anything starting with `session`).
 fn term_weight(
+    forms: bool,
     term: &str,
     name: &str,
     tokens: &[String],
@@ -245,12 +246,12 @@ fn term_weight(
     } else if tokens.iter().any(|t| t == term) {
         3.0
     } else if (term.chars().count() >= MIN_SUBSTRING_TERM && name.contains(term))
-        || tokens.iter().any(|t| same_word(t, term))
+        || (forms && tokens.iter().any(|t| same_word(t, term)))
     {
         NAME_MATCH
     } else if doc_words.contains(&term) {
         DOC_WORD
-    } else if id.contains(term) || doc_words.iter().any(|w| same_word(w, term)) {
+    } else if id.contains(term) || (forms && doc_words.iter().any(|w| same_word(w, term))) {
         // A path, or another form of the word in the doc: weaker hints.
         1.0
     } else if doc.contains(term) {
@@ -357,7 +358,8 @@ fn score_nodes(
             .filter(|w| w.chars().count() >= 2)
             .collect();
         for (t, term) in terms.iter().enumerate() {
-            let mut w = term_weight(term, &name, &tokens, &id, &doc_words, &doc);
+            let identifier = identifiers.contains(term);
+            let mut w = term_weight(!identifier, term, &name, &tokens, &id, &doc_words, &doc);
             if !synonyms[t].is_empty() {
                 if w < SYNONYM_IN_NAME && tokens.iter().any(|tok| synonyms[t].contains(tok)) {
                     w = SYNONYM_IN_NAME;
@@ -370,7 +372,7 @@ fn score_nodes(
             if w >= DOC_WORD {
                 strong_terms[i].push(t);
             }
-            if w >= NAME_MATCH && identifiers.contains(term) {
+            if w >= NAME_MATCH && identifier {
                 w *= IDENTIFIER_BOOST;
             }
             per_term[t][i] = w;
@@ -513,15 +515,29 @@ fn pick_seeds(
             seeds.push(best);
         }
     }
-    // A runtime global (`localStorage`) stands for the code using it: start there too.
-    let users: Vec<usize> = seeds
+    // A runtime global (`localStorage`) stands for the code using it: start there too,
+    // its most relevant users first, taking turns between globals.
+    let users: Vec<Vec<usize>> = seeds
         .iter()
         .filter(|&&s| g.nodes[s].id.starts_with("global:"))
-        .flat_map(|&s| g.in_edges[s].iter().map(|&e| g.edges[e].from))
+        .map(|&s| {
+            let mut users: Vec<usize> = g.in_edges[s].iter().map(|&e| g.edges[e].from).collect();
+            users.sort_by(|&a, &b| {
+                scores.total[b]
+                    .total_cmp(&scores.total[a])
+                    .then(g.degree(b).cmp(&g.degree(a)))
+                    .then(a.cmp(&b))
+            });
+            users.dedup();
+            users
+        })
         .collect();
-    for user in users {
-        if !seeds.contains(&user) && seeds.len() < MAX_SEEDS {
-            seeds.push(user);
+    let longest = users.iter().map(Vec::len).max().unwrap_or(0);
+    for k in 0..longest {
+        for user in users.iter().filter_map(|u| u.get(k)) {
+            if !seeds.contains(user) && seeds.len() < MAX_SEEDS {
+                seeds.push(*user);
+            }
         }
     }
     // Say so when the starting points cover few of the question's terms.
@@ -833,18 +849,30 @@ mod tests {
             ("schede", "scheda"),
             ("atleti", "atleta"),
             ("plans", "plans"),
+            ("serialize", "serialization"),
         ] {
             assert!(same_word(a, b), "{a} ~ {b}");
         }
         for (a, b) in [
             ("context", "content"),
             ("interval", "internal"),
-            ("session", "sessionstorage"),
             ("construct", "constant"),
             ("plan", "plans"),
         ] {
             assert!(!same_word(a, b), "{a} !~ {b}");
         }
+    }
+
+    #[test]
+    fn an_identifier_term_matches_no_other_word_forms() {
+        let toks = name_tokens("SessionState");
+        let w = |forms| term_weight(forms, "sessionstorage", "sessionstate", &toks, "", &[], "");
+        assert!(w(true) > 0.0);
+        assert_eq!(w(false), 0.0);
+        assert_eq!(
+            identifier_terms("is sessionStorage or user_id read? Not plain words"),
+            HashSet::from(["sessionstorage".to_string(), "user_id".to_string()])
+        );
     }
 
     #[test]
@@ -866,11 +894,11 @@ mod tests {
     fn exact_name_beats_token_and_short_substrings_do_not_match() {
         let toks = name_tokens("resolve_imports");
         assert!(
-            term_weight("resolve", "resolve", &["resolve".into()], "", &[], "")
-                > term_weight("resolve", "resolve_imports", &toks, "", &[], "")
+            term_weight(true, "resolve", "resolve", &["resolve".into()], "", &[], "")
+                > term_weight(true, "resolve", "resolve_imports", &toks, "", &[], "")
         );
         assert_eq!(
-            term_weight("get", "budget", &["budget".into()], "", &[], ""),
+            term_weight(true, "get", "budget", &["budget".into()], "", &[], ""),
             0.0
         );
     }
