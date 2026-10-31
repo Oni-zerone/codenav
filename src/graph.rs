@@ -82,7 +82,8 @@ const FORMAT_VERSION: u32 = 3;
 /// 3: common methods on unknown receivers need the owner type named nearby; module
 ///    qualifiers must be single names.
 /// 4: imports of local packages (npm workspaces, Cargo crates) resolve to their files.
-pub const ANALYSIS_VERSION: u32 = 4;
+/// 5: JS/TS runtime globals (`localStorage`, `fetch`…) are nodes with edges to them.
+pub const ANALYSIS_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]

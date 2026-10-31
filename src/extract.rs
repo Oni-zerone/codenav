@@ -54,6 +54,9 @@ pub struct Ref {
     pub is_static: bool,
     /// The whole qualifier as written (`self.graph`, `pkg.utils`, `crate::store`).
     pub qualifier_path: Option<String>,
+    /// JS/TS: the first name of the reference (the qualifier's root, or the name itself)
+    /// is a local binding there (a parameter or variable), not a global.
+    pub local_root: bool,
     pub byte: usize,
     pub line: u32,
 }
@@ -238,6 +241,7 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 qualifier_path: None,
                 byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
+                local_root: false,
             });
         } else if let Some(node) = caps.get("call") {
             let Some(name_node) = caps.get("name") else {
@@ -257,6 +261,7 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                     .map(|n| text(*n)),
                 byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
+                local_root: false,
             });
         } else if let Some((kind, node)) = caps
             .get("base")
@@ -271,16 +276,29 @@ pub fn extract(path: &str, lang: Lang, source: &[u8]) -> Result<FileFacts> {
                 qualifier_path: None,
                 byte: node.start_byte(),
                 line: node.start_position().row as u32 + 1,
+                local_root: false,
             });
         }
     }
 
+    let bound_at = |name: &str, byte: usize| {
+        locals
+            .get(name)
+            .is_some_and(|scopes| scopes.iter().any(|&(s, e)| s <= byte && byte < e))
+    };
+    for r in &mut facts.refs {
+        let root = r
+            .qualifier_path
+            .as_deref()
+            .map_or(r.name.as_str(), |p| p.split(['.', '?']).next().unwrap_or(p));
+        r.local_root = bound_at(root, r.byte);
+    }
     // A value ref shadowed by a local binding of an enclosing function is not the constant.
-    facts.refs.extend(value_refs.into_iter().filter(|r| {
-        !locals
-            .get(&r.name)
-            .is_some_and(|scopes| scopes.iter().any(|&(s, e)| s <= r.byte && r.byte < e))
-    }));
+    facts.refs.extend(
+        value_refs
+            .into_iter()
+            .filter(|r| !bound_at(&r.name, r.byte)),
+    );
 
     dedupe_defs(&mut facts.defs);
     // `export { a }` names a top-level definition (defs are sorted by start, -end).

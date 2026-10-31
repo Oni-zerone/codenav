@@ -26,7 +26,8 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "codenav exposes a pre-built graph of this repository. \
 Nodes are files, symbols (classes, structs, interfaces/traits/protocols, functions, methods, ...) \
-and external packages; edges are contains, imports, calls, inherits and references. \
+external packages and JS/TS runtime globals (global:localStorage, global:fetch, ...: who uses them); \
+edges are contains, imports, calls, inherits and references. \
 Start with graph_overview or module_graph for the big picture (get_community for structural clusters); for a question about specific code \
 call explore first, which returns the relevant subgraph in one call. Use search_symbols to get node ids, \
 then get_symbol, get_neighbors, find_paths and impact_analysis to explore relations. \
@@ -889,6 +890,10 @@ fn architecture_review(focus: Option<&str>) -> Value {
 
 /// The ecosystem of an external package, from the files importing it.
 fn external_ecosystem(g: &Graph, ext: usize) -> Option<packages::PackageKind> {
+    // A runtime global (`localStorage`) is no package.
+    if g.nodes[ext].id.starts_with("global:") {
+        return None;
+    }
     g.in_edges[ext].iter().find_map(|&e| {
         let edge = &g.edges[e];
         let lang = g.nodes[edge.from].lang?;

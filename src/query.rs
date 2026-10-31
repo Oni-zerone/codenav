@@ -821,9 +821,15 @@ pub fn module_graph(g: &Graph, depth: usize, min_weight: u32) -> Value {
         }
         let (a, b) = (&g.nodes[e.from], &g.nodes[e.to]);
         if b.kind == SymKind::External {
+            // A runtime global by its id (`global:fetch`), not to pass for a package.
+            let name = if b.id.starts_with("global:") {
+                &b.id
+            } else {
+                &b.name
+            };
             ext.entry(component(&a.file))
                 .or_default()
-                .insert(b.name.clone());
+                .insert(name.clone());
             continue;
         }
         let (ca, cb) = (component(&a.file), component(&b.file));

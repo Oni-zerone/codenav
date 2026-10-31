@@ -2551,6 +2551,134 @@ fn explore_dfs_follows_callers_and_respects_budget() {
     assert!(text.len() <= 200 * 3, "output too long: {}", text.len());
 }
 
+#[test]
+fn runtime_globals_are_nodes_and_explore_starts_from_their_users() {
+    let repo = TempRepo::new(
+        "globals",
+        &[
+            (
+                "src/useStoredState.ts",
+                "export type StorageArea = \"local\" | \"session\";\n\
+                 export function useStoredState(key: string, area: StorageArea) {\n\
+                 \x20 return area === \"local\" ? localStorage.getItem(key) : sessionStorage.getItem(key);\n}\n\
+                 export function saveStoredState(key: string, value: string) {\n\
+                 \x20 localStorage.setItem(key, value);\n}\n"
+                    .into(),
+            ),
+            (
+                "src/Panel.tsx",
+                "export function Panel() {\n\
+                 \x20 const open = window.sessionStorage.getItem(\"panel\");\n\
+                 \x20 return <div>{open}</div>;\n}\n"
+                    .into(),
+            ),
+            (
+                "src/session.ts",
+                "export class SessionState { user = \"\"; }\n\
+                 export interface SessionUserState { id: string }\n\
+                 export function sessionState(): SessionState { return new SessionState(); }\n\
+                 export interface FormState { ok: boolean }\n\
+                 export function rememberFailure(state: FormState) { return state.ok; }\n\
+                 export async function loadUser() { return fetch(\"/api/user\"); }\n"
+                    .into(),
+            ),
+            // A definition of a global's name in the file wins: not a use of the global.
+            (
+                "src/nav.ts",
+                "export const navigator = { go() {} };\nexport function move() { navigator.go(); }\n"
+                    .into(),
+            ),
+            // Imports, parameters, locals and members named like a global are not uses;
+            // `window.fetch()` and optional chains are.
+            (
+                "src/ext.ts",
+                "import { window } from \"vscode\";\n\
+                 export function notify() { window.showInformationMessage(\"hi\"); }\n\
+                 export function save(document: { save(): void }) { document.save(); }\n\
+                 export function text(editor: any) { return editor.document.getText(); }\n"
+                    .into(),
+            ),
+            (
+                "src/web.ts",
+                "export function load() { return window.fetch(\"/x\"); }\n\
+                 export function peek() { return window?.localStorage?.getItem(\"k\"); }\n\
+                 export function local() { const process = { run() {} }; process.run(); }\n"
+                    .into(),
+            ),
+            // Same names in another language do not hide the JS globals.
+            ("tools/fetch.py", "def fetch():\n    pass\n".into()),
+        ],
+    );
+    let neighbors = |id: &str| {
+        let (ok, text) = tool_text_in(
+            &repo.0,
+            "get_neighbors",
+            json!({ "id": id, "direction": "in", "format": "json" }),
+        );
+        assert!(ok, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let mut ids: Vec<String> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        neighbors("global:localStorage"),
+        vec![
+            "src/useStoredState.ts::saveStoredState",
+            "src/useStoredState.ts::useStoredState",
+            "src/web.ts::peek"
+        ]
+    );
+    // `window.sessionStorage.getItem()`: the most specific global.
+    assert_eq!(
+        neighbors("global:sessionStorage"),
+        vec![
+            "src/Panel.tsx::Panel",
+            "src/useStoredState.ts::useStoredState"
+        ]
+    );
+    assert_eq!(
+        neighbors("global:fetch"),
+        vec!["src/session.ts::loadUser", "src/web.ts::load"]
+    );
+    for absent in [
+        "global:navigator",
+        "global:document",
+        "global:process",
+        "global:window",
+    ] {
+        let (ok, text) = tool_text_in(&repo.0, "get_symbol", json!({ "id": absent }));
+        assert!(!ok, "{absent}: {text}");
+    }
+
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "explore",
+        json!({ "question": "where is UI state remembered in localStorage or sessionStorage" }),
+    );
+    assert!(ok, "{text}");
+    let seeds = text
+        .lines()
+        .find_map(|l| l.split_once("seeds: ").map(|(_, s)| s.to_string()))
+        .unwrap();
+    for user in ["useStoredState", "saveStoredState", "Panel"] {
+        assert!(seeds.contains(&format!("::{user}")), "{seeds}");
+    }
+    // `session` alone (in `sessionStorage`) no longer pulls in the session state names.
+    for unrelated in ["sessionState", "SessionState", "SessionUserState"] {
+        assert!(
+            !seeds.contains(&format!("::{unrelated},"))
+                && !seeds.ends_with(&format!("::{unrelated}")),
+            "{seeds}"
+        );
+    }
+}
+
 /// A throwaway repository with the given files, removed on drop.
 struct TempRepo(std::path::PathBuf);
 
