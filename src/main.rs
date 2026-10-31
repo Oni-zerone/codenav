@@ -1,27 +1,10 @@
-mod communities;
-mod cycles;
-mod diff_impact;
-mod embeddings;
-mod explore;
-mod extract;
-mod graph;
-mod indexer;
-mod insights;
-mod lang;
-mod live;
-mod mcp;
-mod output;
-mod packages;
-mod query;
-mod tests_for;
-mod vcs;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 
-use crate::lang::Lang;
+use codenav::lang::Lang;
+use codenav::{embeddings, graph::Graph, indexer, mcp};
 
 /// Index a repository into a code graph and serve it to LLMs over MCP.
 #[derive(Parser)]
@@ -88,6 +71,11 @@ enum Command {
         /// that know it is current); also set by the CODENAV_NO_REFRESH variable.
         #[arg(long)]
         no_refresh: bool,
+    },
+    /// Print a saved graph (`.codenav/graph.cnav` of PATH, or a .cnav file) as JSON.
+    Export {
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Print the tree-sitter syntax tree of a file (useful to write extraction queries).
     Ast { file: PathBuf },
@@ -193,6 +181,26 @@ fn main() -> Result<()> {
             }
             let result = server.call_tool(&name, &args)?;
             println!("{result}");
+        }
+        Command::Export { path } => {
+            let file = if path.is_dir() {
+                Graph::index_path(&path)
+            } else {
+                path
+            };
+            let data =
+                std::fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            let graph = Graph::from_bytes(&data)?;
+            let mut out = std::io::stdout().lock();
+            // A reader that stops early (`| head`) is not an error.
+            match serde_json::to_writer(&mut out, &graph) {
+                Err(e) if e.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) => {}
+                written => {
+                    written?;
+                    use std::io::Write;
+                    let _ = writeln!(out);
+                }
+            }
         }
         Command::Ast { file } => {
             let lang = Lang::from_path(&file).ok_or_else(|| anyhow!("unsupported file type"))?;

@@ -87,6 +87,11 @@ impl Embeddings {
         self.rows.len()
     }
 
+    /// Never true for loaded embeddings (`load` refuses an empty file).
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }

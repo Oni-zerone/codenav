@@ -1,0 +1,13 @@
+[package]
+name = "codenav-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "Reads graph.cnav in WebAssembly, with codenav's own code (for the VS Code extension)"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+codenav = { path = "..", default-features = false }
+serde_json = "1.0.154"

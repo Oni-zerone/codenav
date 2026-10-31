@@ -4,8 +4,9 @@ Visualizza dentro VS Code il grafo della codebase generato da [codenav](../READM
 (`.codenav/graph.cnav`): lo stesso grafo che gli LLM navigano via MCP.
 
 Per vederlo basta **aprire un file `.cnav`** (dall'Explorer, da Quick Open o con
-`code .codenav/graph.cnav`): l'estensione lo apre come grafo invece che come testo. Il file è
-JSON; per leggerlo come testo usa *Reopen Editor With… → Text Editor*. Un `.cnav` copiato fuori
+`code .codenav/graph.cnav`): l'estensione lo apre come grafo. Il file è binario: lo decodifica lo
+stesso codice Rust di codenav, compilato in WebAssembly e incluso nell'estensione (per vederlo in
+JSON: `codenav export`). Si aprono anche i `.cnav` in JSON delle versioni precedenti. Un `.cnav` copiato fuori
 da `.codenav/` funziona lo stesso: i sorgenti vengono cercati nella root registrata al momento
 dell'indicizzazione.
 
@@ -60,9 +61,10 @@ re-indicizza in background).
 
 ```sh
 cd vscode
+rustup target add wasm32-unknown-unknown   # una volta: serve per il decoder dei .cnav
 npm install
-npm run compile      # tsc + copia cytoscape/fcose in media/vendor
-npm test             # test del modello (node:test, senza VS Code)
+npm run compile      # tsc + copia cytoscape/fcose in media/vendor + decoder wasm in wasm/
+npm test             # test del modello e del decoder (node:test, senza VS Code)
 ```
 
 Per provarla: apri la cartella `vscode/` in VS Code e premi `F5` (Extension Development Host),
@@ -71,6 +73,8 @@ poi apri una repo indicizzata con `codenav index`. Per creare il pacchetto: `npx
 Struttura:
 
 - `src/graphModel.ts`: parsing del grafo e costruzione delle viste (puro, testato);
+- `src/cnavFile.ts`: lettura dei `.cnav` con il decoder WebAssembly (crate `../wasm`, che usa il
+  codice del grafo di codenav senza la parte di indicizzazione);
 - `src/graphStore.ts`: caricamento dei file `.cnav` (cache per file) e file watcher;
 - `src/graphPanel.ts`: webview e protocollo dei messaggi, pannello dei comandi e custom editor per `*.cnav`;
 - `src/extension.ts`: comandi;
