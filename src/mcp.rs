@@ -107,6 +107,8 @@ pub struct Server {
     clock: u64,
     /// Static word embeddings for explore's synonym matching (`--embeddings`).
     embeddings: Option<Embeddings>,
+    /// A shorter view of the last tool's result, for a text answer over its budget.
+    summary: Option<Value>,
 }
 
 impl Server {
@@ -133,6 +135,7 @@ impl Server {
             load_options: LoadOptions::default(),
             clock: 0,
             embeddings: None,
+            summary: None,
         }
     }
 
@@ -451,10 +454,17 @@ impl Server {
             anyhow::bail!("`{name}` always returns text; format=json is not supported");
         }
         let budget = token_budget(a)?;
-        Ok(match self.run_tool(name, a)? {
+        self.summary = None;
+        let v = self.run_tool(name, a)?;
+        let summary = self.summary.take();
+        Ok(match v {
             Value::String(text) => text,
             v if format == "json" => serde_json::to_string(&v)?,
-            v => output::fit_value(&v, budget, hint),
+            v => match output::whole_value(&v, budget) {
+                Some(text) => text,
+                // Too long: the tool's summary, if it has one, so what gets cut matters least.
+                None => output::fit_value(summary.as_ref().unwrap_or(&v), budget, hint),
+            },
         })
     }
 
@@ -646,13 +656,11 @@ impl Server {
             }
             "impact_analysis" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
-                Ok(query::impact(
-                    g,
-                    i,
-                    uint(a, "depth", 3)?.clamp(1, 8) as u32,
-                    uint(a, "limit", 200)?,
-                    min_confidence(a)?,
-                ))
+                let depth = uint(a, "depth", 3)?.clamp(1, 8) as u32;
+                let limit = uint(a, "limit", 200)?;
+                let impact = query::impact_of(g, i, depth, min_confidence(a)?);
+                self.summary = Some(impact.summary(g, limit));
+                Ok(impact.full(g, limit))
             }
             "diff_impact" => {
                 let staged = opt_bool(a, "staged")?.unwrap_or(false);
@@ -1200,7 +1208,7 @@ fn base_tool_definitions() -> Value {
         },
         {
             "name": "impact_analysis",
-            "description": "Everything that transitively depends on a symbol or file (and its members): what may break if it changes. Grouped by file. Methods also count callers of the interface/base-class methods they override (listed in overridden_members).",
+            "description": "Everything that transitively depends on a symbol or file (and its members): what may break if it changes. Grouped by file. Methods also count callers of the interface/base-class methods they override (listed in overridden_members). When the text answer exceeds token_budget it starts with a summary (counts per directory, test files, every direct dependent) and only the per-file detail of indirect dependents is cut; format=json is always the full list.",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string" },
                 "depth": { "type": "integer", "description": "1-8, default 3." },

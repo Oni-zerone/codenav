@@ -123,8 +123,17 @@ pub fn clip(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// `v` as compact text if it fits `token_budget` whole (what `fit_value` then returns).
+pub fn whole_value(v: &Value, token_budget: usize) -> Option<String> {
+    let text = to_lines(v).join("\n");
+    (text.len() <= token_budget.saturating_mul(CHARS_PER_TOKEN)).then_some(text)
+}
+
 /// Renders a JSON result as compact YAML-like text cut to the budget.
 pub fn fit_value(v: &Value, token_budget: usize, hint: &str) -> String {
+    if let Some(text) = whole_value(v, token_budget) {
+        return text;
+    }
     let blocks: Vec<Vec<String>> = to_lines(v).into_iter().map(|l| vec![l]).collect();
     fit_blocks("", &blocks, token_budget, "lines", hint)
 }
