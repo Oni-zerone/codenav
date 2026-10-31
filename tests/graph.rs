@@ -2679,6 +2679,74 @@ fn runtime_globals_are_nodes_and_explore_starts_from_their_users() {
     }
 }
 
+#[test]
+fn impact_too_long_for_the_budget_starts_with_a_summary() {
+    // A utility used by 96 files in 12 directories, most of them through a wrapper.
+    let mut files = vec![(
+        "src/lib/dates.ts".to_string(),
+        "export function formatDate(d: Date): string { return d.toISOString(); }\n".to_string(),
+    )];
+    for i in 0..96 {
+        let dir = format!("src/app/area{}", i % 12);
+        files.push((
+            format!("{dir}/page{i}.ts"),
+            format!(
+                "import {{ formatDate }} from \"../../lib/dates\";\n\
+                 export function renderPage{i}(d: Date) {{ return formatDate(d); }}\n\
+                 export function headerOf{i}(d: Date) {{ return renderPage{i}(d); }}\n"
+            ),
+        ));
+    }
+    files.push((
+        "test/dates.test.ts".to_string(),
+        "import { formatDate } from \"../src/lib/dates\";\n\
+         export function checksFormat() { return formatDate(new Date()); }\n"
+            .to_string(),
+    ));
+    let refs: Vec<(&str, String)> = files.iter().map(|(p, s)| (p.as_str(), s.clone())).collect();
+    let repo = TempRepo::new("impact-summary", &refs);
+
+    let (ok, text) = tool_text_in(
+        &repo.0,
+        "impact_analysis",
+        json!({ "id": "src/lib/dates.ts" }),
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("by_directory:"), "{text}");
+    for i in 0..12 {
+        assert!(
+            text.contains(&format!("src/app/area{i}")),
+            "area{i}: {text}"
+        );
+    }
+    assert!(text.contains("test_files: [test/dates.test.ts]"), "{text}");
+    for i in 0..96 {
+        assert!(
+            text.contains(&format!("renderPage{i}")),
+            "renderPage{i}: {text}"
+        );
+    }
+    // JSON keeps its shape.
+    let (ok, json_text) = tool_text_in(
+        &repo.0,
+        "impact_analysis",
+        json!({ "id": "src/lib/dates.ts", "format": "json" }),
+    );
+    assert!(ok);
+    let v: Value = serde_json::from_str(&json_text).unwrap();
+    assert!(v.get("by_file").is_some() && v.get("by_directory").is_none());
+    // A short answer is unchanged.
+    let (_, short) = tool_text_in(
+        &repo.0,
+        "impact_analysis",
+        json!({ "id": "src/app/area0/page0.ts::headerOf0" }),
+    );
+    assert!(
+        short.contains("by_file:") && !short.contains("by_directory"),
+        "{short}"
+    );
+}
+
 /// A throwaway repository with the given files, removed on drop.
 struct TempRepo(std::path::PathBuf);
 

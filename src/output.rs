@@ -124,6 +124,13 @@ pub fn clip(s: &str, max: usize) -> String {
 }
 
 /// Renders a JSON result as compact YAML-like text cut to the budget.
+/// Whether `fit_value` shows `v` whole within `token_budget`.
+pub fn fits(v: &Value, token_budget: usize) -> bool {
+    let lines = to_lines(v);
+    let len = lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1);
+    len <= token_budget.saturating_mul(CHARS_PER_TOKEN)
+}
+
 pub fn fit_value(v: &Value, token_budget: usize, hint: &str) -> String {
     let blocks: Vec<Vec<String>> = to_lines(v).into_iter().map(|l| vec![l]).collect();
     fit_blocks("", &blocks, token_budget, "lines", hint)

@@ -157,7 +157,7 @@ aggiornamento automatico quando l'indice cambia.
 | `find_paths` | Catene di relazioni più brevi tra due nodi ("come sono collegati A e B?") |
 | `file_outline` | Simboli di un file (annidati), import, importatori, file più correlati |
 | `audit_edges` | Verifica del resolver: archi per tipo e confidenza, poi quelli di un livello (default `ambiguous`) con file e riga |
-| `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base) |
+| `impact_analysis` | Tutto ciò che dipende transitivamente da un simbolo/file: cosa si rompe se cambia. Per un metodo conta anche chi chiama i metodi che sovrascrive (interfacce, classi base). Se il testo supera il budget parte da un riepilogo (conteggi per directory, file di test, tutti i dipendenti diretti) e si taglia solo il dettaglio degli indiretti |
 | `read_code` | Legge un intervallo di righe di un file del repo |
 | `list_projects` | Repository serviti (nome da passare come `project` a ogni tool), quale è il default e quali sono caricati |
 | `reindex` | Ricostruisce il grafo da zero (rilegge tutti i file) |

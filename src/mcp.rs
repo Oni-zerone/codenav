@@ -454,6 +454,12 @@ impl Server {
         Ok(match self.run_tool(name, a)? {
             Value::String(text) => text,
             v if format == "json" => serde_json::to_string(&v)?,
+            // Too long: a summary first, so that what gets cut is the least important.
+            v if name == "impact_analysis" && !output::fits(&v, budget) => {
+                let (i, depth, limit, min) = impact_args(&self.cur.graph, a)?;
+                let summary = query::impact_summary(&self.cur.graph, i, depth, limit, min);
+                output::fit_value(&summary, budget, hint)
+            }
             v => output::fit_value(&v, budget, hint),
         })
     }
@@ -645,14 +651,8 @@ impl Server {
                 Ok(query::file_outline(g, file))
             }
             "impact_analysis" => {
-                let i = query::resolve(g, &string(a, "id")?)?;
-                Ok(query::impact(
-                    g,
-                    i,
-                    uint(a, "depth", 3)?.clamp(1, 8) as u32,
-                    uint(a, "limit", 200)?,
-                    min_confidence(a)?,
-                ))
+                let (i, depth, limit, min) = impact_args(g, a)?;
+                Ok(query::impact(g, i, depth, limit, min))
             }
             "diff_impact" => {
                 let staged = opt_bool(a, "staged")?.unwrap_or(false);
@@ -758,6 +758,16 @@ impl Server {
             _ => Err(anyhow!("unknown tool `{name}`")),
         }
     }
+}
+
+/// impact_analysis arguments: target, depth, limit, minimum confidence.
+fn impact_args(g: &Graph, a: &Value) -> Result<(usize, u32, usize, Confidence)> {
+    Ok((
+        query::resolve(g, &string(a, "id")?)?,
+        uint(a, "depth", 3)?.clamp(1, 8) as u32,
+        uint(a, "limit", 200)?,
+        min_confidence(a)?,
+    ))
 }
 
 fn token_budget(a: &Value) -> Result<usize> {
@@ -1200,7 +1210,7 @@ fn base_tool_definitions() -> Value {
         },
         {
             "name": "impact_analysis",
-            "description": "Everything that transitively depends on a symbol or file (and its members): what may break if it changes. Grouped by file. Methods also count callers of the interface/base-class methods they override (listed in overridden_members).",
+            "description": "Everything that transitively depends on a symbol or file (and its members): what may break if it changes. Grouped by file. Methods also count callers of the interface/base-class methods they override (listed in overridden_members). When the text answer exceeds token_budget it starts with a summary (counts per directory, test files, every direct dependent) and only the per-file detail of indirect dependents is cut; format=json is always the full list.",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string" },
                 "depth": { "type": "integer", "description": "1-8, default 3." },

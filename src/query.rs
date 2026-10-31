@@ -1,7 +1,7 @@
 //! Read-only graph analyses used by the MCP tools and the CLI. Every function returns a
 //! JSON value meant to be read by an LLM: compact, with stable ids it can pass back.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -698,25 +698,158 @@ pub fn dependents_by_file(
     limit: usize,
 ) -> BTreeMap<String, Vec<Value>> {
     let mut by_file: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    for &(n, d, k, conf) in hits.iter().take(limit) {
-        let node = &g.nodes[n];
-        let guess = conf.label().map(|l| format!(", {l}")).unwrap_or_default();
-        let label = if node.kind == SymKind::File {
-            format!("(file) via {} [depth {d}{guess}]", k.inverse_str())
-        } else {
-            format!(
-                "{} ({}) via {} [depth {d}{guess}]",
-                g.qualified_name(n),
-                node.kind.as_str(),
-                k.inverse_str()
-            )
-        };
+    for hit in hits.iter().take(limit) {
         by_file
-            .entry(node.file.clone())
+            .entry(g.nodes[hit.0].file.clone())
             .or_default()
-            .push(json!(label));
+            .push(json!(dependent_label(g, hit)));
     }
     by_file
+}
+
+/// `name (kind) via called_by [depth 2, inferred]`, or `(file) via …` for a file.
+fn dependent_label(g: &Graph, &(n, d, k, conf): &Dependent) -> String {
+    let node = &g.nodes[n];
+    let guess = conf.label().map(|l| format!(", {l}")).unwrap_or_default();
+    if node.kind == SymKind::File {
+        format!("(file) via {} [depth {d}{guess}]", k.inverse_str())
+    } else {
+        format!(
+            "{} ({}) via {} [depth {d}{guess}]",
+            g.qualified_name(n),
+            node.kind.as_str(),
+            k.inverse_str()
+        )
+    }
+}
+
+/// Directories listed at most in an impact summary: deeper ones are merged into their
+/// parents (`src/app/**`) until they fit.
+const MAX_SUMMARY_DIRS: usize = 20;
+
+/// `impact` for a text answer too long for its budget: the whole picture first (counts
+/// per directory, the tests involved, every direct dependent), then the detail per file,
+/// closest first, which is what gets cut.
+pub fn impact_summary(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
+    let (mut seeds, overridden) = change_seeds(g, start, min);
+    seeds.extend(&overridden);
+    let seed_set: HashSet<usize> = seeds.iter().map(|&(s, _)| s).collect();
+    let hits = dependents(g, &seeds, depth, min);
+    let files: BTreeSet<&str> = hits.iter().map(|h| g.nodes[h.0].file.as_str()).collect();
+    let mut out = json!({
+        "target": summary(g, start),
+        "members_considered": seed_set.len(),
+    });
+    if !overridden.is_empty() {
+        out["overridden_members"] = json!(
+            overridden
+                .iter()
+                .map(|&(m, conf)| match conf.label() {
+                    Some(l) => format!("{} ({l})", g.nodes[m].id),
+                    None => g.nodes[m].id.clone(),
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    out["affected_symbols"] = json!(
+        hits.iter()
+            .filter(|h| g.nodes[h.0].kind != SymKind::File)
+            .count()
+    );
+    out["affected_files"] = json!(files.len());
+    out["truncated"] = json!(hits.len() > limit);
+    out["note"] = json!(
+        "summary first (too long for the budget): directories, tests and direct dependents are \
+         complete; the per-file detail after them is cut"
+    );
+
+    // Directories, at the deepest level that keeps them few.
+    let max_depth = files
+        .iter()
+        .map(|f| f.matches('/').count())
+        .max()
+        .unwrap_or(0);
+    let mut level = max_depth;
+    let group = |file: &str, level: usize| -> String {
+        let dir = component(file, level);
+        if level < file.matches('/').count() {
+            format!("{dir}/**")
+        } else {
+            dir
+        }
+    };
+    while level > 1
+        && files
+            .iter()
+            .map(|f| group(f, level))
+            .collect::<HashSet<_>>()
+            .len()
+            > MAX_SUMMARY_DIRS
+    {
+        level -= 1;
+    }
+    let mut dirs: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for f in &files {
+        dirs.entry(group(f, level)).or_default().0 += 1;
+    }
+    for h in hits.iter().filter(|h| g.nodes[h.0].kind != SymKind::File) {
+        dirs.entry(group(&g.nodes[h.0].file, level)).or_default().1 += 1;
+    }
+    let mut dirs: Vec<(String, (usize, usize))> = dirs.into_iter().collect();
+    dirs.sort_by(|a, b| (b.1).0.cmp(&(a.1).0).then(a.0.cmp(&b.0)));
+    let mut by_dir = serde_json::Map::new();
+    for (dir, (nf, ns)) in dirs {
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        by_dir.insert(
+            dir,
+            json!(format!("{}, {}", plural(nf, "file"), plural(ns, "symbol"))),
+        );
+    }
+    out["by_directory"] = Value::Object(by_dir);
+    let tests: Vec<&str> = files
+        .iter()
+        .copied()
+        .filter(|f| crate::tests_for::is_test_file(f))
+        .collect();
+    out["test_files"] = json!(tests);
+
+    // Direct dependents in full; then the rest, file by file, closest first.
+    let (direct, deeper): (Vec<&Dependent>, Vec<&Dependent>) = hits.iter().partition(|h| h.1 == 1);
+    // One line per file, names only: `(file)` for an import of it.
+    let mut direct_by_file: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for &&(n, _, _, conf) in &direct {
+        let node = &g.nodes[n];
+        let mut name = if node.kind == SymKind::File {
+            "(file)".to_string()
+        } else {
+            g.qualified_name(n)
+        };
+        if let Some(l) = conf.label() {
+            name.push_str(&format!(" ({l})"));
+        }
+        direct_by_file
+            .entry(node.file.as_str())
+            .or_default()
+            .push(name);
+    }
+    out["direct_dependents"] = json!(
+        direct_by_file
+            .into_iter()
+            .map(|(f, names)| (f, names.join(", ")))
+            .collect::<BTreeMap<_, _>>()
+    );
+    let mut deeper_by_file = serde_json::Map::new();
+    for h in deeper.into_iter().take(limit.saturating_sub(direct.len())) {
+        let file = &g.nodes[h.0].file;
+        if !deeper_by_file.contains_key(file) {
+            deeper_by_file.insert(file.clone(), json!([]));
+        }
+        if let Some(Value::Array(list)) = deeper_by_file.get_mut(file) {
+            list.push(json!(dependent_label(g, h)));
+        }
+    }
+    out["indirect_by_file"] = Value::Object(deeper_by_file);
+    out
 }
 
 pub fn impact(g: &Graph, start: usize, depth: u32, limit: usize, min: Confidence) -> Value {
