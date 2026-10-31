@@ -224,7 +224,7 @@ impl Server {
     fn load(&self, root: PathBuf) -> Result<State> {
         let opts = self.load_options;
         let (graph, index_options) =
-            indexer::load_or_index(&root, opts.fresh, opts.hub_percentile)?;
+            indexer::load_or_index(&root, opts.fresh, opts.hub_percentile, !self.auto_refresh)?;
         Ok(State::new(root, graph, index_options, self.auto_refresh))
     }
 

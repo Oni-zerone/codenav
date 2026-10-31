@@ -84,6 +84,10 @@ enum Command {
         /// Static word embeddings for explore (as for `serve`).
         #[arg(long, value_name = "FILE")]
         embeddings: Option<PathBuf>,
+        /// Use the saved index without checking for changed sources (faster, for callers
+        /// that know it is current); also set by the CODENAV_NO_REFRESH variable.
+        #[arg(long)]
+        no_refresh: bool,
     },
     /// Print the tree-sitter syntax tree of a file (useful to write extraction queries).
     Ast { file: PathBuf },
@@ -152,7 +156,10 @@ fn main() -> Result<()> {
                 fresh,
                 hub_percentile: opts.hub_percentile,
             };
-            let (graph, opts) = indexer::load_or_index(&roots[0], fresh, opts.hub_percentile)?;
+            // With auto-refresh, changes since the last index are picked up in the
+            // background right after startup.
+            let (graph, opts) =
+                indexer::load_or_index(&roots[0], fresh, opts.hub_percentile, no_refresh)?;
             let mut server = mcp::Server::new(roots[0].clone(), graph, !no_refresh, opts);
             server.set_load_options(load);
             for root in &roots[1..] {
@@ -169,6 +176,7 @@ fn main() -> Result<()> {
             path,
             path_flag,
             embeddings,
+            no_refresh,
         } => {
             let (args, path) = tool_args_and_path(args, path.or(path_flag));
             // Validate before indexing: a wrong argument must not index anything.
@@ -177,7 +185,8 @@ fn main() -> Result<()> {
                 .filter(serde_json::Value::is_object)
                 .ok_or_else(|| anyhow!("arguments must be a JSON object, got `{args}`"))?;
             let root = canonical_root(&path)?;
-            let (graph, opts) = indexer::load_or_index(&root, false, None)?;
+            let no_refresh = no_refresh || std::env::var_os("CODENAV_NO_REFRESH").is_some();
+            let (graph, opts) = indexer::load_or_index(&root, false, None, !no_refresh)?;
             let mut server = mcp::Server::new(root, graph, false, opts);
             // Only explore uses them, and only after the arguments are known to be valid.
             if name == "explore" {

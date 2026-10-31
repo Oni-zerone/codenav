@@ -117,6 +117,8 @@ pub struct SourceFile {
     pub rel: String,
     pub abs: PathBuf,
     pub lang: Lang,
+    /// Modification time when scanned.
+    pub modified: Option<SystemTime>,
 }
 
 /// Files under `root` that indexing considers: .gitignore and .codenavignore rules, no
@@ -159,10 +161,10 @@ pub fn scan(root: &Path) -> Tree {
             manifests.push(e.path().to_path_buf());
             continue;
         }
-        if !e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_BYTES) {
-            continue;
-        }
         let Some(lang) = Lang::from_path(e.path()) else {
+            continue;
+        };
+        let Some(meta) = e.metadata().ok().filter(|m| m.len() <= MAX_FILE_BYTES) else {
             continue;
         };
         let Ok(rel) = e.path().strip_prefix(root) else {
@@ -172,6 +174,7 @@ pub fn scan(root: &Path) -> Tree {
             rel: to_unix(rel),
             abs: e.path().to_path_buf(),
             lang,
+            modified: meta.modified().ok(),
         });
     }
     sources.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -274,7 +277,7 @@ pub fn is_stale_tree(graph: &Graph, tree: &Tree) -> bool {
     // Package manifests decide how imports resolve: their changes count too.
     files
         .iter()
-        .any(|f| !graph.by_file.contains_key(&f.rel) || changed(&f.abs))
+        .any(|f| !graph.by_file.contains_key(&f.rel) || f.modified.is_some_and(|t| t > since))
         || tree.manifests.iter().any(|m| changed(m))
 }
 
@@ -290,10 +293,14 @@ pub fn index_options(root: &Path, requested: Option<f64>) -> IndexOptions {
 
 /// Reuses the saved graph when it is up to date and was built with the requested
 /// settings, otherwise indexes and saves. Returns the settings in effect.
+/// `check_sources`: look for source files changed since the graph was built (a walk of
+/// the repository); without it, a saved graph is reused unless the analysis changed
+/// (for callers that refresh on their own, or know it is current).
 pub fn load_or_index(
     root: &Path,
     force: bool,
     requested: Option<f64>,
+    check_sources: bool,
 ) -> Result<(Graph, IndexOptions)> {
     let index_path = Graph::index_path(root);
     let opts = if force || !index_path.exists() {
@@ -302,7 +309,14 @@ pub fn load_or_index(
         }
         index_options(root, requested)
     } else {
-        match Graph::load(root) {
+        // The scan for changed sources runs while the graph loads.
+        let (loaded, tree) = std::thread::scope(|s| {
+            let tree = check_sources.then(|| s.spawn(|| scan(root)));
+            let loaded = Graph::load(root);
+            let tree = tree.map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+            (loaded, tree)
+        });
+        match loaded {
             Ok(mut g) => {
                 let opts = IndexOptions {
                     hub_percentile: requested.unwrap_or(g.hub_percentile),
@@ -312,7 +326,9 @@ pub fn load_or_index(
                         "codenav: hub percentile changed ({} → {}), re-indexing…",
                         g.hub_percentile, opts.hub_percentile
                     );
-                } else if is_stale(root, &g) {
+                } else if g.analysis != crate::graph::ANALYSIS_VERSION
+                    || tree.as_ref().is_some_and(|t| is_stale_tree(&g, t))
+                {
                     eprintln!("codenav: index is stale, re-indexing…");
                 } else {
                     // Same code, maybe a new commit: keep the graph, update its Git state.
