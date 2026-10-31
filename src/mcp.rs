@@ -1,10 +1,8 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0), exposing the code
 //! graph as tools. Logs go to stderr: stdout is reserved for protocol messages.
 
-use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -14,18 +12,17 @@ use crate::diff_impact::{self, DiffSource};
 use crate::embeddings::Embeddings;
 use crate::explore;
 use crate::graph::{Confidence, EdgeKind, Graph, SymKind};
-use crate::indexer::{self, FactsCache, IndexOptions};
+use crate::indexer::{self, IndexOptions};
 use crate::insights;
+use crate::live::Live;
 use crate::output;
 use crate::packages;
 use crate::query::{self, Direction, EdgeFilter};
 use crate::tests_for;
 use crate::vcs;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(20);
 
 const INSTRUCTIONS: &str = "codenav exposes a pre-built graph of this repository. \
 Nodes are files, symbols (classes, structs, interfaces/traits/protocols, functions, methods, ...) \
@@ -47,125 +44,32 @@ pub const DEFAULT_MAX_LOADED: usize = 4;
 /// One repository's loaded state: the active project's is `Server::cur`, the others'
 /// are parked in their `Project`.
 struct State {
-    root: PathBuf,
-    /// Shared with the thread saving it to disk.
+    /// The graph, kept up to date in the background when the server refreshes.
+    live: Live,
+    /// The graph this tool call answers from (the latest when the call started).
     graph: Arc<Graph>,
-    index_options: IndexOptions,
     /// insights for (graph build time in ms, top): costly, changes only on reindex.
     insights_cache: Option<((u64, usize), Value)>,
-    last_stale_check: Instant,
-    /// Facts of every file, so a refresh only parses changed files (warmed in the
-    /// background after loading).
-    facts: Arc<Mutex<FactsCache>>,
-    /// The last background save, joined before the next one and on drop.
-    saving: Option<JoinHandle<()>>,
-    /// `git status` after an incremental update (whose `git_dirty` is an estimate):
-    /// applied to the graph once done.
-    git_check: Option<JoinHandle<Option<bool>>>,
 }
 
 impl State {
-    /// `warm`: fill the facts cache in the background (for servers that refresh).
-    fn new(root: PathBuf, graph: Graph, index_options: IndexOptions, warm: bool) -> State {
-        let facts = Arc::new(Mutex::new(FactsCache::default()));
-        // Warm the cache: the first refresh then parses only what changed. A refresh
-        // started meanwhile waits for the lock. Skipped if the project is dropped first.
-        if warm {
-            let (facts, root) = (Arc::downgrade(&facts), root.clone());
-            std::thread::spawn(move || {
-                if let Some(facts) = facts.upgrade() {
-                    lock_facts(&facts).fill(&root);
-                }
-            });
-        }
+    /// `watch`: refresh the graph in the background as sources change.
+    fn new(root: PathBuf, graph: Graph, index_options: IndexOptions, watch: bool) -> State {
+        let live = Live::new(root, graph, index_options, watch);
         State {
-            root,
-            graph: Arc::new(graph),
-            index_options,
+            graph: live.graph(),
+            live,
             insights_cache: None,
-            last_stale_check: Instant::now(),
-            facts,
-            saving: None,
-            git_check: None,
         }
     }
 
-    /// Applies a finished background `git status` to the graph (and saves it) if it
-    /// changes `git_dirty`.
-    fn apply_git_check(&mut self) {
-        if !self.git_check.as_ref().is_some_and(JoinHandle::is_finished) {
-            return;
-        }
-        let Some(Ok(dirty)) = self.git_check.take().map(JoinHandle::join) else {
-            return;
-        };
-        if dirty == self.graph.git_dirty {
-            return;
-        }
-        if let Some(saving) = self.saving.take() {
-            let _ = saving.join();
-        }
-        // Only the save thread shares the graph, and it is done.
-        if let Some(graph) = Arc::get_mut(&mut self.graph) {
-            graph.git_dirty = dirty;
-            self.save_in_background();
-        }
+    fn root(&self) -> &Path {
+        self.live.root()
     }
 
-    /// Writes the graph to disk on another thread (after the previous write).
-    fn save_in_background(&mut self) {
-        if let Some(previous) = self.saving.take() {
-            let _ = previous.join();
-        }
-        let (graph, root) = (Arc::clone(&self.graph), self.root.clone());
-        self.saving = Some(std::thread::spawn(move || {
-            if let Err(e) = graph.save(&root) {
-                eprintln!("codenav: could not save index: {e:#}");
-            }
-        }));
-    }
-
-    /// Re-indexes, parsing only files changed since the cached facts (all of them when
-    /// `full`), and saves in the background.
-    fn reindex(&mut self, tree: Option<indexer::Tree>, full: bool) -> Result<indexer::IndexStats> {
-        let mut cache = lock_facts(&self.facts);
-        if full {
-            *cache = FactsCache::default();
-        }
-        let git = if full {
-            indexer::GitState::Full
-        } else {
-            indexer::GitState::Since(&self.graph)
-        };
-        let (graph, stats) =
-            indexer::index_cached(&self.root, &self.index_options, &mut cache, tree, git)?;
-        drop(cache);
-        self.graph = Arc::new(graph);
-        self.save_in_background();
-        if !full {
-            let root = self.root.clone();
-            let files: HashSet<String> = self.graph.by_file.keys().cloned().collect();
-            self.git_check = Some(std::thread::spawn(move || vcs::dirty(&root, &files)));
-        }
-        Ok(stats)
-    }
-}
-
-/// The facts cache, emptied if a panic left it poisoned (it may be partly updated).
-fn lock_facts(facts: &Mutex<FactsCache>) -> std::sync::MutexGuard<'_, FactsCache> {
-    facts.lock().unwrap_or_else(|poisoned| {
-        facts.clear_poison();
-        let mut cache = poisoned.into_inner();
-        *cache = FactsCache::default();
-        cache
-    })
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        if let Some(saving) = self.saving.take() {
-            let _ = saving.join();
-        }
+    /// Answers from the latest graph from now on.
+    fn sync(&mut self) {
+        self.graph = self.live.graph();
     }
 }
 
@@ -348,7 +252,9 @@ impl Server {
             Some(state) => state,
             None => self.load(self.projects[idx].root.clone())?,
         };
+        next.live.set_active(true);
         let old = std::mem::replace(&mut self.cur, next);
+        old.live.set_active(false);
         let keep_old =
             1 + self.projects.iter().filter(|p| p.parked.is_some()).count() < self.max_loaded;
         self.projects[self.active].parked = keep_old.then_some(old);
@@ -499,42 +405,9 @@ impl Server {
         })
     }
 
-    /// Refreshes if the last check is old enough; returns whether it checked.
-    fn refresh_if_stale(&mut self) -> Result<bool> {
-        if !self.auto_refresh || self.cur.last_stale_check.elapsed() < STALE_CHECK_INTERVAL {
-            return Ok(false);
-        }
-        self.cur.last_stale_check = Instant::now();
-        self.refresh_now()?;
-        Ok(true)
-    }
-
-    /// Re-indexes the active project incrementally if its sources changed (one scan, only
-    /// changed files parsed), else updates its Git state if HEAD moved.
-    fn refresh_now(&mut self) -> Result<()> {
-        let tree = indexer::scan(&self.cur.root);
-        if indexer::is_stale_tree(&self.cur.graph, &tree) {
-            self.cur.reindex(Some(tree), false)?;
-        } else if vcs::head_changed(&self.cur.graph, &self.cur.root) {
-            // Same code, new commit: update the Git fields in place (after any save).
-            if let Some(saving) = self.cur.saving.take() {
-                let _ = saving.join();
-            }
-            match Arc::get_mut(&mut self.cur.graph) {
-                Some(graph) => {
-                    vcs::refresh_state(graph, &self.cur.root);
-                    self.cur.save_in_background();
-                }
-                None => {
-                    self.cur.reindex(Some(tree), false)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn reindex(&mut self) -> Result<Value> {
-        let stats = self.cur.reindex(None, true)?;
+        let stats = self.cur.live.reindex_full()?;
+        self.cur.sync();
         Ok(json!({
             "files": stats.files,
             "symbols": stats.symbols,
@@ -575,23 +448,17 @@ impl Server {
 
     fn run_tool(&mut self, name: &str, a: &Value) -> Result<Value> {
         if name == "reindex" {
-            self.cur.last_stale_check = Instant::now();
             return self.reindex();
         }
         if name == "list_projects" {
             return Ok(json!({ "projects": self.list_projects() }));
         }
-        self.cur.apply_git_check();
-        let checked = self.refresh_if_stale();
         // diff_impact matches diff lines to the graph's: it must reflect the current files.
+        // Other tools answer from the latest graph, refreshed in the background.
         if name == "diff_impact" {
-            if !checked? {
-                self.cur.last_stale_check = Instant::now();
-                self.refresh_now()?;
-            }
-        } else if let Err(e) = checked {
-            eprintln!("codenav: re-index failed: {e:#}");
+            self.cur.live.refresh()?;
         }
+        self.cur.sync();
         if name == "insights" {
             let key = (
                 self.cur.graph.indexed_at_ms,
@@ -611,7 +478,10 @@ impl Server {
             "graph_overview" => {
                 let mut v = query::overview(g, uint(a, "top", 15)?);
                 // With auto-refresh, stale sources are re-indexed on their own.
-                v["index"] = vcs::index_state(g, &self.cur.root, !self.auto_refresh);
+                v["index"] = vcs::index_state(g, self.cur.root(), !self.auto_refresh);
+                if self.cur.live.reindexing() {
+                    v["index"]["reindexing"] = json!(true);
+                }
                 Ok(v)
             }
             "get_community" => {
@@ -694,7 +564,7 @@ impl Server {
             "get_symbol" => {
                 let i = query::resolve(g, &string(a, "id")?)?;
                 let code = opt_bool(a, "include_code")?.unwrap_or(true);
-                let mut v = query::symbol_details(g, &self.cur.root, i, code);
+                let mut v = query::symbol_details(g, self.cur.root(), i, code);
                 // An external package that another served project declares (same
                 // ecosystem as the files importing it): say which.
                 if g.nodes[i].kind == SymKind::External
@@ -784,7 +654,7 @@ impl Server {
                 };
                 diff_impact::diff_impact(
                     g,
-                    &self.cur.root,
+                    self.cur.root(),
                     &source,
                     uint(a, "depth", 3)?.clamp(1, 8) as u32,
                     uint(a, "limit", 200)?.max(1),
@@ -857,12 +727,12 @@ impl Server {
                 let file = string(a, "file")?;
                 let start = uint(a, "start_line", 1)? as u32;
                 let end = uint(a, "end_line", start as usize + 80)? as u32;
-                let path = self.cur.root.join(&file).canonicalize()?;
+                let path = self.cur.root().join(&file).canonicalize()?;
                 anyhow::ensure!(
-                    path.starts_with(self.cur.root.canonicalize()?),
+                    path.starts_with(self.cur.root().canonicalize()?),
                     "path outside repository"
                 );
-                let code = query::read_lines(&self.cur.root, &file, start, end)
+                let code = query::read_lines(self.cur.root(), &file, start, end)
                     .ok_or_else(|| anyhow!("cannot read {file}"))?;
                 let lines: Vec<Vec<String>> = code.lines().map(|l| vec![l.to_string()]).collect();
                 Ok(Value::String(output::fit_blocks(

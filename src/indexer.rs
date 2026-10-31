@@ -363,7 +363,7 @@ pub fn index(root: &Path) -> Result<(Graph, IndexStats)> {
 }
 
 pub fn index_with(root: &Path, opts: &IndexOptions) -> Result<(Graph, IndexStats)> {
-    index_cached(root, opts, &mut FactsCache::default(), None, GitState::Full)
+    index_cached(root, opts, &mut FactsCache::default(), None)
 }
 
 /// Facts extracted from each file, kept between indexing runs by the server so that only
@@ -437,16 +437,6 @@ impl FactsCache {
     }
 }
 
-/// How to record the repository's Git state in a new graph.
-pub enum GitState<'g> {
-    /// Ask git (HEAD, uncommitted changes): a few tens of ms.
-    Full,
-    /// Incremental update of `previous`: if HEAD did not move, keep its Git fields, and
-    /// mark uncommitted changes when sources changed since (no `git status`: an estimate,
-    /// see `vcs::dirty`).
-    Since(&'g Graph),
-}
-
 /// Indexes `root`, parsing only files that are new or changed since `cache` saw them (by
 /// modification time and size); `tree` is a scan of `root` if the caller already has one.
 pub fn index_cached(
@@ -454,7 +444,6 @@ pub fn index_cached(
     opts: &IndexOptions,
     cache: &mut FactsCache,
     tree: Option<Tree>,
-    git: GitState,
 ) -> Result<(Graph, IndexStats)> {
     let started = Instant::now();
     // Timestamp taken before reading, so edits made during indexing count as stale.
@@ -486,7 +475,6 @@ pub fn index_cached(
             ))
         })
         .collect();
-    let changed = !parsed.is_empty() || cache.files.len() != files.len();
     for (k, entry) in parsed {
         cache.files.insert(files[k].rel.clone(), entry);
     }
@@ -510,16 +498,7 @@ pub fn index_cached(
     graph.indexed_at = started_at.as_secs();
     graph.indexed_at_ms = started_at.as_millis() as u64;
     graph.build_indexes();
-    match git {
-        GitState::Since(previous) => {
-            graph.git_commit = previous.git_commit.clone();
-            graph.git_branch = previous.git_branch.clone();
-            graph.git_dirty = previous.git_dirty.map(|d| d || changed);
-            // HEAD moved (a commit, a checkout): ask git again.
-            vcs::refresh_state(&mut graph, root);
-        }
-        GitState::Full => vcs::record_state(&mut graph, root),
-    }
+    vcs::record_state(&mut graph, root);
     communities::detect(&mut graph, opts.hub_percentile);
 
     let mut by_lang = HashMap::new();
@@ -2015,7 +1994,7 @@ mod tests {
         );
         let opts = IndexOptions::default();
         let mut cache = FactsCache::default();
-        index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
+        index_cached(&repo.0, &opts, &mut cache, None).unwrap();
 
         // Modify, add, remove, rename a file; move a symbol from a.py to e.py, whose
         // callers in other files must follow.
@@ -2030,8 +2009,7 @@ mod tests {
         fs::remove_file(repo.0.join("c.py")).unwrap();
         fs::rename(repo.0.join("old_name.py"), repo.0.join("new_name.py")).unwrap();
 
-        let (incremental, _) =
-            index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
+        let (incremental, _) = index_cached(&repo.0, &opts, &mut cache, None).unwrap();
         let (full, _) = index_with(&repo.0, &opts).unwrap();
         assert_eq!(comparable(&incremental), comparable(&full));
         assert!(full.by_id.contains_key("e.py::moved") && !full.by_id.contains_key("c.py::gone"));
@@ -2066,7 +2044,7 @@ mod tests {
         let repo = TempRepo::new("incremental-speed", &refs);
         let opts = IndexOptions::default();
         let mut cache = FactsCache::default();
-        let (first, _) = index_cached(&repo.0, &opts, &mut cache, None, GitState::Full).unwrap();
+        index_cached(&repo.0, &opts, &mut cache, None).unwrap();
 
         // The best of a few runs, so that a busy machine does not fail the test.
         let mut elapsed = std::time::Duration::MAX;
@@ -2075,8 +2053,7 @@ mod tests {
             let edit = format!("+ {}", 100 + run);
             fs::write(repo.0.join("src/m7.ts"), files[7].1.replace("+ 0", &edit)).unwrap();
             let started = Instant::now();
-            let (_, stats) =
-                index_cached(&repo.0, &opts, &mut cache, None, GitState::Since(&first)).unwrap();
+            let (_, stats) = index_cached(&repo.0, &opts, &mut cache, None).unwrap();
             elapsed = elapsed.min(started.elapsed());
             assert_eq!(stats.files, 360);
         }
