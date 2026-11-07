@@ -77,8 +77,12 @@ modules, `@/` and `~/` aliases, Go packages) or to `ext:*` nodes.
 ## Installation
 
 ```sh
-cargo install --path .
+cargo install codenav --locked
 ```
+
+Or download a prebuilt binary for macOS, Linux or Windows from the
+[latest release](https://github.com/Oni-zerone/codenav/releases/latest) and put it on your `PATH`.
+To build from a clone, use `cargo install --path .`.
 
 ## Command line
 
@@ -253,6 +257,12 @@ Any other MCP client supporting the **stdio** transport works the same way. Chat
 accepts only remote (HTTP) MCP servers: that needs an HTTP transport (see the roadmap) or a
 stdio→HTTP bridge.
 
+## Agent skill
+
+[`skills/codenav/SKILL.md`](skills/codenav/SKILL.md) is an agent skill: it tells an agent how to
+install and register codenav, when to use it and which tool fits each question. To use it with
+Claude Code, copy `skills/codenav/` to `~/.claude/skills/` (or `.claude/skills/` in a project).
+
 ## Code layout
 
 | File | Role |
@@ -292,3 +302,7 @@ cargo test --workspace
 The integration tests (`tests/graph.rs`) index the multi-language fixture in
 `tests/fixtures/poly` and check the expected edges and the MCP handshake. The extension's tests
 run with `npm test` in `vscode/` (see its README).
+
+## License
+
+[MIT](LICENSE)

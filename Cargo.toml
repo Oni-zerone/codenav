@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Index a repository into a code graph and let LLMs explore it over MCP"
+license = "MIT"
+repository = "https://github.com/Oni-zerone/codenav"
+readme = "README.md"
+keywords = ["mcp", "code-graph", "tree-sitter", "llm", "code-analysis"]
+categories = ["development-tools", "command-line-utilities"]
+exclude = ["/.github", "/.codenavignore", "/skills", "/vscode", "/wasm"]
 
 [workspace]
 members = [".", "wasm"]

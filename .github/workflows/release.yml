@@ -1,0 +1,88 @@
+# Builds the binaries and publishes them as a GitHub Release when a version tag is pushed:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Asset names carry no version, so `releases/latest/download/<asset>` is a stable link.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # The oldest supported runners: the binaries need at least their glibc.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cross-compiled on an arm runner, so its tests could not run natively.
+      - name: Test
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked -p codenav --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p codenav --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          name=codenav-${{ matrix.target }}
+          mkdir -p "$name" dist
+          cp README.md LICENSE* "$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/codenav.exe "$name/"
+            7z a "dist/$name.zip" "$name"
+          else
+            cp target/${{ matrix.target }}/release/codenav "$name/"
+            tar -czf "dist/$name.tar.gz" "$name"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codenav-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes
